@@ -2769,18 +2769,18 @@ static size_t load_words(const uint32_t *op)
     return 5 + ((size_t)op[3] * op[4] + 1) / 2;
 }
 
-/* A run of loads in a record, from the one at taken[at] (the 3D battle's
- * models and palettes come as some 235 of them in the frame it starts): every
- * upload into VRAM's texture first, then each one's copy into the picture, in
- * the record's order. One at a time, each upload changed the texture the copy
- * queued just before it still reads. Measured on a Samsung A22 (Mali, OpenGL
- * ES): the worst frame at the start of a battle was 106 to 153 ms at 2x and
- * 102 to 172 ms at 4x (three runs of two battles each), and in two passes 38
- * to 43 ms at 2x and 58 to 69 ms at 4x; with timers around the uploads (one
- * run at 2x) an upload took 1.5 to 2 ms, and 0.3 ms in two passes (a desktop
- * GPU: 8 us). The driver waiting for the queued copy, or copying the texture,
- * is the likely cause; it was not looked at. The
- * picture is the same: a copy reads only its own word of VRAM's texture
+/* A run of loads in a record, from the one at taken[at] (a 3D battle sends
+ * some 235 of them, its models and palettes, as it starts, up to 68 in one
+ * replay): every upload into VRAM's texture first, then each one's copy into
+ * the picture, in the record's order. One at a time, each upload changed the
+ * texture the copy queued just before it still reads. Measured on a Samsung
+ * A22 (Mali, OpenGL ES): the worst frame at the start of a battle was 106 to
+ * 153 ms at 2x and 102 to 172 ms at 4x (three runs of two battles each), and
+ * in two passes 38 to 43 ms at 2x and 58 to 69 ms at 4x. With timers around
+ * the uploads (one run at 2x) an upload took 1.5 to 2 ms there, and 0.3 ms in
+ * two passes; a desktop GPU takes 8 us. The likely cause is the driver
+ * waiting for the queued copy, or copying the texture; it was not looked at.
+ * The picture is the same: a copy reads only its own word of VRAM's texture
  * (nothing around it), so where two loads overlap the later one's words are in
  * the picture either way, and each copy and its widescreen mirror still follow
  * the one before it. Returns the words the run takes: it ends at a record that

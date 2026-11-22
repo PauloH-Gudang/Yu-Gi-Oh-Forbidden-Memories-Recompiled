@@ -2587,30 +2587,29 @@ What a primitive draws is not sampled by a later one of the same frame
 whole after each replay. A duel with 3D Monsters replays in 1.5-2.5 ms a
 frame at 2x and 2.5-4 ms at 4x on the development machine.
 
-A run of consecutive uploads in a record (`apply_loads`: the 3D battle
-starts with some 235 of them, models and palettes, in one frame) is applied
-in two passes, every upload into VRAM's texture first and then each one's
-copy into the picture and the widescreen targets, in the record's order;
-one upload and one copy at a time, each upload changed the texture a copy
-queued just before it still reads. On a Samsung A22 (Mali, OpenGL ES) that
-cost 1.5-2 ms an upload (timers around them, one run at 2x; 0.3 ms in two
-passes; a desktop GPU: 8 us an upload, no stall): the worst frame at the
-start of a battle took 106-153 ms at 2x and 102-172 ms at 4x (three runs of
-two battles each, median 135 and 159 ms; the game's own frame log, mods off,
-no pack), and 38-43 ms at 2x and 58-69 ms at 4x with two passes (median 40
-and 68 ms; one entry under the log's 20 ms line). The driver waiting for
-the queued copy, or copying the texture, is the likely cause; it was not
-looked at. At 4x the entry still has a frame of about 60-70 ms. The picture is the same: the copy shader reads only its own
-word of VRAM's texture, so where two loads overlap the later one's words are
-in the picture either way. Checked on the desktop with the whole scaled
-picture hashed after every replay: three battles at 2x and at 4x, a
-synthetic record of overlapping, edge-clipped, odd-sized and empty loads,
-widescreen, the HD pack with HD text and a state load inside a battle came
-out the same before and after (with anti-aliasing, 2x to 8x, the hash of the
-picture differs in a few frames from run to run, as much between two runs of
-the same build as between the two builds; where that comes from was not
-found). The
-attack effect's frame inside the battle (200 ms and more on the phone,
+A run of consecutive uploads in a record (`apply_loads`; a 3D battle sends
+some 235 of them, models and palettes, as it starts, up to 68 in one replay)
+is applied in two passes, every upload into VRAM's texture first and then
+each one's copy into the picture and the widescreen targets, in the record's
+order; one upload and one copy at a time, each upload changed the texture a
+copy queued just before it still reads. On a Samsung A22 (Mali, OpenGL ES)
+that cost 1.5-2 ms an upload (timers around them, one run at 2x; 0.3 ms in
+two passes; a desktop GPU takes 8 us an upload, no stall): the worst frame at
+the start of a battle took 106-153 ms at 2x and 102-172 ms at 4x (three runs
+of two battles each, median 135 and 159 ms; the game's own frame log, mods
+off, no pack), and 38-43 ms at 2x and 58-69 ms at 4x with two passes (median
+40 and 68 ms). The likely cause is the driver waiting for the queued copy, or
+copying the texture; it was not looked at. At 4x the entry still has a frame
+of about 60-70 ms. The picture is the same: the copy shader reads only its
+own word of VRAM's texture, so where two loads overlap the later one's words
+are in the picture either way. Checked on the desktop with the whole scaled
+picture hashed after every replay: three battles at 2x and at 4x, a synthetic
+record of overlapping, edge-clipped, odd-sized and empty loads, widescreen,
+the HD pack with HD text and a state load inside a battle came out the same
+before and after (with anti-aliasing, 2x to 8x, the hash of the picture
+differs in a few frames from run to run, as much between two runs of the
+same build as between the two builds; where that comes from was not found).
+The attack effect's frame inside the battle (200 ms and more on the phone,
 growing with the scale) is another cost and is not changed by this.
 
 Without that (the X11 backend, `MEMORIES_GL_PICTURE=0`, an older GL) the
