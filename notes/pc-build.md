@@ -2746,7 +2746,10 @@ which a semi-transparent texel of mode 2 reads the pixel under it
 the blend (one, source alpha) passes through as it is: the subtracting
 pass's equation, in the same draw. Reading the picture costs the GPU, so it
 is used where the draws cost more: in a flush with at least 128
-subtractive runs (`FETCH_MIN_RUNS`), `fetch_join` joins each stretch of
+subtractive runs for one target (`FETCH_MIN_RUNS`; counted per target, the
+picture or a widescreen target, since in widescreen a primitive is drawn
+into both: the map's flushes have 128 to 188 subtractive runs in all
+there, 64 to 94 for one target), `fetch_join` joins each stretch of
 runs of one state from its first subtractive run to its last into one run
 drawn with `fetch_program` (`fetch_use` switches programs per run); the
 runs around them, and every other flush, are drawn as before. On the A22
