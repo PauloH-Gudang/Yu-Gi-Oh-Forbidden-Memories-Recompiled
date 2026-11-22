@@ -231,6 +231,20 @@ void Platform_StopTimers(void);
  * lets 1 ms of game time pass, since a loop polling it is waiting for time
  * (movie playback waits for its strips that way). Nothing otherwise. */
 void Platform_PollTime(void);
+/* The game's code runs on the fixed game stack (state.h), and so does the
+ * host code it calls: the clock's pass (advance, the tick and VBlank
+ * handlers, the disc and MDEC work), the VSync's present. What such a call
+ * leaves below the game's frame is read as garbage by a local the game never
+ * wrote (the padding bytes of a primitive, the ones the GPU ignores), and
+ * the clock's temporaries are the time of day: one lockstep run recorded a
+ * different padding byte each time (MEMORIES_DETERMINISTIC=1).
+ * PLATFORM_SCRUB_DEAD_STACK(bytes), last in a function a game call enters
+ * (a wrapper, so that the host code's frames are all below it), zeroes
+ * `bytes` of the stack below the function's own frame, with the cooperative
+ * clock and on the game stack; anywhere else it does nothing. The interrupt
+ * clock lands its frame in that span, so it never scrubs. */
+int Platform_DeadStackScrubbable(const void *frame, size_t bytes);
+#define PLATFORM_SCRUB_DEAD_STACK(bytes)     do {         if (Platform_DeadStackScrubbable(__builtin_frame_address(0), (bytes))) {             volatile uint32_t *scrub_ = (volatile uint32_t *)__builtin_alloca(bytes);             size_t scrub_i_;             for (scrub_i_ = 0; scrub_i_ < (bytes) / sizeof(uint32_t); scrub_i_++) scrub_[scrub_i_] = 0;         }     } while (0)
 /* Run what the cooperative clock owes (ticks, VBlanks) at a point where the
  * console would have taken them while the game waited (DrawSync). Never
  * steps time itself; nothing under the interrupt clock or in a

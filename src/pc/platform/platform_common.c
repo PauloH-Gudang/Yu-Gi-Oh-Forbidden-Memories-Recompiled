@@ -177,6 +177,18 @@ static void advance(uint64_t real_now, uintptr_t eip)
     }
 }
 
+/* A clock pass is a few hundred bytes deep (about 300 measured over a duel),
+ * and the game's VBlank handler may go deeper. */
+#define SERVICE_SCRUB_BYTES 8192u
+
+int Platform_DeadStackScrubbable(const void *frame, size_t bytes)
+{
+    uintptr_t here = (uintptr_t)frame;
+    /* Well clear of the stack's guard pages, and inside it. */
+    return cooperative && here >= MEMORIES_GAME_STACK_BASE + 0x20000u + bytes &&
+           here < MEMORIES_GAME_STACK_BASE + MEMORIES_GAME_STACK_SIZE;
+}
+
 /* The cooperative clock's service point: the time now, and whatever it owes. */
 static int servicing; /* inside advance(): the handlers it runs are the game's interrupt code */
 static void service(void)
@@ -664,10 +676,18 @@ void Platform_PollTime(void)
  * calls DrawSync(0) just before its read, after the frame's drawing is
  * rasterized, so the VBlanks the frame overran are delivered here, where the
  * console would have delivered them. */
+__attribute__((noinline)) static int service_clock(void)
+{
+    if (servicing) return 0; /* DrawSync from the game's own interrupt code */
+    service();
+    return 1;
+}
+
 void Platform_ServiceClock(void)
 {
-    if (servicing) return; /* DrawSync from the game's own interrupt code */
-    service();
+    if (service_clock()) {
+        PLATFORM_SCRUB_DEAD_STACK(SERVICE_SCRUB_BYTES);
+    }
 }
 
 /* VSync(0) on the console returns at the first VBlank after its entry, with
@@ -689,7 +709,7 @@ void Platform_SetTickDue(uint64_t real_us)
     tick_due = real_us;
 }
 
-void Platform_WaitVBlank(unsigned count_at_entry)
+__attribute__((noinline)) static void wait_vblank(unsigned count_at_entry)
 {
     struct timespec nap = {0, 500000};
     /* Spent, and still no VBlank since the caller's count: a wait nested in
@@ -747,6 +767,14 @@ void Platform_WaitVBlank(unsigned count_at_entry)
             nanosleep(&nap, NULL); /* on Windows (interrupt clock), returns at once */
         }
     }
+}
+
+/* The game's wait for a VBlank: the clock's passes and the VBlank handlers it
+ * runs are all below this frame. */
+void Platform_WaitVBlank(unsigned count_at_entry)
+{
+    wait_vblank(count_at_entry);
+    PLATFORM_SCRUB_DEAD_STACK(SERVICE_SCRUB_BYTES);
 }
 
 /* The VBlank count is what the game sees through VSync(-1). The clock's
