@@ -2747,12 +2747,16 @@ static int fetch_joinable(const Run *a, const Run *b)
  * cost the CPU less than fetch_program costs the GPU. Measured on the A22 at
  * 4x: the campaign map has 64 to 94 subtractive runs in every flush and fell
  * from 46.7 to 43.8 frames a second with fetch_program for them (35.3 with it
- * for the whole flush); the attack effect has about 460 in its flush. */
+ * for the whole flush); the attack effect has about 460 in its flush.
+ * Counted per target (the picture, each widescreen target): in widescreen a
+ * primitive is drawn into the picture and again into its target, which would
+ * double a flush's count (a 3D battle's flushes went from at most 534 to at
+ * most 1,066) and take the map past the line. */
 #define FETCH_MIN_RUNS 128
 
-/* A flush with at least FETCH_MIN_RUNS subtractive runs, drawn with
- * fetch_program's help when there is one and nothing it draws into is
- * anti-aliased. In each stretch
+/* A flush with at least FETCH_MIN_RUNS subtractive runs for one target,
+ * drawn with fetch_program's help when there is one and nothing it draws
+ * into is anti-aliased. In each stretch
  * of joinable runs, the runs from its first subtractive one to its last are
  * joined into one, drawn with fetch_program (`fetch`); the runs before and
  * after them stay as they are, drawn with `program`, so the picture's other
@@ -2760,10 +2764,12 @@ static int fetch_joinable(const Run *a, const Run *b)
  * drawn as without the extension. */
 static int fetch_join(void)
 {
-    size_t i, j, k, count = 0, subtractive = 0;
+    size_t i, j, k, count = 0, subtractive[WIDE_TARGETS + 1] = {0}, most = 0;
     if (!fetch_program) return 0;
-    for (i = 0; i < run_count; i++) subtractive += runs[i].subtractive != 0;
-    if (subtractive < FETCH_MIN_RUNS) return 0;
+    for (i = 0; i < run_count; i++) {
+        if (runs[i].subtractive && ++subtractive[runs[i].wide + 1] > most) most = subtractive[runs[i].wide + 1];
+    }
+    if (most < FETCH_MIN_RUNS) return 0;
     for (i = 0; i < run_count; i++) {
         if (runs[i].wide < 0 ? picture_ms_fbo != 0 : wide[runs[i].wide].ms_fbo != 0) return 0;
     }
