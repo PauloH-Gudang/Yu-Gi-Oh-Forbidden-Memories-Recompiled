@@ -2768,7 +2768,19 @@ The first start after an install compiles one more program: 337 ms on the
 A22 against 6 without; later starts take 5 to 13 ms (the driver keeps
 it). `GL_EXT_shader_framebuffer_fetch` (Adreno, PowerVR) is not used: it
 has not been tried on a device.
-FETCH_RESULTS_PLACEHOLDER
+Measured on the A22 (22 November 2026, mods off, no pack, three runs a
+side, `MEMORIES_GL_FETCH=0` against the default on the same APK, the
+game's 120-frame trace windows): in the attack effect at 2x, 38.5 VBlanks
+missed (27 to 40.5) and a worst frame of 101 to 255 ms became 0 missed and
+at most 13 ms; at 4x 45.5 (24 to 47.5) became 37.5 (37 to 38) and the worst
+frame 134 to 252 ms became 47 to 53 ms, the effect still GPU-bound (about
+26 frames a second, the GPU at 80% against 69%). The duel field, the map and
+the steady 3D battle drew no flush with it and kept their frame rates (the
+map at 4x 46.5 against 46.6 frames a second). The picture is the same:
+lockstep frame dumps (`MEMORIES_DETERMINISTIC=1`, `MEMORIES_DUMP_PICTURE=1`)
+of the effect against the two passes, and the scaled picture of every
+replay on the desktop (which never takes this path) against the build
+before it.
 
 **A lost context.** Android may lose the GL context while the app is in
 the background; SDL then makes a new one and sends
