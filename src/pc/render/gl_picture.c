@@ -840,8 +840,8 @@ static int make_program(int xbr)
  * one at a time between normal ones: about 890 runs and 1,360 draw calls in
  * one flush, against 35 runs before the effect. Measured on a Samsung A22
  * (Mali-G52, OpenGL ES 3.2) at 2x: that flush took 42 ms of CPU a frame, and
- * about 180 ms on the effect's first frame, 44 VBlanks missed in the effect's
- * 120 frames; the same state and uniform calls without the draws took 1.6 ms,
+ * about 180 ms on the effect's first frame, 27 to 44 VBlanks missed around it
+ * over the runs measured; the same state and uniform calls without the draws took 1.6 ms,
  * so the time is in glDrawArrays (likely the driver's cost per draw: the
  * PC's driver makes the same calls in 0.2 ms).
  *
@@ -2750,8 +2750,8 @@ static int fetch_joinable(const Run *a, const Run *b)
  * for the whole flush); the attack effect has about 460 in its flush.
  * Counted per target (the picture, each widescreen target): in widescreen a
  * primitive is drawn into the picture and again into its target, which would
- * double a flush's count (a 3D battle's flushes went from at most 534 to at
- * most 1,066) and take the map past the line. */
+ * double a flush's count (a 3D battle's flushes went from at most about 540
+ * to about 1,070) and take the map past the line. */
 #define FETCH_MIN_RUNS 128
 
 /* A flush with at least FETCH_MIN_RUNS subtractive runs for one target,

@@ -2735,10 +2735,10 @@ normal stretch after it is another run. A 3D battle's attack effect
 time between normal ones: one flush of about 890 runs and 1,360
 `glDrawArrays`, against 35 runs before the effect. On a Samsung Galaxy A22
 (Mali-G52, OpenGL ES 3.2) at 2x that flush took 42 ms of CPU a frame and
-about 180 ms on the effect's first frame, 44 VBlanks missed in the 120
-frames around it; the same state and uniform calls without the draws took
-1.6 ms, so the time is in the draw calls (likely the driver's cost per
-draw; a desktop NVIDIA driver makes the same calls in 0.2 ms).
+about 180 ms on the effect's first frame, 27 to 44 VBlanks missed around
+it over the runs measured; the same state and uniform calls without the
+draws took 1.6 ms, so the time is in the draw calls (likely the driver's
+cost per draw; a desktop NVIDIA driver makes the same calls in 0.2 ms).
 Where the driver lists `GL_ARM_shader_framebuffer_fetch`, the pass also
 builds `fetch_program`: the fragment shader with `FRAMEBUFFER_FETCH`, in
 which a semi-transparent texel of mode 2 reads the pixel under it
@@ -2759,8 +2759,9 @@ runs a flush, the campaign map with 64 to 94 in every flush, Free Duel,
 the duel, 3D battles, the credits), and at 4x the map fell from 46.7 to
 35.3 frames a second when every flush with one used `fetch_program`, 43.8
 when only the span between its subtractive runs did; the steady 3D battle
-(about 4 a flush) kept 30 frames a second with the GPU busier. The attack
-effect has about 460 in its flush. Not used with anti-aliasing (the color
+(a median of 8 a flush over two whole battles) kept 30 frames a second
+with the GPU busier. The attack effect has about 460 in its flush.
+Not used with anti-aliasing (the color
 read is then not the pixel's), where the extension is missing (desktop
 GL, GPUs without it), where its program does not build (once: "no
 framebuffer fetch" in the log), or with `MEMORIES_GL_FETCH=0` (the
