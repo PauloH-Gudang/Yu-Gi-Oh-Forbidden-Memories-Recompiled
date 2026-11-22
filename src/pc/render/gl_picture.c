@@ -848,19 +848,22 @@ static int make_program(int xbr)
  * Where the driver has GL_ARM_shader_framebuffer_fetch (Mali), fetch_program
  * is the program with FRAMEBUFFER_FETCH: a semi-transparent texel of mode 2
  * reads the pixel under it (gl_LastFragColorARM) and subtracts itself there,
- * so a flush with subtractive primitives joins their runs with the rest
- * (fetch_join) and draws them all with it in one pass each: 36 draws in the
- * effect's frames, the blend as before for everything else. Measured on the
- * A22: the same picture (lockstep frame dumps, whole battle), and at 2x 0
- * VBlanks missed in the effect. A flush without a subtractive primitive is
- * drawn as before, with `program`. Not with anti-aliasing (the color read
- * is then not the pixel's), nor without the extension (desktop GL, GPUs
- * without it: as before), nor when the program does not build, nor with
- * MEMORIES_GL_FETCH=0. GL_EXT_shader_framebuffer_fetch (Adreno, PowerVR) is
- * not used: it has not been tried on a device. */
+ * with the blend as before for everything else, so a subtractive primitive
+ * needs no run of its own. In a flush with many subtractive runs
+ * (FETCH_MIN_RUNS), fetch_join joins each stretch of them, from its first
+ * subtractive run to its last, into one run drawn with fetch_program; the
+ * rest of the flush, and every other flush, is drawn as before. Reading the
+ * picture costs the GPU (on the A22 at 4x the map lost frames when every
+ * flush with a subtractive primitive used it), hence both limits.
+ * Not with anti-aliasing (the color read is then not the pixel's), nor
+ * without the extension (desktop GL, GPUs without it: as before), nor when
+ * the program does not build, nor with MEMORIES_GL_FETCH=0.
+ * GL_EXT_shader_framebuffer_fetch (Adreno, PowerVR) is not used: it has not
+ * been tried on a device. */
 static GLuint fetch_program;
 static int fetch_allowed; /* the driver has the extension and MEMORIES_GL_FETCH is not 0 */
-static int flush_fetching; /* the flush being drawn is drawn with fetch_program */
+static int flush_fetching; /* the flush being drawn has runs for fetch_program (fetch_join) */
+static int fetch_in_use;   /* fetch_program is the program in use, its uniforms swapped in (fetch_use) */
 static unsigned fetch_flushes; /* such flushes in the last 120 replays, for MEMORIES_TRACE=frames */
 static int tex_xbr_now;    /* tex_xbr as this replay set it */
 /* fetch_program's uniforms: those the flush sets, swapped with `program`'s
@@ -1149,6 +1152,7 @@ typedef struct Run {
     size_t first, count;
     int clip[4], window[4], subtractive, pack; /* pack: the entry (index + 1) sampled, 0 none */
     int wide; /* the widescreen target it is drawn into, -1 the picture */
+    int fetch; /* drawn with fetch_program (set by fetch_join, read only in a flush it joined) */
 } Run;
 /* The widescreen target the primitive being read is drawn into, -1 the
  * picture (see "widescreen" below). */
@@ -2676,7 +2680,7 @@ static void lean_draw(size_t r)
             gl_Uniform2i(ul_pack_origin, h->ox, h->oy);
             gl_Uniform1i(ul_pack, 5);
             glDrawArrays(GL_TRIANGLES, (GLint)from, (GLsizei)(t - from));
-            gl_UseProgram(flush_fetching ? fetch_program : program);
+            gl_UseProgram(fetch_in_use ? fetch_program : program);
         } else {
             glDrawArrays(GL_TRIANGLES, (GLint)from, (GLsizei)(t - from));
         }
@@ -2732,40 +2736,72 @@ static int fast_wanted(void)
     return mode == 1 || (mode == 2 && fast_auto);
 }
 
-/* A flush with subtractive primitives, drawn with fetch_program when there
- * is one and nothing it draws into is anti-aliased: every run joined with
- * the one before it where they share their state and their vertices follow
- * on (as push_vertices would have joined them but for the subtractive
- * ones), none subtractive. 0: the flush is drawn as without the extension. */
+/* Runs a and b, b right after a: one state, b's vertices following a's. */
+static int fetch_joinable(const Run *a, const Run *b)
+{
+    return a->wide == b->wide && a->pack == b->pack && a->first + a->count == b->first &&
+           !memcmp(a->clip, b->clip, sizeof(b->clip)) && !memcmp(a->window, b->window, sizeof(b->window));
+}
+
+/* Subtractive runs a flush needs for fetch_join: below that the two passes
+ * cost the CPU less than fetch_program costs the GPU. Measured on the A22 at
+ * 4x: the campaign map has 64 to 94 subtractive runs in every flush and fell
+ * from 46.7 to 43.8 frames a second with fetch_program for them (35.3 with it
+ * for the whole flush); the attack effect has about 460 in its flush. */
+#define FETCH_MIN_RUNS 128
+
+/* A flush with at least FETCH_MIN_RUNS subtractive runs, drawn with
+ * fetch_program's help when there is one and nothing it draws into is
+ * anti-aliased. In each stretch
+ * of joinable runs, the runs from its first subtractive one to its last are
+ * joined into one, drawn with fetch_program (`fetch`); the runs before and
+ * after them stay as they are, drawn with `program`, so the picture's other
+ * pixels are shaded as before. None is left subtractive. 0: the flush is
+ * drawn as without the extension. */
 static int fetch_join(void)
 {
-    size_t i, count = 0;
+    size_t i, j, k, count = 0, subtractive = 0;
     if (!fetch_program) return 0;
-    for (i = 0; i < run_count && !runs[i].subtractive; i++) {}
-    if (i == run_count) return 0;
+    for (i = 0; i < run_count; i++) subtractive += runs[i].subtractive != 0;
+    if (subtractive < FETCH_MIN_RUNS) return 0;
     for (i = 0; i < run_count; i++) {
         if (runs[i].wide < 0 ? picture_ms_fbo != 0 : wide[runs[i].wide].ms_fbo != 0) return 0;
     }
-    for (i = 0; i < run_count; i++) {
-        const Run *run = &runs[i];
-        Run *last = count ? &runs[count - 1] : NULL;
-        if (last && last->wide == run->wide && last->pack == run->pack && last->first + last->count == run->first &&
-            !memcmp(last->clip, run->clip, sizeof(run->clip)) && !memcmp(last->window, run->window, sizeof(run->window))) {
-            last->count += run->count;
-            continue;
+    for (i = 0; i < run_count; i = j) {
+        size_t first_sub = run_count, last_sub = 0;
+        for (j = i + 1; j < run_count && fetch_joinable(&runs[j - 1], &runs[j]); j++) {}
+        for (k = i; k < j; k++) {
+            if (!runs[k].subtractive) continue;
+            if (first_sub == run_count) first_sub = k;
+            last_sub = k;
         }
-        runs[count] = *run;
-        runs[count++].subtractive = 0;
+        for (k = i; k < j; k++) {
+            if (first_sub < k && k <= last_sub) {
+                runs[count - 1].count += runs[k].count;
+                continue;
+            }
+            runs[count] = runs[k];
+            runs[count].fetch = k == first_sub;
+            runs[count++].subtractive = 0;
+        }
     }
     run_count = count;
     return 1;
 }
 
-/* fetch_program in use for the flush, with what the replay set in
- * `program` set in it too, and the flush's uniforms swapped in. */
-static void fetch_begin(void)
+/* fetch_program in use (on) or `program` (off): fetch_program with what the
+ * replay set in `program` set in it too, and the flush's uniforms swapped
+ * in, or back. */
+static void fetch_use(int on)
 {
     int i;
+    if (on == fetch_in_use) return;
+    fetch_in_use = on;
+    if (!on) {
+        fetch_swap();
+        gl_UseProgram(program);
+        return;
+    }
     gl_UseProgram(fetch_program);
     gl_Uniform1i(uf_op, 0);
     gl_Uniform1i(uf_scale, scale);
@@ -2796,10 +2832,7 @@ static void flush_runs(void)
     glBindTexture(GL_TEXTURE_2D, vram_texture);
     gl_UseProgram(program);
     gl_Uniform1i(u_op, 0);
-    if (flush_fetching) {
-        fetch_begin();
-        fetch_flushes++;
-    }
+    fetch_flushes += flush_fetching;
     glEnable(GL_SCISSOR_TEST);
     glEnable(GL_BLEND);
     glBlendFunc(GL_ONE, GL_SRC_ALPHA);
@@ -2823,6 +2856,7 @@ static void flush_runs(void)
                 glViewport(-origin_x * scale, -origin_y * scale, SOFT_GPU_WIDTH * scale, SOFT_GPU_HEIGHT * scale);
             }
         }
+        if (flush_fetching) fetch_use(run->fetch); /* before the run's uniforms: they are its program's */
         scissor_words(run->clip[0], run->clip[1], run->clip[2], run->clip[3], origin_x, origin_y);
         gl_Uniform4i(u_window, run->window[0] * 8, run->window[1] * 8, (run->window[2] & run->window[0]) * 8,
                     (run->window[3] & run->window[1]) * 8);
@@ -2850,7 +2884,7 @@ static void flush_runs(void)
             glBlendFunc(GL_ONE, GL_SRC_ALPHA);
         }
     }
-    if (flush_fetching) fetch_swap(); /* `program`'s uniforms back */
+    fetch_use(0); /* `program` and its uniforms back */
     flush_fetching = 0;
     unbind_attributes();
     glDisable(GL_BLEND);
@@ -3588,7 +3622,7 @@ static void forget_names(void)
     program = buffer = vertex_array = 0;
     lean_program = 0;
     fetch_program = 0; /* made again with `program` (make_program) */
-    flush_fetching = 0;
+    flush_fetching = fetch_in_use = 0;
     lean_tried = 0; /* made again in the new context, when wanted */
     lean_maps = ~0u;
     vram_texture = vram_scratch = vram_fbo = vram_scratch_fbo = 0;
