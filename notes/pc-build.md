@@ -565,13 +565,25 @@ entries), and
 `MEMORIES_TRACE_MENU=1` (menu-bar clicks) and
 `MEMORIES_TRACE_MODEL_MODULES=1` (MODEL bridge commands) and
 `MEMORIES_TRACE_DUEL_EFFECTS=1` (WA effect requests and payloads). Without an audio device
-(or headless) a silent sink still runs the SPU: the game polls envelopes and
-the disc service waits for CD-input room, so a stopped SPU hangs the game
-after the movie.
+(or headless) a silent sink still runs the SPU: the sound driver reads
+voice status and envelopes, and only the mixer drains the CD/XA input (a
+full ring drops the decoded sectors' samples; the disc service does not
+wait for room). The sink is a thread that mixes 256 frames every 5.8 ms of
+real time, except under `MEMORIES_DETERMINISTIC=1` (not on Android): there
+the game thread mixes 44.1 frames at each 1 ms step of the virtual clock,
+before the step's tick runs the sound driver, and writes
+`MEMORIES_DUMP_AUDIO` from there, so the dump is as long as the game's
+virtual time. The thread mixed as much as real time allowed while the game
+ran flat out, so a voice finished its release at another game instant in
+each run and the driver reused its note records in another order: two
+lockstep runs differed in up to a few hundred bytes of the driver's memory.
+The fraction of a frame still owed is saved in the state
+(`platform-mixer`).
 
 Key-on and key-off requests are applied by the mixer at its next 256-frame
-period (5.8 ms), but the hardware answered `SpuGetKeyStatus` and
-`SpuGetVoiceEnvelope` at once, and the sound driver relies on that: it picks
+period (5.8 ms; 1 ms when the game thread mixes), but the hardware answered
+`SpuGetKeyStatus` and `SpuGetVoiceEnvelope` at once, and the sound driver
+relies on that: it picks
 a free SFX voice by envelope 0 and spins on status after a key-off. So both
 reads answer from the request (`keyed_mask`; a pending key-on reads as full
 attack), not from the mixer. Before that, two sounds keyed within one mix
