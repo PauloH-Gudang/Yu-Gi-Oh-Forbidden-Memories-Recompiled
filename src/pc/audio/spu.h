@@ -5,9 +5,9 @@
 
 /* Software SPU: 24 ADPCM voices with hardware ADSR, 512 KiB sound RAM, and a
  * CD/XA input. The game thread (including its interrupt handlers) sets
- * parameters; one audio thread calls Spu_Mix (with no device under the
- * virtual clock, the game thread itself: platform_common.c). Key on/off cross threads as
- * atomic bit sets, everything else is single-word state, so no locks are
+ * parameters; one mixer calls Spu_Mix: the audio thread, or the game thread
+ * under the virtual clock with no device (platform_common.c). Key on/off
+ * cross threads as atomic bit sets, everything else is single-word state, so no locks are
  * taken anywhere a signal handler can run.
  * Samples pass through the hardware's four-tap Gaussian interpolation.
  * Not modelled: reverb, noise, pitch modulation, volume sweeps, IRQ address. */
@@ -38,7 +38,7 @@ size_t Spu_CdSpace(void);
 void Spu_CdFlush(void);
 
 /* Output volume over the whole mix, 0-100: the port's own control, not the
- * game's. Set from the main thread, read by the audio thread. */
+ * game's. Set from the main thread, read by the mixer. */
 void Spu_SetOutputVolume(int percent);
 int Spu_GetOutputVolume(void);
 void Spu_SetMuted(int muted);
@@ -54,7 +54,8 @@ typedef enum { SPU_BUS_MUSIC, SPU_BUS_SFX, SPU_BUS_STREAM, SPU_BUS_COUNT } SpuBu
 void Spu_SetBusVolume(SpuBus bus, int percent);
 int Spu_GetBusVolume(SpuBus bus);
 
-/* Save states: make the audio thread output silence, and wait until it is
+/* Save states: make the mixer (the audio thread, or the game thread under
+ * the virtual clock with no device) output silence, and wait until it is
  * outside Spu_Mix, so the voices can be read or replaced. */
 void Spu_Hold(int on);
 /* Nonzero while held: a mixer that steps Spu_Mix itself (the virtual
@@ -62,6 +63,7 @@ void Spu_Hold(int on);
  * them as silence. */
 int Spu_Held(void);
 
-/* Audio thread: interleaved stereo at 44.1 kHz. */
+/* The mixer (the audio thread, or the game thread under the virtual clock
+ * with no device): interleaved stereo at 44.1 kHz. */
 void Spu_Mix(int16_t *out, size_t frames);
 #endif

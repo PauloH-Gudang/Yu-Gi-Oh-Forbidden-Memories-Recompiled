@@ -571,7 +571,9 @@ full ring drops the decoded sectors' samples; the disc service does not
 wait for room). The sink is a thread that mixes 256 frames every 5.8 ms of
 real time, except under `MEMORIES_DETERMINISTIC=1` (not on Android): there
 the game thread mixes 44.1 frames at each 1 ms step of the virtual clock,
-before the step's tick runs the sound driver, and writes
+before the step's tick runs the sound driver (a step the interrupt clock's
+handler takes only owes its frames, mixed at the next step on the game
+thread), and writes
 `MEMORIES_DUMP_AUDIO` from there, so the dump is as long as the game's
 virtual time. The thread mixed as much as real time allowed while the game
 ran flat out, so a voice finished its release at another game instant in
