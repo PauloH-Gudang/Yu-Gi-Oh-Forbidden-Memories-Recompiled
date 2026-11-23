@@ -68,8 +68,9 @@ audio device (`MEMORIES_NO_AUDIO=1`, headless, no window, or none opens)
 the switch also mixes the SPU on the game thread by virtual time, 44.1
 frames for each 1 ms step, instead of on a thread paced by the host's
 clock, so the sound driver's memory (`g_SDValue` and its secondary state,
-0x801E0000 to about 0x801E1B50) is the same in two lockstep runs too, and
-RAM comparisons need not mask it. A run with a real device keeps the
+0x801E0000 to about 0x801E1B50) is the same in two lockstep runs too, as
+are the spu and libspu chunks of a state saved at the same VBlank, and RAM
+comparisons need not mask them. A run with a real device keeps the
 device-paced mixer, and that driver memory still differs between two such
 runs. The old combination (no `MEMORIES_DETERMINISTIC`) keeps the mixer
 thread as well, and Android keeps it in every case.
