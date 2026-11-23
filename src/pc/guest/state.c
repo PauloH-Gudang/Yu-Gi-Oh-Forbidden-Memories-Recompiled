@@ -5,6 +5,7 @@
 #include "state_subsystems.h"
 #include "state_remap.h"
 #include "pc/platform/settings.h"
+#include "pc/platform/platform.h"
 #include "pc/platform/paths.h"
 #include "pc/mods/mods.h"
 #include "pc/mods/events.h"
@@ -579,6 +580,10 @@ static void apply(void)
     memcpy(&entry, chunk, sizeof(entry));
     chunk = Memories_StateFindChunk(&state, "stack", &size);
     memcpy((void *)(uintptr_t)MEMORIES_STATE_ENTRY_SP(entry), chunk, size);
+    /* The state resumes in the VSync's caller, past the wrapper that clears what the host code left below
+     * the game's frame (platform.h, PLATFORM_SCRUB_DEAD_STACK): what is below the restored frames now is the
+     * session before the load's (its present, its clock pass, the times they read). The span of that VSync. */
+    Platform_ScrubGameStackBelow(MEMORIES_STATE_ENTRY_SP(entry), 256u * 1024u);
     free(pending_image);
     pending_image = NULL;
     Spu_Hold(0);

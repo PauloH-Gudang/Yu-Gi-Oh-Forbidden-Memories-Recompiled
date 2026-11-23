@@ -244,6 +244,11 @@ void Platform_PollTime(void);
  * clock and on the game stack; anywhere else it does nothing. The interrupt
  * clock lands its frame in that span, so it never scrubs. */
 int Platform_DeadStackScrubbable(const void *frame, size_t bytes);
+/* A state load resumes in the VSync's caller, past the wrapper that scrubs: this does the same
+ * for it. Zeroes `bytes` of the game stack below `sp` (the stack below the restored frames is
+ * the session before the load's). Cooperative clock only; stays clear of the stack's guard
+ * pages. Called from the process stack, not the game's. */
+void Platform_ScrubGameStackBelow(uintptr_t sp, size_t bytes);
 /* The zeroing is rep stos on x86, where the game stack is: a loop of volatile
  * stores (what keeps the compiler from dropping stores to memory that is never
  * read) ran about 19 us for a 256 KiB span, once a frame, and rep stos runs at the

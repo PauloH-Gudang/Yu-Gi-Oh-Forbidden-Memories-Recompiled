@@ -189,6 +189,14 @@ int Platform_DeadStackScrubbable(const void *frame, size_t bytes)
            here < MEMORIES_GAME_STACK_BASE + MEMORIES_GAME_STACK_SIZE;
 }
 
+void Platform_ScrubGameStackBelow(uintptr_t sp, size_t bytes)
+{
+    uintptr_t floor_ = MEMORIES_GAME_STACK_BASE + 0x20000u, low;
+    if (!cooperative || sp <= floor_ || sp > MEMORIES_GAME_STACK_BASE + MEMORIES_GAME_STACK_SIZE) return;
+    low = sp - floor_ > bytes ? sp - bytes : floor_;
+    memset((void *)low, 0, sp - low);
+}
+
 /* The cooperative clock's service point: the time now, and whatever it owes. */
 static int servicing; /* inside advance(): the handlers it runs are the game's interrupt code */
 static void service(void)
