@@ -241,8 +241,9 @@ void Platform_PollTime(void);
  * PLATFORM_SCRUB_DEAD_STACK(bytes), last in a function a game call enters
  * (a wrapper, so that the host code's frames are all below it), zeroes
  * `bytes` of the stack below the function's own frame, with the cooperative
- * clock and on the game stack; anywhere else it does nothing. The interrupt
- * clock lands its frame in that span, so it never scrubs. */
+ * clock and on the game stack; anywhere else it does nothing. Under the
+ * interrupt clock (MEMORIES_CLOCK=interrupt) it never scrubs: a tick lands
+ * between the scrub and the game's next read of that stack, and dirties it again. */
 int Platform_DeadStackScrubbable(const void *frame, size_t bytes);
 /* A state load resumes in the VSync's caller, past the wrapper that scrubs: this does the same
  * for it. Zeroes `bytes` of the game stack below `sp` (the stack below the restored frames is
@@ -259,7 +260,7 @@ void Platform_ScrubGameStackBelow(uintptr_t sp, size_t bytes);
 #define PLATFORM_ZERO_DEAD_STACK_(bytes) \
     do { \
         void *scrub_ = __builtin_alloca(bytes); \
-        unsigned long scrub_n_ = (bytes) / 4u; \
+        size_t scrub_n_ = (bytes) / 4u; \
         __asm__ volatile("rep stosl" : "+D"(scrub_), "+c"(scrub_n_) : "a"(0) : "memory", "cc"); \
     } while (0)
 #else
