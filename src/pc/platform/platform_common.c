@@ -97,7 +97,9 @@ static uint64_t now_us(void)
  * its note records in another order, and two lockstep runs parted in the
  * driver's memory (0x801E0380.., 0x801E15D8..0x801E1B0F). Here the SPU is
  * mixed on the game thread as virtual time passes, 44.1 frames for each
- * 1 ms step, before the step's tick runs the sound driver. The fraction of
+ * 1 ms step, before the step's tick runs the sound driver (a step the
+ * interrupt clock's handler takes only owes its frames, which the next step
+ * on the game thread mixes before its own tick). The fraction of
  * a frame still owed goes in the save state ("platform-mixer"), since
  * virtual time itself is the process's. */
 static void (*stepped_mixer)(int16_t *, size_t);
@@ -124,7 +126,7 @@ static void mix_owed_frames(void)
         if (stepped_dump) {
             fwrite(buffer, sizeof(int16_t) * 2, count, stepped_dump);
             unflushed += (unsigned)count;
-            if (unflushed >= 735) { /* about a VBlank's worth, as the thread flushed every 256 */
+            if (unflushed >= 256) { /* as often as the thread flushed, so a killed run loses as little */
                 fflush(stepped_dump);
                 unflushed = 0;
             }
@@ -831,9 +833,16 @@ void Platform_State(MemoriesState *state)
     if (stepped_mixer) {
         /* The stepped mixer's phase (above): the steps after a load mix as
          * many frames as they did in the game that saved. A state without
-         * it starts from a whole frame, whatever the loading game owed. */
+         * it starts from a whole frame, whatever the loading game owed
+         * (unlike the loader's "keeps its current state" for a missing
+         * chunk: what this game owed has nothing to do with the state's
+         * game). Values no game saves (more than a second owed) are a
+         * damaged state: clamped, so a step never mixes for seconds. */
         const MemoriesStateField mixer[] = {{&mix_fraction, sizeof(mix_fraction)}, {&mix_owed, sizeof(mix_owed)}};
-        if (!Memories_StateChunk(state, "platform-mixer", mixer, 2) && Memories_StateLoading(state)) {
+        if (Memories_StateChunk(state, "platform-mixer", mixer, 2)) {
+            if (mix_fraction >= 10000u) mix_fraction = 0;
+            if (mix_owed > 44100u) mix_owed = 44100u;
+        } else if (Memories_StateLoading(state)) {
             mix_fraction = mix_owed = 0;
         }
     }
