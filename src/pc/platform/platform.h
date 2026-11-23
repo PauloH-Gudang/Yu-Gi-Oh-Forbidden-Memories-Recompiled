@@ -244,7 +244,33 @@ void Platform_PollTime(void);
  * clock and on the game stack; anywhere else it does nothing. The interrupt
  * clock lands its frame in that span, so it never scrubs. */
 int Platform_DeadStackScrubbable(const void *frame, size_t bytes);
-#define PLATFORM_SCRUB_DEAD_STACK(bytes)     do {         if (Platform_DeadStackScrubbable(__builtin_frame_address(0), (bytes))) {             volatile uint32_t *scrub_ = (volatile uint32_t *)__builtin_alloca(bytes);             size_t scrub_i_;             for (scrub_i_ = 0; scrub_i_ < (bytes) / sizeof(uint32_t); scrub_i_++) scrub_[scrub_i_] = 0;         }     } while (0)
+/* The zeroing is rep stos on x86, where the game stack is: a loop of volatile
+ * stores (what keeps the compiler from dropping stores to memory that is never
+ * read) ran about 19 us for a 256 KiB span, once a frame, and rep stos runs at the
+ * memory system's speed, about 5 us. It is inline asm, never a call to memset: a
+ * call's return address would be left just past the span, where a local of the
+ * game that deep reads it. Elsewhere the loop. */
+#if defined(__i386__) || defined(__x86_64__)
+#define PLATFORM_ZERO_DEAD_STACK_(bytes) \
+    do { \
+        void *scrub_ = __builtin_alloca(bytes); \
+        unsigned long scrub_n_ = (bytes) / 4u; \
+        __asm__ volatile("rep stosl" : "+D"(scrub_), "+c"(scrub_n_) : "a"(0) : "memory", "cc"); \
+    } while (0)
+#else
+#define PLATFORM_ZERO_DEAD_STACK_(bytes) \
+    do { \
+        volatile uint32_t *scrub_ = (volatile uint32_t *)__builtin_alloca(bytes); \
+        size_t scrub_i_; \
+        for (scrub_i_ = 0; scrub_i_ < (bytes) / sizeof(uint32_t); scrub_i_++) scrub_[scrub_i_] = 0; \
+    } while (0)
+#endif
+#define PLATFORM_SCRUB_DEAD_STACK(bytes) \
+    do { \
+        if (Platform_DeadStackScrubbable(__builtin_frame_address(0), (bytes))) { \
+            PLATFORM_ZERO_DEAD_STACK_(bytes); \
+        } \
+    } while (0)
 /* Run what the cooperative clock owes (ticks, VBlanks) at a point where the
  * console would have taken them while the game waited (DrawSync). Never
  * steps time itself; nothing under the interrupt clock or in a
