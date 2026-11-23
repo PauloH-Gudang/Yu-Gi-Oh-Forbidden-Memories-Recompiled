@@ -449,6 +449,11 @@ void Spu_Hold(int on)
     }
 }
 
+int Spu_Held(void)
+{
+    return __atomic_load_n(&hold, __ATOMIC_SEQ_CST);
+}
+
 void Spu_State(MemoriesState *state)
 {
     const MemoriesStateField fields[] = {

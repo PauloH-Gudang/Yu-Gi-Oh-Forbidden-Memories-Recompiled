@@ -5,7 +5,8 @@
 
 /* Software SPU: 24 ADPCM voices with hardware ADSR, 512 KiB sound RAM, and a
  * CD/XA input. The game thread (including its interrupt handlers) sets
- * parameters; one audio thread calls Spu_Mix. Key on/off cross threads as
+ * parameters; one audio thread calls Spu_Mix (with no device under the
+ * virtual clock, the game thread itself: platform_common.c). Key on/off cross threads as
  * atomic bit sets, everything else is single-word state, so no locks are
  * taken anywhere a signal handler can run.
  * Samples pass through the hardware's four-tap Gaussian interpolation.
@@ -56,6 +57,10 @@ int Spu_GetBusVolume(SpuBus bus);
 /* Save states: make the audio thread output silence, and wait until it is
  * outside Spu_Mix, so the voices can be read or replaced. */
 void Spu_Hold(int on);
+/* Nonzero while held: a mixer that steps Spu_Mix itself (the virtual
+ * clock's, platform_common.c) keeps those frames owed instead of mixing
+ * them as silence. */
+int Spu_Held(void);
 
 /* Audio thread: interleaved stereo at 44.1 kHz. */
 void Spu_Mix(int16_t *out, size_t frames);
