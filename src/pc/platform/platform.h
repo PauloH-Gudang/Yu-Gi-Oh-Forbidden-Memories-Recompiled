@@ -333,7 +333,8 @@ void Platform_VSyncHeartbeat(void);
 int Platform_StartAudio(void (*mix)(int16_t *frames, size_t count));
 /* The device-less mixer thread (platform_common.c): silent, or dumping to a
  * file. Backends use it for MEMORIES_NO_AUDIO, MEMORIES_DUMP_AUDIO and when
- * no device opens. */
+ * no device opens. Under MEMORIES_DETERMINISTIC=1 (not on Android) it starts
+ * no thread: the game thread mixes as the virtual clock steps. */
 int Platform_StartSilentAudio(void (*mix)(int16_t *frames, size_t count), const char *dump_path);
 void Platform_AudioStats(int *queued_frames, unsigned *underruns);
 #endif

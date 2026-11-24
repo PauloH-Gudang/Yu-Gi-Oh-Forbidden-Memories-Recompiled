@@ -63,9 +63,23 @@ Gotchas:
 
 `MEMORIES_DETERMINISTIC=1` alone gives the virtual clock, headless or
 windowed, with no frame dump needed and no exit. Proven by the smoke hashes
-staying the same and by two runs giving identical frame hashes. Stepping the
-mixer by virtual time is a separate change; until then, RAM comparisons mask
-`g_SDValue` and the spu, libspu, bss and data chunks.
+staying the same and by two runs giving identical frame hashes. With no
+audio device (`MEMORIES_NO_AUDIO=1`, `MEMORIES_DUMP_AUDIO=path`, headless,
+no window, or none opens) the switch also mixes the SPU on the game thread
+by virtual time, 44.1 frames for each 1 ms step, instead of on a thread
+paced by the host's clock, so the sound driver's memory (`g_SDValue` and
+its secondary state, 0x801E0000 to about 0x801E1B50) is the same in two
+lockstep runs too, as are the spu and libspu chunks of a state saved at the
+same VBlank. Before, that driver memory differed in every run, which is why
+RAM comparisons (replay.py's `MASKS`) mask it; the mask can go once the
+dead game stack's residue, which still reaches a few bytes elsewhere, is
+cleared as well. Headless or `MEMORIES_NO_AUDIO=1` is the deterministic
+path: a run with a device keeps the device-paced mixer, and so does a
+windowed run with `SDL_AUDIODRIVER=dummy` (SDL's dummy device opens) or a
+windowed `yfm_control.py` game, which sets `MEMORIES_DETERMINISTIC` but
+not `MEMORIES_NO_AUDIO`: their driver memory still differs from run to
+run. The old combination (no `MEMORIES_DETERMINISTIC`) keeps the mixer
+thread as well, and Android keeps it in every case.
 
 **Landed** (`platform_common.c`, `virtual_clock()`). The old combination
 (HEADLESS or DETERMINISTIC, with DUMP_FRAME and SPEED=-1) still selects it,

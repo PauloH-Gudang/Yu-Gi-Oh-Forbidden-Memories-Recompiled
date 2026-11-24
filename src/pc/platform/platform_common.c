@@ -75,11 +75,73 @@ static int virtual_clock(void)
 #define DETERMINISTIC_STEP 1000
 #define DETERMINISTIC_SPIN 1000000 /* real us outside a wait before the timer steps a spinning game */
 
+static int deterministic_env(void)
+{
+    const char *asked = getenv("MEMORIES_DETERMINISTIC");
+    return asked && *asked && strcmp(asked, "0") != 0;
+}
+
 static uint64_t now_us(void)
 {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
     return (uint64_t)now.tv_sec * 1000000u + (uint64_t)now.tv_nsec / 1000u;
+}
+
+/* The silent sink under MEMORIES_DETERMINISTIC=1 (Platform_StartSilentAudio):
+ * no mixer thread. A thread paced by the host's clock mixed as much as real
+ * time allowed, while the game ran flat out on virtual time, so the voice
+ * levels the sound driver reads (SpuGetKeyStatus, SpuGetVoiceEnvelope) had
+ * moved a different amount at the same game instant in each run: a voice
+ * finished its release a tick earlier in one, the driver freed and reused
+ * its note records in another order, and two lockstep runs parted in the
+ * driver's memory (0x801E0380.., 0x801E15D8..0x801E1B0F). Here the SPU is
+ * mixed on the game thread as virtual time passes, 44.1 frames for each
+ * 1 ms step, before the step's tick runs the sound driver (a step the
+ * interrupt clock's handler takes only owes its frames, which the next step
+ * on the game thread mixes before its own tick). The fraction of
+ * a frame still owed goes in the save state ("platform-mixer"), since
+ * virtual time itself is the process's. */
+static void (*stepped_mixer)(int16_t *, size_t);
+static FILE *stepped_dump;    /* MEMORIES_DUMP_AUDIO, written as it is mixed */
+static uint32_t mix_fraction; /* ten-thousandths of a frame owed, below one frame */
+static uint32_t mix_owed;     /* whole frames owed: held (a save state), or stepped from the timer */
+
+static void mix_owe(unsigned us)
+{
+    uint32_t total = mix_fraction + 441u * us; /* 44100 frames a second */
+    mix_owed += total / 10000u;
+    mix_fraction = total % 10000u;
+}
+
+static void mix_owed_frames(void)
+{
+    static int16_t buffer[256 * 2];
+    static unsigned unflushed;
+    if (Spu_Held()) return; /* a save state is being taken or applied: the frames stay owed */
+    while (mix_owed) {
+        size_t count = mix_owed < 256 ? mix_owed : 256;
+        stepped_mixer(buffer, count);
+        mix_owed -= (uint32_t)count;
+        if (stepped_dump) {
+            fwrite(buffer, sizeof(int16_t) * 2, count, stepped_dump);
+            unflushed += (unsigned)count;
+            if (unflushed >= 256) { /* as often as the thread flushed, so a killed run loses as little */
+                fflush(stepped_dump);
+                unflushed = 0;
+            }
+        }
+    }
+}
+
+/* One virtual step's mix. `here` is zero where the step runs in the
+ * interrupt clock's handler (MEMORIES_CLOCK=interrupt), which only owes the
+ * frames; the next step on the game thread mixes them. */
+static void mix_step(int here)
+{
+    if (!stepped_mixer) return;
+    mix_owe(DETERMINISTIC_STEP);
+    if (here) mix_owed_frames();
 }
 
 static void deliver_vblank(void)
@@ -121,6 +183,7 @@ static void advance(uint64_t real_now, uintptr_t eip)
             static unsigned reported_count, steps;
             unsigned i;
             virtual_now += DETERMINISTIC_STEP;
+            mix_step(cooperative);
             if (tick_handler) tick_handler(virtual_now, virtual_now);
             steps++;
             for (i = 0; i < reported_count && reported[i] != eip; i++) {}
@@ -273,11 +336,8 @@ int Platform_StartTimers(void (*tick)(uint64_t, uint64_t), void (*vblank)(void))
      * was; MEMORIES_DETERMINISTIC=1 alone needs neither a dump nor speed -1. */
     deterministic_dump = (getenv("MEMORIES_HEADLESS") != NULL || getenv("MEMORIES_DETERMINISTIC") != NULL) &&
                          (getenv("MEMORIES_DUMP_FRAME") != NULL || getenv("MEMORIES_DUMP_FRAMES") != NULL);
-    {
-        const char *asked = getenv("MEMORIES_DETERMINISTIC");
-        deterministic_asked = asked && *asked && strcmp(asked, "0") != 0;
-        deterministic_paced = deterministic_asked && getenv("MEMORIES_HEADLESS") == NULL;
-    }
+    deterministic_asked = deterministic_env();
+    deterministic_paced = deterministic_asked && getenv("MEMORIES_HEADLESS") == NULL;
     last_vsync_real = now_us();
     {
         const char *watchdog = getenv("MEMORIES_WATCHDOG");
@@ -661,6 +721,7 @@ void Platform_PollTime(void)
     sigprocmask(SIG_BLOCK, &set, &previous);
     if (!next_vblank) next_vblank = virtual_now + vblank_period;
     virtual_now += DETERMINISTIC_STEP;
+    mix_step(1);
     if (tick_handler) tick_handler(virtual_now, virtual_now);
     if (virtual_now >= next_vblank) {
         next_vblank += vblank_period;
@@ -734,6 +795,7 @@ __attribute__((noinline)) static void wait_vblank(unsigned count_at_entry)
             if (!next_vblank) next_vblank = virtual_now + vblank_period;
             while (virtual_now < next_vblank) {
                 virtual_now += DETERMINISTIC_STEP;
+                mix_step(1);
                 if (tick_handler) tick_handler(virtual_now, virtual_now);
             }
             next_vblank += vblank_period;
@@ -804,6 +866,22 @@ void Platform_State(MemoriesState *state)
         phase <= 4 * (int64_t)vblank_period) {
         next_vblank = virtual_now + (uint64_t)phase;
     }
+    if (stepped_mixer) {
+        /* The stepped mixer's phase (above): the steps after a load mix as
+         * many frames as they did in the game that saved. A state without
+         * it starts from a whole frame, whatever the loading game owed
+         * (unlike the loader's "keeps its current state" for a missing
+         * chunk: what this game owed has nothing to do with the state's
+         * game). Values no game saves (more than a second owed) are a
+         * damaged state: clamped, so a step never mixes for seconds. */
+        const MemoriesStateField mixer[] = {{&mix_fraction, sizeof(mix_fraction)}, {&mix_owed, sizeof(mix_owed)}};
+        if (Memories_StateChunk(state, "platform-mixer", mixer, 2)) {
+            if (mix_fraction >= 10000u) mix_fraction = 0;
+            if (mix_owed > 44100u) mix_owed = 44100u;
+        } else if (Memories_StateLoading(state)) {
+            mix_fraction = mix_owed = 0;
+        }
+    }
 }
 
 /* MEMORIES_INPUT="600:0008,610:0000": hex pad bits applied from a frame on;
@@ -849,8 +927,11 @@ int Platform_ScriptedPad2(void)
 
 /* MEMORIES_DUMP_AUDIO=path: no device; mix in real time into raw s16le
  * stereo 44.1 kHz so output can be inspected without speakers. With no path
- * this is the silent sink: the SPU still has to run, because the game polls
- * envelopes and the disc service waits for CD input room. */
+ * this is the silent sink: the SPU still has to run, because the sound
+ * driver reads voice status and envelopes, and the CD/XA input is only
+ * drained by the mixer. Under MEMORIES_DETERMINISTIC=1 neither has a thread:
+ * the game thread mixes as virtual time passes (mix_step, above), and the
+ * dump is written from there, as long as the game's virtual time. */
 static void (*silent_mixer)(int16_t *, size_t);
 
 static void *run_silent(void *path)
@@ -874,6 +955,13 @@ int Platform_StartSilentAudio(void (*mix)(int16_t *, size_t), const char *dump_p
     pthread_t thread;
     sigset_t all, previous;
     int error;
+#ifndef __ANDROID__ /* the phone keeps its mixer thread: Spu_Mix on its game thread is untried */
+    if (deterministic_env()) {
+        stepped_dump = dump_path ? fopen(dump_path, "wb") : NULL;
+        stepped_mixer = mix;
+        return 0;
+    }
+#endif
     silent_mixer = mix;
     /* The timer signal is the game's interrupt and must stay on the main thread. */
     sigfillset(&all);
