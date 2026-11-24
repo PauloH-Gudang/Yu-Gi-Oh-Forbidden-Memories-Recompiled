@@ -2724,15 +2724,19 @@ static void clip_rect(int *x, int *y, int *w, int *h)
     if (*y + *h > SOFT_GPU_HEIGHT) *h = SOFT_GPU_HEIGHT - *y;
 }
 
-static void apply_load(int x, int y, int w, int h, const uint16_t *pixels)
+/* The part of a load the picture has room for (an upload past the edge wraps
+ * on the console; here it is cut). 0 when none of it is left. */
+static int load_clip(int *x, int *y, int *w, int *h)
 {
-    int cw = w, ch = h;
-    flush_runs();
-    if (scale < 2) return;
-    x &= SOFT_GPU_WIDTH - 1;
-    y &= SOFT_GPU_HEIGHT - 1;
-    clip_rect(&x, &y, &cw, &ch); /* an upload past the edge wraps on the console; here it is cut */
-    if (cw <= 0 || ch <= 0) return;
+    *x &= SOFT_GPU_WIDTH - 1;
+    *y &= SOFT_GPU_HEIGHT - 1;
+    clip_rect(x, y, w, h);
+    return *w > 0 && *h > 0;
+}
+
+/* Its words into VRAM's texture; w is the row length of pixels. */
+static void load_upload(int x, int y, int w, int cw, int ch, const uint16_t *pixels)
+{
     capture_touch(x, y, cw, ch);
     glBindTexture(GL_TEXTURE_2D, vram_texture);
     glPixelStorei(GL_UNPACK_ROW_LENGTH, w);
@@ -2740,8 +2744,66 @@ static void apply_load(int x, int y, int w, int h, const uint16_t *pixels)
     glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, cw, ch, GL_RED_INTEGER, GL_UNSIGNED_SHORT, pixels);
     glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+}
+
+/* Its words from VRAM's texture into the picture and the widescreen targets. */
+static void load_copy(int x, int y, int cw, int ch)
+{
     picture_from_words(x, y, cw, ch);
     wide_mirror(x, y, cw, ch, 0, 0, 0, 0);
+}
+
+static void apply_load(int x, int y, int w, int h, const uint16_t *pixels)
+{
+    int cw = w, ch = h;
+    flush_runs();
+    if (scale < 2) return;
+    if (!load_clip(&x, &y, &cw, &ch)) return;
+    load_upload(x, y, w, cw, ch, pixels);
+    load_copy(x, y, cw, ch);
+}
+
+/* The words one OP_LOAD takes in a record. */
+static size_t load_words(const uint32_t *op)
+{
+    return 5 + ((size_t)op[3] * op[4] + 1) / 2;
+}
+
+/* A run of loads in a record, from the one at taken[at] (a 3D battle sends
+ * some 235 of them, its models and palettes, as it starts, up to 68 in one
+ * replay): every upload into VRAM's texture first, then each one's copy into
+ * the picture, in the record's order. One at a time, each upload changed the
+ * texture the copy queued just before it still reads. Measured on a Samsung
+ * A22 (Mali, OpenGL ES): the worst frame at the start of a battle was 106 to
+ * 153 ms at 2x and 102 to 172 ms at 4x (three runs of two battles each), and
+ * in two passes 38 to 43 ms at 2x and 58 to 69 ms at 4x. With timers around
+ * the uploads (one run at 2x) an upload took 1.5 to 2 ms there, and 0.3 ms in
+ * two passes; a desktop GPU takes 8 us. The likely cause is the driver
+ * waiting for the queued copy, or copying the texture; it was not looked at.
+ * The picture is the same: a copy reads only its own word of VRAM's texture
+ * (nothing around it), so where two loads overlap the later one's words are in
+ * the picture either way, and each copy and its widescreen mirror still follow
+ * the one before it. Returns the words the run takes: it ends at a record that
+ * is not a load, or a load cut short by the end of the record, which the caller
+ * stops on as it always did. */
+static size_t apply_loads(const uint32_t *taken, size_t at, size_t count)
+{
+    size_t end = at, k;
+    flush_runs();
+    while (end + 5 <= count && taken[end] == OP_LOAD && end + load_words(taken + end) <= count)
+        end += load_words(taken + end);
+    if (scale < 2) return end - at;
+    for (k = at; k < end; k += load_words(taken + k)) {
+        const uint32_t *op = taken + k;
+        int x = (int)op[1], y = (int)op[2], cw = (int)op[3], ch = (int)op[4];
+        if (load_clip(&x, &y, &cw, &ch)) load_upload(x, y, (int)op[3], cw, ch, (const uint16_t *)(op + 5));
+    }
+    for (k = at; k < end; k += load_words(taken + k)) {
+        const uint32_t *op = taken + k;
+        int x = (int)op[1], y = (int)op[2], cw = (int)op[3], ch = (int)op[4];
+        if (load_clip(&x, &y, &cw, &ch)) load_copy(x, y, cw, ch);
+    }
+    return end - at;
 }
 
 static void apply_fill(int x, int y, int w, int h, uint32_t rgb24)
@@ -3051,9 +3113,9 @@ int GlPicture_Replay(void)
             if (scale < 2) vertex_count = run_count = 0; /* the state words still count */
             break;
         case OP_LOAD:
-            used = 5 + ((size_t)op[3] * op[4] + 1) / 2;
+            used = load_words(op);
             if (at + used > count) { at = count; break; }
-            apply_load((int)op[1], (int)op[2], (int)op[3], (int)op[4], (const uint16_t *)(op + 5));
+            used = apply_loads(taken, at, count); /* this one and the loads right after it */
             break;
         case OP_MOVE:
             used = 7;
