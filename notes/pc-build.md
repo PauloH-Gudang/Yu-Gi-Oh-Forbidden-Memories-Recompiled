@@ -2768,6 +2768,65 @@ standard error, which the app forwards to logcat (`adb logcat -s
 memories`: "OpenGL picture: OpenGL ES 3.2 ... on Adreno ..., OpenGL ES
 GLSL ES 3.20", then "OpenGL picture pass on").
 
+**Subtractive blending with framebuffer fetch (Mali).** A subtractive
+(mode 2) primitive is a run of its own, drawn twice (its opaque texels,
+then its semi-transparent ones with `GL_FUNC_REVERSE_SUBTRACT`), and the
+normal stretch after it is another run. A 3D battle's attack effect
+(about 31 frames) draws about 400 subtractive triangles a frame, one at a
+time between normal ones: one flush of about 890 runs and 1,360
+`glDrawArrays`, against 35 runs before the effect. On a Samsung Galaxy A22
+(Mali-G52, OpenGL ES 3.2) at 2x that flush took 42 ms of CPU a frame and
+about 180 ms on the effect's first frame, 27 to 44 VBlanks missed around
+it over the runs measured; the same state and uniform calls without the
+draws took 1.6 ms, so the time is in the draw calls (likely the driver's
+cost per draw; a desktop NVIDIA driver makes the same calls in 0.2 ms).
+Where the driver lists `GL_ARM_shader_framebuffer_fetch`, the pass also
+builds `fetch_program`: the fragment shader with `FRAMEBUFFER_FETCH`, in
+which a semi-transparent texel of mode 2 reads the pixel under it
+(`gl_LastFragColorARM`) and writes `max(dst - src, 0)` with alpha 0, which
+the blend (one, source alpha) passes through as it is: the subtracting
+pass's equation, in the same draw. Reading the picture costs the GPU, so it
+is used where the draws cost more: in a flush with at least 128
+subtractive runs for one target (`FETCH_MIN_RUNS`; counted per target, the
+picture or a widescreen target, since in widescreen a primitive is drawn
+into both: the map's flushes have 128 to 188 subtractive runs in all
+there, 64 to 94 for one target), `fetch_join` joins each stretch of
+runs of one state from its first subtractive run to its last into one run
+drawn with `fetch_program` (`fetch_use` switches programs per run); the
+runs around them, and every other flush, are drawn as before. On the A22
+(OpenGL ES, mods off, no pack), a subtractive primitive is in most of the
+game (the PC's count, 2x: the boot, the menus' fades with 30 subtractive
+runs a flush, the campaign map with 64 to 94 in every flush, Free Duel,
+the duel, 3D battles, the credits), and at 4x the map fell from 46.7 to
+35.3 frames a second when every flush with one used `fetch_program`, 43.8
+when only the span between its subtractive runs did; the steady 3D battle
+(a median of 8 a flush over two whole battles) kept 30 frames a second
+with the GPU busier. The attack effect has about 460 in its flush.
+Not used with anti-aliasing (the color
+read is then not the pixel's), where the extension is missing (desktop
+GL, GPUs without it), where its program does not build (once: "no
+framebuffer fetch" in the log), or with `MEMORIES_GL_FETCH=0` (the
+subtractive primitives then draw in two passes as before). "framebuffer
+fetch on" in the log says it is available; with `MEMORIES_TRACE=frames`,
+"N flushes drawn with framebuffer fetch" counts them every 120 replays.
+The first start after an install compiles one more program: 337 ms on the
+A22 against 6 without; later starts take 5 to 13 ms (the driver keeps
+it). `GL_EXT_shader_framebuffer_fetch` (Adreno, PowerVR) is not used: it
+has not been tried on a device.
+Measured on the A22 (22 November 2026, mods off, no pack, three runs a
+side, `MEMORIES_GL_FETCH=0` against the default on the same APK, the
+game's 120-frame trace windows): in the attack effect at 2x, 38.5 VBlanks
+missed (27 to 40.5) and a worst frame of 101 to 255 ms became 0 missed and
+at most 13 ms; at 4x 45.5 (24 to 47.5) became 37.5 (37 to 38) and the worst
+frame 134 to 252 ms became 47 to 53 ms, the effect still GPU-bound (about
+26 frames a second, the GPU at 80% against 69%). The duel field, the map and
+the steady 3D battle drew no flush with it and kept their frame rates (the
+map at 4x 46.5 against 46.6 frames a second). The picture is the same:
+lockstep frame dumps (`MEMORIES_DETERMINISTIC=1`, `MEMORIES_DUMP_PICTURE=1`)
+of the effect against the two passes, and the scaled picture of every
+replay on the desktop (which never takes this path) against the build
+before it.
+
 **A lost context.** Android may lose the GL context while the app is in
 the background; SDL then makes a new one and sends
 `SDL_EVENT_RENDER_DEVICE_RESET`. SDL's GLES2 renderer cannot go on (its
