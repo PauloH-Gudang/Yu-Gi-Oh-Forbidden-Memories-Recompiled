@@ -231,6 +231,52 @@ void Platform_StopTimers(void);
  * lets 1 ms of game time pass, since a loop polling it is waiting for time
  * (movie playback waits for its strips that way). Nothing otherwise. */
 void Platform_PollTime(void);
+/* The game's code runs on the fixed game stack (state.h), and so does the
+ * host code it calls: the clock's pass (advance, the tick and VBlank
+ * handlers, the disc and MDEC work), the VSync's present. What such a call
+ * leaves below the game's frame is read as garbage by a local the game never
+ * wrote (the padding bytes of a primitive, the ones the GPU ignores), and
+ * the clock's temporaries are the time of day: one lockstep run recorded a
+ * different padding byte each time (MEMORIES_DETERMINISTIC=1).
+ * PLATFORM_SCRUB_DEAD_STACK(bytes), last in a function a game call enters
+ * (a wrapper, so that the host code's frames are all below it), zeroes
+ * `bytes` of the stack below the function's own frame, with the cooperative
+ * clock and on the game stack; anywhere else it does nothing. Under the
+ * interrupt clock (MEMORIES_CLOCK=interrupt) it never scrubs: a tick lands
+ * between the scrub and the game's next read of that stack, and dirties it again. */
+int Platform_DeadStackScrubbable(const void *frame, size_t bytes);
+/* A state load resumes in the VSync's caller, past the wrapper that scrubs: this does the same
+ * for it. Zeroes `bytes` of the game stack below `sp` (the stack below the restored frames is
+ * the session before the load's). Cooperative clock only; stays clear of the stack's guard
+ * pages. Called from the process stack, not the game's. */
+void Platform_ScrubGameStackBelow(uintptr_t sp, size_t bytes);
+/* The zeroing is rep stos on x86, where the game stack is: a loop of volatile
+ * stores (what keeps the compiler from dropping stores to memory that is never
+ * read) ran about 19 us for a 256 KiB span, once a frame, and rep stos runs at the
+ * memory system's speed, about 5 us. It is inline asm, never a call to memset: a
+ * call's return address would be left just past the span, where a local of the
+ * game that deep reads it. Elsewhere the loop. */
+#if defined(__i386__) || defined(__x86_64__)
+#define PLATFORM_ZERO_DEAD_STACK_(bytes) \
+    do { \
+        void *scrub_ = __builtin_alloca(bytes); \
+        size_t scrub_n_ = (bytes) / 4u; \
+        __asm__ volatile("rep stosl" : "+D"(scrub_), "+c"(scrub_n_) : "a"(0) : "memory", "cc"); \
+    } while (0)
+#else
+#define PLATFORM_ZERO_DEAD_STACK_(bytes) \
+    do { \
+        volatile uint32_t *scrub_ = (volatile uint32_t *)__builtin_alloca(bytes); \
+        size_t scrub_i_; \
+        for (scrub_i_ = 0; scrub_i_ < (bytes) / sizeof(uint32_t); scrub_i_++) scrub_[scrub_i_] = 0; \
+    } while (0)
+#endif
+#define PLATFORM_SCRUB_DEAD_STACK(bytes) \
+    do { \
+        if (Platform_DeadStackScrubbable(__builtin_frame_address(0), (bytes))) { \
+            PLATFORM_ZERO_DEAD_STACK_(bytes); \
+        } \
+    } while (0)
 /* Run what the cooperative clock owes (ticks, VBlanks) at a point where the
  * console would have taken them while the game waited (DrawSync). Never
  * steps time itself; nothing under the interrupt clock or in a

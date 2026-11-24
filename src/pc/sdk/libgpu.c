@@ -462,14 +462,28 @@ void Memories_PresentDisplay(void)
  * in and the pad code reports each press twice. So DrawOTag only snapshots
  * the list, and it is rasterized where the hardware would have finished it:
  * at DrawSync, or before anything else that reads or writes VRAM. */
+/* The rasteriser's frames, the clock reads around it (t0, t1) and the list's
+ * words end up below the caller's frame: cleared once the list is drawn, as
+ * the VSync's present is (platform.h, PLATFORM_SCRUB_DEAD_STACK). */
+#define FLUSH_SCRUB_BYTES (64u * 1024u)
+static int draw_pending(void);
+
 static void flush_drawing(void)
+{
+    if (draw_pending()) {
+        PLATFORM_SCRUB_DEAD_STACK(FLUSH_SCRUB_BYTES);
+    }
+}
+
+/* 1 when there was a list to draw. */
+__attribute__((noinline)) static int draw_pending(void)
 {
     static unsigned draws, total_us, total_words;
     struct timespec t0, t1;
     size_t count = pending_words;
     pending_words = 0; /* first: an interrupt-level LoadImage may re-enter */
     if (!count) {
-        return;
+        return 0;
     }
     clock_gettime(CLOCK_MONOTONIC, &t0);
     SoftGpu_PanelName = HdText_NameEnabled() ? HdText_NamePixels : NULL;
@@ -489,6 +503,7 @@ static void flush_drawing(void)
             draws = total_us = total_words = 0;
         }
     }
+    return 1;
 }
 
 /* A model's parts are each projected with their own matrix, and where they
