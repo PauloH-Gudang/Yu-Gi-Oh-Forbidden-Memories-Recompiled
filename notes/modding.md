@@ -1321,8 +1321,7 @@ so a full art card's picture can run past its frame. The picture is always
 stretched whole into the rectangle: a card's own `art` PNG is cut to the
 picture's 102:96 shape when it is read, so a picture of another shape (a tall
 one for a full art card) is squeezed to that shape in the PNG, and the
-rectangle gives it its own shape back (the FM Editor's Variants tab does that
-for **Full art**).
+rectangle gives it its own shape back.
 
 A card's own `art` PNG may have transparent parts (a cut-out figure on a clear
 background) when the card says `"art_transparent": true`: a pixel under half
@@ -1340,7 +1339,7 @@ A full-bleed style with no `image` has no frame at all (the game's own is
 left out, the card is the picture and its parts). `"game_frame": true` keeps
 the game's own frame behind it: the card's colour (monster, magic, trap...),
 its name bar and stat boxes, under a picture and parts the style places where
-it likes (the FM Editor's Full art uses it). On that frame the card's name, its
+it likes (a full art card's). On that frame the card's name, its
 ATK and DFD words and its numbers are the game's own, where the game puts them
 (`title`, `atk_label`, `dfd_label` and `digits`' `atk`/`def` left out), and a
 part the style gives is the style's, as in any full bleed.
@@ -1518,7 +1517,8 @@ that declared it: its pictures are in that mod's folder, its own parts
 on from the start when the mod's `settings` entry for `full_bleed` has
 `"default": 1`. (A mod whose `card_layout` holds only `frame_styles`, below,
 and that declares no `full_bleed` setting has its styles always on: only the
-cards that name one are drawn in it.) The shared keys (`frame_for`,
+cards that name one, or whose `frame` color is a style's name (below), are
+drawn in it.) The shared keys (`frame_for`,
 `default_style`, `default_styles`, the layout's own `art`, `atk`, `def`,
 `stars`, `attribute`, `spell`, `digits` and `type_label`, and the older
 per-kind `frame`) come from one layout, as above.
@@ -1541,7 +1541,9 @@ How a card finds its style:
   retail's frame.
 - Every other card is picked by the shared layout's rules, as before. The rules
   look a name up in the shared layout's own styles first, then the others'. A
-  style named for the card's `frame` color may be any layout's.
+  style named for the card's `frame` color may be any layout's, a mod's of
+  styles alone too: a cards mod's `"frame": "gold"` card wears the `gold` of
+  such a mod while that mod is on, even with the HD pack off.
 - A name two mods declare is taken from the newer one, with a note, unless the
   shared layout's own rules or the declaring mod named it: prefix the styles
   of a cards mod (`foil-rainbow`) so they cannot meet another mod's `gold`.
