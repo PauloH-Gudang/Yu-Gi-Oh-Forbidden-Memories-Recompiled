@@ -429,9 +429,12 @@ static void frame_color_override_wins_over_type(void)
 }
 
 /* CardLayoutFrameStyle is lent to code mods (CardLayout_FrameStyleOf fills the caller's own) and shipped in
- * v0.3.1-preview: nothing may follow library_icon, or a mod built against it has its stack written past. */
-_Static_assert(sizeof(CardLayoutFrameStyle) == offsetof(CardLayoutFrameStyle, library_icon) + 1024,
+ * v0.3.1-preview: five ints, a 32-byte name and six 1024-byte paths. A field added anywhere would have a mod
+ * built against it read the wrong place or have its stack written past. */
+_Static_assert(sizeof(CardLayoutFrameStyle) == 5 * sizeof(int) + 32 + 6 * 1024,
                "CardLayoutFrameStyle keeps its shipped size");
+_Static_assert(offsetof(CardLayoutFrameStyle, library_icon) == 5 * sizeof(int) + 32 + 5 * 1024,
+               "CardLayoutFrameStyle keeps its shipped layout");
 
 /* "frame_styles", "frame_for" and "default_style" (card_layout.h's
  * CardLayoutFrameStyle): the names the whole feature is built on. */

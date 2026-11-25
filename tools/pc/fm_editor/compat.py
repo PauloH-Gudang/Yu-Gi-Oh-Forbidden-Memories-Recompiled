@@ -262,23 +262,26 @@ def features(manifest: dict, project=None) -> list:
             add(27, "a card's see-through picture (\"art_transparent\")")
     layout = manifest.get("card_layout")
     styles = layout.get("frame_styles") if isinstance(layout, dict) else None
-    if isinstance(layout, dict):
-        if isinstance(layout.get("stars"), dict) and "image" in layout["stars"]:
-            add(27, "the level stars from a picture (\"stars\" \"image\")")
-        for key in ("atk_label", "dfd_label", "digits"):
-            if isinstance(layout.get(key), dict) and "color" in layout[key]:
-                add(27, "a \"color\" on \"%s\"" % key)
-    for style in (styles.values() if isinstance(styles, dict) else ()):
-        if not isinstance(style, dict):
+    for node, where in [(layout, "")] + [(style, "a frame style's ") for style in
+                                          (styles.values() if isinstance(styles, dict) else ())]:
+        if not isinstance(node, dict):
             continue
         for key in ("game_frame", "parts_over_art"):
-            if key in style:
+            if where and key in node:
                 add(27, "a frame style's \"%s\"" % key)
-        if isinstance(style.get("stars"), dict) and "image" in style["stars"]:
-            add(27, "a frame style's level stars from a picture (\"stars\" \"image\")")
-        for key in ("atk_label", "dfd_label", "digits"):
-            if isinstance(style.get(key), dict) and "color" in style[key]:
-                add(27, "a \"color\" on a frame style's \"%s\"" % key)
+        if isinstance(node.get("stars"), dict) and node["stars"].get("image"):
+            add(27, where + "level stars from a picture (\"stars\" \"image\")")
+        for key in ("atk_label", "dfd_label"):
+            if isinstance(node.get(key), dict) and "color" in node[key]:
+                add(27, "a \"color\" on %s\"%s\"" % (where, key))
+        # A digit strip's numbers take the color of `atk`/`def` (in `digits` or beside it, as
+        # card_layout.c's digit_stat_part reads them); an older game drew the strip untinted.
+        digits = node.get("digits")
+        if isinstance(digits, dict) and digits.get("image"):
+            for key in ("atk", "def"):
+                part = digits.get(key) if isinstance(digits.get(key), dict) else node.get(key)
+                if isinstance(part, dict) and "color" in part:
+                    add(27, "a \"color\" on %sdigit strip's \"%s\"" % (where, key))
     return out
 
 

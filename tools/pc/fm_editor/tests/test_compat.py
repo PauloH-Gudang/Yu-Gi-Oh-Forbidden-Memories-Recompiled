@@ -301,13 +301,19 @@ class FeatureTest(unittest.TestCase):
     def test_api_27_frame_looks(self):
         """The richer parts of a frame style, and a see-through picture (notes/modding.md, "Frame styles"): a game
         of API 26 would ignore them and draw the plain card."""
+        strip = {"image": "d.png", "atk": {"color": {"g": 96}}}
         for style in ({"game_frame": True}, {"parts_over_art": True}, {"stars": {"image": "s.png"}},
-                      {"atk_label": {"color": {"r": 255}}}, {"digits": {"color": {"g": 96}}}):
+                      {"atk_label": {"color": {"r": 255}}}, {"digits": strip},
+                      {"digits": {"image": "d.png"}, "def": {"color": {"r": 9}}}):
             with self.subTest(style=style):
                 self.assertEqual(self.needs({"card_layout": {"frame_styles": {"a": style}}}), 27)
-        for layout in ({"stars": {"image": "s.png"}}, {"dfd_label": {"color": {"b": 32}}}):
+        for layout in ({"stars": {"image": "s.png"}}, {"dfd_label": {"color": {"b": 32}}}, {"digits": strip}):
             with self.subTest(layout=layout):
                 self.assertEqual(self.needs({"card_layout": layout}), 27)
+        # A color on the game's own numbers (no strip) was read before 27; an empty star picture is none.
+        self.assertLess(self.needs({"card_layout": {"atk": {"color": {"r": 1}}}}), 27)
+        self.assertLess(self.needs({"card_layout": {"digits": {"atk": {"color": {"r": 1}}}}}), 27)
+        self.assertLess(self.needs({"card_layout": {"stars": {"image": ""}}}), 27)
         self.assertEqual(self.needs({"cards": [{"copy": 1, "id": "a", "art_transparent": True}]}), 27)
         self.assertEqual(self.needs({"card_layout": {"frame_styles": {"a": {"stars": {"width": 9}}}}}), 18)
 
