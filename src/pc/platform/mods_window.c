@@ -18,6 +18,7 @@
 #include "pc/mods/import.h"
 #include "pc/mods/import_job.h"
 #include "pc/mods/json.h"
+#include "pc/mods/manifest_code.h"
 #include "pc/mods/mods.h"
 #include "pc/mods/overlap.h"
 #include "paths.h"
@@ -1007,6 +1008,12 @@ static JsonDocument *pack_info;
 static int pack_info_of = -1;
 static uint32_t *poster_pixels;
 static int poster_w, poster_h;
+/* The shown modpack's code mods, from its folders as the scan will load
+ * them (Mods_ImportFolderCode): their names, ", " between, and which of
+ * modpack.json's "mods" they are. */
+static char pack_code_names[1024];
+static int pack_code_count;
+static unsigned char pack_code_of[MODS_MAX];
 void ModsWindow_SetModpackPicker(int (*pick)(int kind, char *why, size_t why_size),
                                  int (*picked)(char *path, size_t size, char *why, size_t why_size))
 {
@@ -1041,6 +1048,28 @@ static void pack_forget_info(void)
     poster_pixels = NULL;
     poster_w = poster_h = 0;
     pack_info_of = -1;
+    pack_code_names[0] = 0;
+    pack_code_count = 0;
+    memset(pack_code_of, 0, sizeof(pack_code_of));
+}
+/* pack_code_*: each mod folder of `folder` read for "library"/"libraries". */
+static void pack_code_scan(const char *folder)
+{
+    const JsonValue *list = Json_Member(Json_Root(pack_info), "mods");
+    DIR *d = opendir(folder);
+    struct dirent *e;
+    if (!d) return;
+    while ((e = readdir(d))) {
+        char path[1200], name[128];
+        size_t n = strlen(pack_code_names);
+        if (e->d_name[0] == '.' || (size_t)snprintf(path, sizeof(path), "%s/%s", folder, e->d_name) >= sizeof(path) ||
+            !Mods_ImportFolderCode(path, name, sizeof(name)))
+            continue;
+        snprintf(pack_code_names + n, sizeof(pack_code_names) - n, "%s%s", pack_code_count++ ? ", " : "", name);
+        for (int i = 0; i < Json_Count(list) && i < MODS_MAX; i++)
+            if (!strcmp(Json_String(Json_Member(Json_At(list, i), "folder"), ""), e->d_name)) pack_code_of[i] = 1;
+    }
+    closedir(d);
 }
 /* A PNG's pixels (0xRRGGBB), and its size; NULL when it cannot be read. */
 static uint32_t *png_pixels(const char *path, int *w, int *h)
@@ -1088,6 +1117,7 @@ static void pack_load_info(void)
     pack_info = Json_ParseFile(path, error, sizeof(error));
     snprintf(path, sizeof(path), "%s/poster.png", folder);
     poster_pixels = png_pixels(path, &poster_w, &poster_h);
+    pack_code_scan(folder);
 }
 static void packs_scan(void)
 {
@@ -2167,6 +2197,7 @@ typedef struct {
     int poster_w, poster_h;
     int mods;                                                    /* how many cards */
     void (*mod)(int i, const char **name, const char **author); /* the i-th card's */
+    int (*code)(int i);                    /* the i-th card's mod runs native code (NULL: none does) */
 } PackView;
 static void poster_paint(MenuCanvas *c, Rect r, const uint32_t *pixels, int pw, int ph)
 {
@@ -2221,13 +2252,19 @@ static int pack_view_draw(MenuCanvas *c, int x, int y, int w, const PackView *v)
             const char *name = "?", *who = "";
             v->mod(i, &name, &who);
             int chip_w = *who ? min(width_text(who) + 16 * unit, w / 2) : 0;
+            int code_w = v->code && v->code(i) ? width_text("Code mod") + 16 * unit : 0;
             Rect row = rect(x, y, w, card), chip = rect(x + w - chip_w - 4 * unit, y + 3 * unit, chip_w, card - 6 * unit);
+            Rect tag = rect(chip.x - code_w - (chip_w ? 6 * unit : 0), y + 3 * unit, code_w, card - 6 * unit);
             fill(c, row, i % 2 ? 0x262b33u : 0x2a303au);
             fill(c, rect(x, y, 3 * unit, card), ACCENT); /* a stripe on the card's left */
-            text(c, x + 12 * unit, y + card / 2, w - chip_w - 24 * unit, name, TEXT);
+            text(c, x + 12 * unit, y + card / 2, tag.x - x - 18 * unit, name, TEXT);
             if (chip_w) {
                 fill(c, chip, 0x1f3354u);
                 centred(c, chip, who, BLUE);
+            }
+            if (code_w) { /* it runs native code: said before Activate, as an import says it */
+                fill(c, tag, 0x4a3a1fu);
+                centred(c, tag, "Code mod", WARN);
             }
             y += card + gap;
         }
@@ -2240,6 +2277,14 @@ static void detail_mod(int i, const char **name, const char **author)
     const JsonValue *m = Json_At(Json_Member(Json_Root(pack_info), "mods"), i);
     *name = Json_String(Json_Member(m, "name"), "?");
     *author = Json_String(Json_Member(m, "author"), "");
+}
+static int detail_code(int i) { return i >= 0 && i < MODS_MAX && pack_code_of[i]; }
+/* The Export form's preview: whether the i-th ticked mod has code. */
+static int export_preview_code(int i)
+{
+    for (int j = 0; j < export_count; j++)
+        if (export_mods[j].selected && !i--) return Manifest_HasCode(Json_Root(export_mods[j].manifest));
+    return 0;
 }
 /* The Export form's preview: the i-th ticked mod. */
 static void export_preview_mod(int i, const char **name, const char **author)
@@ -2331,6 +2376,7 @@ static void draw_form(MenuCanvas *c, const PackLayout *k)
         v.poster = preview_pixels, v.poster_w = preview_w, v.poster_h = preview_h;
         v.mods = export_selected();
         v.mod = export_preview_mod;
+        v.code = export_preview_code;
         text(c, x, top + 10 * unit, w, "Preview", TEXT);
         fill(c, rect(x, top + 24 * unit, w, 1 * unit), EDGE);
         y = pack_view_draw(c, x + 12 * unit, top + 36 * unit, w - 24 * unit, &v);
@@ -2426,12 +2472,19 @@ static void draw_packs(MenuCanvas *c, const Layout *l)
         v.poster = poster_pixels, v.poster_w = poster_w, v.poster_h = poster_h;
         v.mods = root ? Json_Count(Json_Member(root, "mods")) : 0;
         v.mod = detail_mod;
+        v.code = detail_code;
         y = pack_view_draw(c, x, y, w, &v);
         if (v.mods) {
         } else if (pack_sel) {
-            put(line, sizeof(line), "%d mod(s), all on when the game starts with this modpack.", pack_mods[pack_sel - 1]);
+            put(line, sizeof(line), "%d mod(s), all on at the first launch with this modpack.", pack_mods[pack_sel - 1]);
             y = wrap(c, x, y, w, line, DIM);
-        } else
+        }
+        if (pack_sel && pack_code_count) {
+            /* Information, not a question: activating it is the player's choice. */
+            put(line, sizeof(line), "%d code mod(s), which run native code in the game: %s.", pack_code_count,
+                pack_code_names);
+            y = wrap(c, x, y + 4 * unit, w, line, WARN);
+        } else if (!pack_sel)
             y = wrap(c, x, y, w, "The game starts with the mods of the mods folder, as without modpacks.", DIM);
     }
     pack_detail_max = max(0, y + pack_detail_scroll + 12 * unit - viewport.height);

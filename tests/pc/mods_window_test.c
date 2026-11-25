@@ -1627,6 +1627,30 @@ static int folder_main(void)
     folder_access_case();
     return 0;
 }
+/* The Modpack tab: a pack's detail marks its code mods, read from its
+ * folders, before Activate (information only: no question is asked). */
+static void test_modpack_code(void)
+{
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/modpacks", root);
+    mkdir(path, 0777); /* there already, or not */
+    make_dir("modpacks/Set");
+    make_dir("modpacks/Set/mod-001");
+    write_text("modpacks/Set/mod-001/mod.json", "{\"id\":\"coded\",\"name\":\"Coded\",\"library\":\"coded\"}");
+    make_dir("modpacks/Set/mod-002");
+    write_text("modpacks/Set/mod-002/mod.json", "{\"id\":\"plain\",\"name\":\"Plain\"}");
+    write_text("modpacks/Set/modpack.json",
+               "{\"name\":\"Set\",\"mods\":[{\"id\":\"coded\",\"name\":\"Coded\",\"folder\":\"mod-001\"},"
+               "{\"id\":\"plain\",\"name\":\"Plain\",\"folder\":\"mod-002\"}],\"files\":{}}");
+    ModsWindow_Init();
+    click(50, 118);            /* the Modpack tab */
+    click(100, 178 + 44 + 14); /* its first pack (the row above is No modpack) */
+    draw(920, 640);
+    assert(strstr(drawn, "1 code mod(s), which run native code in the game: Coded."));
+    assert(drawn_y("Code mod\n") >= 0 && drawn_y("Code mod\n") == drawn_y(" Coded\n"));
+    assert(drawn_y(" Plain\n") >= 0 && drawn_y(" Plain\n") != drawn_y("Code mod\n"));
+    ModsWindow_Init();
+}
 int main(int argc, char **argv)
 {
     char path[1024];
@@ -1829,6 +1853,7 @@ int main(int argc, char **argv)
         draw(920, 640);
         assert(strstr(drawn, "Content mod") && !strstr(drawn, "Native code mod"));
     }
+    test_modpack_code();
     ModsWindow_Init();
     ModsWindow_Resize(720, 480);
     ModsWindow_Size(&w, &h);

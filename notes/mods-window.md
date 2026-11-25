@@ -503,6 +503,11 @@ instead of every other mods folder; "No modpack" goes back to the normal mods.
 A folder put in `modpacks/` by hand, without a `modpack.json`, is a modpack
 too.
 
+- **Code mods** in a pack are marked in its detail before Activate: a "Code
+  mod" tag on its card and a line naming them, read from the pack's mod
+  folders as the scan will load them (`Mods_ImportFolderCode`, the same
+  "library"/"libraries" test as the loader and Import mod...); the Export
+  form's preview marks them too. Information only: no question is asked.
 - **The check.** A pack with a `modpack.json` is read only when it is as it
   was made: every file its `"files"` list names is there with that SHA-256,
   and no other file is in its folder, except `modpack.json` and `poster.png`

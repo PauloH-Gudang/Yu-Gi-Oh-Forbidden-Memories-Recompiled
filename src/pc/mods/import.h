@@ -76,6 +76,10 @@ int Mods_ImportTaken(const char *mods, const char *folder, char *path, size_t si
 /* Whether `directory` holds a mod (a mod.json), with its id in `id`: the
  * manifest's, else the folder's name, as the loader takes it. */
 int Mods_ImportFolderId(const char *directory, char *id, size_t size);
+/* Whether `directory`'s mod.json makes a code mod (as ModsImportMod.code and
+ * the loader tell it), read as cheaply: 1, else 0 (not, or no mod.json).
+ * The manifest's name, else its id, else the folder's name, in `name`. */
+int Mods_ImportFolderCode(const char *directory, char *name, size_t size);
 /* Removes what an import cut short left in the mods folder (".import-*"
  * folders and ".incoming*.zip" files). An old mod it had moved aside for a
  * new one that never got in (the process ended between the two renames) goes

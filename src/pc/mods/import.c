@@ -796,6 +796,29 @@ int Mods_ImportFolderId(const char *directory, char *id, size_t size)
     return 1;
 }
 
+int Mods_ImportFolderCode(const char *directory, char *name, size_t size)
+{
+    char path[2048], error[128];
+    static const char *const lists[] = {"fusions", "cards"};
+    JsonDeferred deferred[2];
+    JsonDocument *document;
+    const JsonValue *root;
+    const char *text;
+    int code;
+    if (size) name[0] = '\0';
+    if (snprintf(path, sizeof(path), "%s/mod.json", directory) >= (int)sizeof(path) ||
+        !(document = Json_ParseFileDeferring(path, lists, 2, deferred, error, sizeof(error))))
+        return 0;
+    root = Json_Root(document);
+    code = Manifest_HasCode(root);
+    text = Json_String(Json_Member(root, "name"), NULL);
+    if (!text || !*text) text = Json_String(Json_Member(root, "id"), NULL);
+    if (!text || !*text) text = strrchr(directory, '/') ? strrchr(directory, '/') + 1 : directory;
+    copy(name, size, text);
+    Json_Free(document);
+    return code;
+}
+
 /* The first name in `directory` that is not hidden, in `name`; 0 if none. */
 static int first_visible(const char *directory, char *name, size_t size)
 {
