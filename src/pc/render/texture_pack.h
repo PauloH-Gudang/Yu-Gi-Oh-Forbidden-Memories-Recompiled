@@ -123,8 +123,9 @@ int TexturePack_AddBankSpriteCrop(int bank, int page_x, int page_y, int depth, i
  * returns 1, so new pixels need a new id (an old picture can stay kept as a
  * spare for a while after its last sprite is gone). An id kept without pixels
  * (a failed file of that name, or a copy that ran out of memory) takes these.
- * A picture no sprite shows yet is a spare, and adding or clearing sprites
- * lets the oldest spares go, so call it immediately before the
+ * A picture no sprite shows yet is a spare, and adding or clearing sprites or
+ * preloading pictures lets the oldest spares go (TexturePack_BankImagesForgetSpare
+ * lets them all go), so call it immediately before the
  * TexturePack_AddBankSprite that names `id`, not for several ids first: an id
  * let go is looked up as a file, which fails. Returns 1 when the picture has
  * pixels, 0 when it cannot be made (bad arguments, out of memory). */

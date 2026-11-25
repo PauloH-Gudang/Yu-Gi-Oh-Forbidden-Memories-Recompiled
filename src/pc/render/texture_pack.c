@@ -260,8 +260,10 @@ static BankImage *bank_image_from(const char *file, const unsigned char *rgba, i
     for (i = 0; i < bank_image_count; i++) {
         if (strcmp(bank_images[i]->file, file)) continue;
         /* A new key with the new pixels: nothing that kept the old (empty) one takes them for it. */
-        if (rgba && !bank_images[i]->level[0] && bank_fill_rgba(bank_images[i], rgba, width, height))
+        if (rgba && !bank_images[i]->level[0] && bank_fill_rgba(bank_images[i], rgba, width, height)) {
             bank_images[i]->key = ++bank_keys;
+            bank_images[i]->released = ++bank_clock;   /* the newest spare, as a picture just made is */
+        }
         return bank_images[i];
     }
     more = realloc(bank_images, (size_t)(bank_image_count + 1) * sizeof(*more));
