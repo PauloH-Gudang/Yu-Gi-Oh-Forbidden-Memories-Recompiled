@@ -38,15 +38,50 @@ static uint32_t frame_words[MAX_FRAME_WORDS];
 static uint32_t frame_addresses[MAX_FRAME_WORDS]; /* where each was in guest RAM (PGXP) */
 static size_t pending_words;
 static void flush_drawing(void);
+
+/* VRAM for showing the display area, w x h words from where it starts
+ * (a 24-bit row is one and a half times as many), settled there. Without a
+ * window (MEMORIES_HEADLESS) both backends' Platform_Present return before
+ * reading a word, so nothing is settled: the deferred raster's held work
+ * then lives on to be dropped, as with the OpenGL picture. */
+static const uint16_t *display_words(int w, int h)
+{
+    static int headless = -1;
+    if (headless < 0) {
+        const char *value = getenv("MEMORIES_HEADLESS");
+        headless = value && *value && strcmp(value, "0") != 0;
+    }
+    if (!headless) SoftGpu_Settle(disp_env.disp.x, disp_env.disp.y, disp_env.isrgb24 ? (w * 3 + 1) / 2 : w, h);
+    return SoftGpu_VramRaw();
+}
 #define MAX_FRAME_PRECISE 65536
 static PgxpVertex frame_precise[MAX_FRAME_PRECISE];
 static size_t pending_precise;
 
 int ResetGraph(int mode)
 {
+    static int deferred_read;
     flush_drawing();
     if (mode == 0 || mode == 3) {
         SoftGpu_Reset();
+    }
+    if (!deferred_read) {
+        /* The deferred raster keeps the drawing areas' primitives back until
+         * something reads them (soft_gpu.h, SoftGpu_SetDeferred). Unset, it
+         * is on while the OpenGL picture draws at 2x and above, where
+         * nothing shows the words (SOFT_GPU_DEFERRED_AUTO);
+         * MEMORIES_DEFERRED_RASTER=0 turns it off, any other value on at
+         * every scale (1x included, for tests). MEMORIES_DEFERRED_POISON=1
+         * also shows what is held as magenta to any reader that does not
+         * settle it. */
+        const char *on = getenv("MEMORIES_DEFERRED_RASTER"), *poison = getenv("MEMORIES_DEFERRED_POISON");
+        int mode = !on || !*on ? SOFT_GPU_DEFERRED_AUTO : strcmp(on, "0") != 0;
+        deferred_read = 1;
+        /* A mod's VRAM binding is told as it is made, and the ones made
+         * before now are told here; flush_drawing tells it again. */
+        Mods_VramUsersChanged = SoftGpu_SetModVramUsers;
+        SoftGpu_SetModVramUsers(Mods_VramUsers());
+        SoftGpu_SetDeferred(mode, poison && *poison && strcmp(poison, "0") != 0);
     }
     return 0;
 }
@@ -113,9 +148,10 @@ static uint32_t *displayed_picture(int full_vram, int scaled, int *out_w, int *o
     int x, y, w = disp_env.disp.w > 0 ? disp_env.disp.w : 320;
     int h = disp_env.disp.h > 0 ? disp_env.disp.h : 240;
     int x0 = full_vram ? 0 : disp_env.disp.x, y0 = full_vram ? 0 : disp_env.disp.y, wide_view = 0;
-    const uint16_t *source = SoftGpu_Vram();
+    const uint16_t *source;
     uint32_t *out;
     flush_drawing();
+    source = SoftGpu_Vram(); /* after the flush: what it drew is read too */
     if (full_vram) {
         w = SOFT_GPU_WIDTH;
         h = SOFT_GPU_HEIGHT;
@@ -190,7 +226,7 @@ static uint32_t *displayed_picture(int full_vram, int scaled, int *out_w, int *o
         for (x = 0; x < w; x++) {
             uint16_t c = source[((y0 + y) & 511) * SOFT_GPU_WIDTH + ((x0 + x) & 1023)];
             if (disp_env.isrgb24 && !full_vram) {
-                const uint8_t *rgb = (const uint8_t *)&SoftGpu_Vram()[((y0 + y) & 511) * SOFT_GPU_WIDTH + x0] + x * 3;
+                const uint8_t *rgb = (const uint8_t *)&SoftGpu_VramRaw()[((y0 + y) & 511) * SOFT_GPU_WIDTH + x0] + x * 3;
                 out[(size_t)y * w + x] = 0xFF000000u | (uint32_t)rgb[0] << 16 | (uint32_t)rgb[1] << 8 | rgb[2];
                 continue;
             }
@@ -275,9 +311,10 @@ static void present_wide(int w, int h)
         /* The backend could not show its own (no room for its target), and
          * these pixels were left to it: 4:3 between black sides, below. */
     }
+    const uint16_t *vram = display_words(w, h); /* x, y: the display area's */
     for (row = 0; row < h; row++) {
         uint8_t *out = (uint8_t *)(sides + row * SOFT_GPU_WIDTH * 2);
-        const uint8_t *in = (const uint8_t *)(SoftGpu_Vram() + ((y + row) & 511) * SOFT_GPU_WIDTH);
+        const uint8_t *in = (const uint8_t *)(vram + ((y + row) & 511) * SOFT_GPU_WIDTH);
         int size = disp_env.isrgb24 ? 3 : 2;
         memset(out, 0, (size_t)(w + 2 * margin) * (size_t)size);
         if (disp_env.isrgb24) {
@@ -297,12 +334,17 @@ static void present_wide(int w, int h)
  * pictures and widescreen targets the present is still reading. */
 static int presenting, scale_after_present;
 
+/* The highest scale this session can have: 8, until a backend refuses one
+ * (Memories_ScaleRefused). */
+static int scale_cap = 8;
+
 int Memories_SetInternalScale(int wanted)
 {
     sigset_t held, previous;
     int done;
     /* 1, 2, 4 or 8: the setting's 3 is 2, 5 to 7 are 4. */
     wanted = wanted >= 8 ? 8 : wanted >= 4 ? 4 : wanted >= 2 ? 2 : 1;
+    if (wanted > scale_cap) wanted = scale_cap;
     if (presenting) { /* after this frame (Memories_PresentDisplay) */
         scale_after_present = wanted;
         return 1;
@@ -314,7 +356,22 @@ int Memories_SetInternalScale(int wanted)
     sigprocmask(SIG_BLOCK, &held, &previous);
     done = SoftGpu_SetScale(wanted);
     sigprocmask(SIG_SETMASK, &previous, NULL);
+    if (!done && wanted > 1) { /* no room for the software picture */
+        Memories_ScaleRefused(wanted, MEMORIES_REFUSED_ROOM);
+        return 0;
+    }
     return done;
+}
+
+void Memories_ScaleRefused(int refused, int why)
+{
+    int fallback = refused >= 8 ? 4 : refused >= 4 ? 2 : 1;
+    if (refused < 2 || refused > scale_cap) return; /* a lower one is refused already */
+    scale_cap = fallback;
+    fprintf(stderr, "memories-pc: internal resolution: %dx does not fit here, %dx for this session\n", refused,
+            fallback);
+    Menu_ScaleRefused(refused, fallback, why);
+    Memories_SetInternalScale(fallback);
 }
 
 /* MEMORIES_FRAME_HASHES=<file>: one line per presented frame, the frame
@@ -335,12 +392,17 @@ static void frame_hash(void)
 {
     static FILE *out;
     static int opened;
+    static unsigned every = 1;
     if (!opened) {
-        const char *path = getenv("MEMORIES_FRAME_HASHES");
+        /* MEMORIES_FRAME_HASHES_EVERY=<n>: every n-th frame only. A hash
+         * settles all of VRAM, so a sparse one lets the deferred raster drop
+         * what the frames between draw, and still sees what it got wrong. */
+        const char *path = getenv("MEMORIES_FRAME_HASHES"), *step = getenv("MEMORIES_FRAME_HASHES_EVERY");
         opened = 1;
         out = path && *path ? fopen(path, "w") : NULL;
+        if (step && atoi(step) > 1) every = (unsigned)atoi(step);
     }
-    if (!out) return;
+    if (!out || (unsigned)frames_presented % every) return;
     fprintf(out, "%u %016llx\n", (unsigned)frames_presented, Memories_VramHash());
     fflush(out);
 }
@@ -352,7 +414,7 @@ static void frame_hash(void)
 void Memories_ShowStill(void)
 {
     int w = disp_env.disp.w > 0 ? disp_env.disp.w : 320, h = disp_env.disp.h > 0 ? disp_env.disp.h : 240;
-    Platform_Present(SoftGpu_Vram(), SOFT_GPU_WIDTH, disp_env.disp.x, disp_env.disp.y, w, h, disp_env.isrgb24);
+    Platform_Present(display_words(w, h), SOFT_GPU_WIDTH, disp_env.disp.x, disp_env.disp.y, w, h, disp_env.isrgb24);
 }
 
 void Memories_PresentDisplay(void)
@@ -441,7 +503,7 @@ void Memories_PresentDisplay(void)
         if (at_scale <= 1 || disp_env.isrgb24 ||
             !Platform_PresentPicture(SoftGpu_Picture(), SOFT_GPU_WIDTH * at_scale, disp_env.disp.x * at_scale,
                                      disp_env.disp.y * at_scale, w * at_scale, h * at_scale, at_scale)) {
-            Platform_Present(SoftGpu_Vram(), SOFT_GPU_WIDTH, disp_env.disp.x, disp_env.disp.y, w, h,
+            Platform_Present(display_words(w, h), SOFT_GPU_WIDTH, disp_env.disp.x, disp_env.disp.y, w, h,
                              disp_env.isrgb24);
             }
         }
@@ -462,14 +524,28 @@ void Memories_PresentDisplay(void)
  * in and the pad code reports each press twice. So DrawOTag only snapshots
  * the list, and it is rasterized where the hardware would have finished it:
  * at DrawSync, or before anything else that reads or writes VRAM. */
+/* The rasteriser's frames, the clock reads around it (t0, t1) and the list's
+ * words end up below the caller's frame: cleared once the list is drawn, as
+ * the VSync's present is (platform.h, PLATFORM_SCRUB_DEAD_STACK). */
+#define FLUSH_SCRUB_BYTES (64u * 1024u)
+static int draw_pending(void);
+
 static void flush_drawing(void)
+{
+    if (draw_pending()) {
+        PLATFORM_SCRUB_DEAD_STACK(FLUSH_SCRUB_BYTES);
+    }
+}
+
+/* 1 when there was a list to draw. */
+__attribute__((noinline)) static int draw_pending(void)
 {
     static unsigned draws, total_us, total_words;
     struct timespec t0, t1;
     size_t count = pending_words;
     pending_words = 0; /* first: an interrupt-level LoadImage may re-enter */
     if (!count) {
-        return;
+        return 0;
     }
     clock_gettime(CLOCK_MONOTONIC, &t0);
     SoftGpu_PanelName = HdText_NameEnabled() ? HdText_NamePixels : NULL;
@@ -477,6 +553,7 @@ static void flush_drawing(void)
     SoftGpu_SetPrecise(frame_precise, pending_precise);
     pending_precise = 0;
     SoftGpu_PictureOnlyFrame(Mods_PictureOnlyFrame());
+    SoftGpu_SetModVramUsers(Mods_VramUsers());
     SoftGpu_Gp0(frame_words, count);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     {
@@ -487,8 +564,37 @@ static void flush_drawing(void)
         if (++draws == 120) {
             LOG(LOG_FRAMES, "draws: %u us, %u words per DrawOTag", total_us / 120, total_words / 120);
             draws = total_us = total_words = 0;
+            if (SoftGpu_Deferred()) {
+                /* The deferred raster, over the same 120 DrawOTags: what
+                 * it kept back and what became of it, and the time its
+                 * settles took: in the draws above when the batch caused
+                 * them, else outside them (a reader's). */
+                static SoftGpuDeferredStats last;
+                static unsigned long long last_undo;
+                SoftGpuDeferredStats now;
+                unsigned long long undo = SoftGpu_UndoSaves();
+                SoftGpu_DeferredStats(&now);
+                LOG(LOG_FRAMES, "deferred: %u held, %u dropped, %u rastered, %u at once; areas %u cleared, "
+                    "%u settled (read %u, write %u, draw %u, area %u, all %u); settles %u us, %u of them outside "
+                    "the draws; the OpenGL copy missed %u areas, %u patches; %u undo saves",
+                    (unsigned)(now.held - last.held), (unsigned)(now.dropped - last.dropped),
+                    (unsigned)(now.rastered - last.rastered), (unsigned)(now.immediate - last.immediate),
+                    (unsigned)(now.cleared - last.cleared), (unsigned)(now.settled - last.settled),
+                    (unsigned)(now.why[SOFT_GPU_WHY_READ] - last.why[SOFT_GPU_WHY_READ]),
+                    (unsigned)(now.why[SOFT_GPU_WHY_WRITE] - last.why[SOFT_GPU_WHY_WRITE]),
+                    (unsigned)(now.why[SOFT_GPU_WHY_DRAW] - last.why[SOFT_GPU_WHY_DRAW]),
+                    (unsigned)(now.why[SOFT_GPU_WHY_AREA] - last.why[SOFT_GPU_WHY_AREA]),
+                    (unsigned)(now.why[SOFT_GPU_WHY_ALL] - last.why[SOFT_GPU_WHY_ALL]),
+                    (unsigned)(now.settle_us - last.settle_us),
+                    (unsigned)(now.settle_outside_us - last.settle_outside_us),
+                    (unsigned)(now.copy_missed - last.copy_missed), (unsigned)(now.patches - last.patches),
+                    (unsigned)(undo - last_undo));
+                last = now;
+                last_undo = undo;
+            }
         }
     }
+    return 1;
 }
 
 /* A model's parts are each projected with their own matrix, and where they

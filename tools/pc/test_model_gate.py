@@ -34,6 +34,41 @@ class ModelGate(unittest.TestCase):
     def test_sources_and_address_sections(self):
         self.assertEqual(model_gate.check_sources(self.rows), [])
 
+    def test_retail_list_matches_table(self):
+        """config/pc/model_retail.csv: code rows for each native shape, images
+        for the rest, and its table is what it gives."""
+        retail = model_gate.load_retail()
+        self.assertEqual(model_gate.retail_problems(self.rows, retail, model_gate.primary_rows()), [])
+        text = model_gate.RETAIL_HEADER.read_text(encoding="utf-8").replace("\r\n", "\n")
+        self.assertEqual(text, model_gate.retail_header_text(retail))
+        self.assertEqual(sum(entry["kind"] == "primary" for entry in retail), 2 * len(model_gate.primary_rows()))
+
+    def test_retail_problems_names_a_missing_or_wrong_row(self):
+        retail = model_gate.load_retail()
+        native = next(row for row in self.rows if row["backend"] == "native")
+        # A row the port still interprets (none on the disc now): its code row is its own hash.
+        other = model_gate.Row(dict(native, backend="interpret", data_start="", note=""))
+        without = [entry for entry in retail if not (entry["shape"] == str(native.shape) and entry["slot"] == "B")]
+        self.assertTrue(any(f"shape {native.shape} slot B has 0 code rows" in line
+                            for line in model_gate.retail_problems(self.rows, without)))
+        stale = [dict(entry, size="0x4") if entry["shape"] == str(native.shape) else entry for entry in retail]
+        self.assertTrue(any(f"shape {native.shape} slot A: its code row" in line
+                            for line in model_gate.retail_problems(self.rows, stale)))
+        own = [{"kind": "code", "slot": slot, "identifier": str(other.identifier(slot)), "shape": str(other.shape),
+                "size": f"0x{other.span:X}", "sha256": "0" * 64 if slot == "A" else other.sha256(slot), "records": ""}
+               for slot in "AB"]
+        self.assertTrue(any(f"shape {other.shape} slot A: its code row's hash" in line
+                            for line in model_gate.retail_problems([other], own)))
+
+    def test_the_disc_runs_no_module_on_the_interpreter(self):
+        """Every variant and primary shape of the disc is native: a shape left
+        on the interpreter (or kept) fails here, in CI, without the disc. The
+        oracle's sweep is the test with the disc (notes/pc-build.md). No row may
+        be `keep` or `interpret` any more: a new one needs this test changed."""
+        for table in (self.rows, model_gate.primary_rows()):
+            self.assertTrue(table)
+            self.assertEqual([row.shape for row in table if row["backend"] != "native"], [])
+
     def test_every_native_slot_is_a_gated_module(self):
         modules = {name: (pattern, bank) for name, pattern, _, bank in build_config.MODULES}
         for row in model_gate.native_rows():
@@ -84,6 +119,18 @@ class SpanRules(unittest.TestCase):
         model_gate.hashed(shape, "A", 0x400)
         with self.assertRaises(SystemExit):
             model_gate.hashed(shape, "A", 0x404)
+
+    def test_a_span_may_end_inside_a_word(self):
+        """A table whose last entry ends two bytes into a word that differs per
+        record past it: the span stops at its last byte."""
+        shape = self.shape(0x402)
+        self.assertEqual(shape.common("A"), 0x400)
+        self.assertEqual(shape.common("A", 1), 0x402)
+        model_gate.hashed(shape, "A", 0x402)
+        with self.assertRaises(SystemExit):
+            model_gate.hashed(shape, "A", 0x403)
+        self.assertEqual(model_gate.problems([self.row(span="0x3F62")]), [])
+        self.assertTrue(model_gate.problems([self.row(span="0x5001")]))
 
     def test_printf_format_strings_are_found(self):
         """A format string from the slot's data handed to printf, directly or
@@ -136,8 +183,8 @@ class SpanRules(unittest.TestCase):
         text = model_gate.header_text([self.row(), self.row(shape="500", command_table="none", sha256_a="c" * 64,
                                                             sha256_b="d" * 64, identifier_a="500",
                                                             identifier_b="650")])
-        self.assertIn("0x12u, 0x3A68u, 0x44u, 0x1B74u, 0u)", text)
-        self.assertIn("0xFFFFFFFFu, 0u, 0u, 0u, 0u)", text)
+        self.assertIn("0x12u, 0x3A68u, 0x44u, 0x1B74u, 0u, 0u)", text)
+        self.assertIn("0xFFFFFFFFu, 0u, 0u, 0u, 0u, 0u)", text)
 
     def test_a_command_table_may_bound_an_index_word(self):
         """`:indexN` says the work area keeps the command itself as a uN."""
@@ -148,6 +195,17 @@ class SpanRules(unittest.TestCase):
         self.assertTrue(model_gate.problems([self.row(command_table="0x3A68:0x44:18:0x20:index64")]))
         self.assertTrue(model_gate.problems([self.row(command_table="0x3A68:0x44:18:0x20:pointer")]))
         self.assertTrue(model_gate.problems([self.row(command_table="0x3A68:0x44:18:0x20:index8:x")]))
+
+    def test_a_command_table_may_take_the_command_modulo(self):
+        """`:modN` (last) says the C picks entry command % N: a pointer row's,
+        never with an index (its updates compare the stored command itself)."""
+        row = self.row(command_table="0x3A68:0x44:18:0x20:mod100")
+        self.assertEqual((row.command_table, row.command_modulus), ((0x3A68, 0x44, 18, 0x20, 0), 100))
+        self.assertEqual(model_gate.problems([row]), [])
+        self.assertIn(", 100u)", model_gate.header_text([row]))
+        self.assertTrue(model_gate.problems([self.row(command_table="0x3A68:0x44:18:0x20:index8:mod100")]))
+        self.assertTrue(model_gate.problems([self.row(command_table="0x3A68:0x44:18:0x20:mod0")]))
+        self.assertTrue(model_gate.problems([self.row(command_table="0x3A68:0x44:18:0x20:mod100:index8")]))
 
     def test_a_command_table_is_well_formed(self):
         """No negative number (it would not compile in the table), a field inside a
@@ -163,7 +221,7 @@ class SpanRules(unittest.TestCase):
 
     def test_the_header_carries_the_index_width(self):
         text = model_gate.header_text([self.row(command_table="0x3A68:0x44:18:0x20:index16")])
-        self.assertIn("0x12u, 0x3A68u, 0x44u, 0x20u, 2u)", text)
+        self.assertIn("0x12u, 0x3A68u, 0x44u, 0x20u, 2u, 0u)", text)
 
     def test_the_tables_the_command_indexes_are_found(self):
         """Each form the decomp's C picks a row with; a wrapper's #define puts
@@ -271,7 +329,7 @@ class PortRules(unittest.TestCase):
     def test_a_stale_local_takes_the_slot_storage(self):
         import model_gate_port as port
         path = "src/native_overlays/model_variant/variant169_entry.c"
-        declaration, replacement = port.STALE_LOCALS[path]
+        (declaration, replacement, _), = port.STALE_LOCALS[path]
         text = '#include "../../types.h"\n#include "variant169_entry.h"\n\ns32 f(void)\n{\n' + declaration + "}\n"
         self.assertEqual(port.stale_local_text(path, text),
                          '#include "../../types.h"\n' + port.STALE_INCLUDE + '#include "variant169_entry.h"\n\n'
@@ -282,11 +340,23 @@ class PortRules(unittest.TestCase):
         with self.assertRaises(SystemExit):
             port.stale_local_text(path, text.replace(declaration, ""))
 
+    def test_a_stale_struct_local_becomes_a_pointer(self):
+        import model_gate_port as port
+        path = "src/native_overlays/model_variant/variant163_entry.c"
+        (declaration, replacement, _), = port.STALE_LOCALS[path]
+        text = ('#include "../../types.h"\n\ns32 f(void)\n{\n' + declaration +
+                "    SetPolyFT4(&quad);\n    quad.r0 = 1;\n    g(&quad.x0, (u32 *)&quad);\n"
+                "    work->quad.r0 = quads.r0;\n}\n")
+        self.assertEqual(port.stale_local_text(path, text),
+                         '#include "../../types.h"\n' + port.STALE_INCLUDE + '\ns32 f(void)\n{\n' + replacement +
+                         "    SetPolyFT4(quad);\n    quad->r0 = 1;\n    g(&quad->x0, (u32 *)quad);\n"
+                         "    work->quad.r0 = quads.r0;\n}\n")
+
     def test_check_fails_a_native_copy_without_the_stale_local_rule(self):
         import tempfile
         import model_gate_port as port
         path = "src/native_overlays/model_variant/variant169_entry.c"
-        declaration, _ = port.STALE_LOCALS[path]
+        (declaration, *_), = port.STALE_LOCALS[path]
         text = '#include "../../types.h"\n\ns32 f(void)\n{\n' + declaration + "}\n"
         listed = {"model_variant_169": [path]}
         with tempfile.TemporaryDirectory() as temporary:
@@ -297,6 +367,60 @@ class PortRules(unittest.TestCase):
             self.assertEqual(port.stale_local_problems(listed, set(), root), [])   # not native: no rule needed
             (root / path).write_text(port.stale_local_text(path, text).replace("\n", "\r\n"), newline="")
             self.assertEqual(port.stale_local_problems(listed, {"model_variant_169"}, root), [])
+
+    def test_a_stale_local_reached_through_another_address(self):
+        """Shape 448's col: the declaration takes the storage, every (s32)&rot
+        becomes ((s32)col - 240), and check fails a copy that keeps one."""
+        import tempfile
+        import model_gate_port as port
+        path = "src/native_overlays/model_variant/variant448_fan.c"
+        (declaration, storage, pointer, (old, new)), = port.STALE_LOCALS[path]
+        text = ('#include "../../types.h"\n\ns32 f(void)\n{\n' + declaration +
+                "    SVECTOR rot;\n    RotMatrix(&rot, 0);\n    u = t * 6 + (s32)&rot + 240;\n}\n")
+        ported = port.stale_local_text(path, text)
+        self.assertIn(storage, ported)
+        self.assertIn("u = t * 6 + ((s32)col - 240) + 240;", ported)
+        self.assertIn("RotMatrix(&rot, 0);", ported)
+        self.assertNotIn(old, ported)
+        listed = {"model_variant_448": [path]}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / path).parent.mkdir(parents=True)
+            (root / path).write_text(ported)
+            self.assertEqual(port.stale_local_problems(listed, {"model_variant_448"}, root), [])
+            (root / path).write_text(ported + "    v = (s32)&rot + 256;\n")
+            self.assertEqual(len(port.stale_local_problems(listed, {"model_variant_448"}, root)), 1)
+
+    def test_a_file_takes_each_of_its_stale_locals(self):
+        import model_gate_port as port
+        path = "src/native_overlays/model_variant/variant769_entry.c"
+        (quad, quad_storage, _), (screen, screen_storage, _) = port.STALE_LOCALS[path]
+        text = ('#include "../../types.h"\n\ns32 f(void)\n{\n' + quad + screen +
+                "    setlen(&quad, 9);\n    quad.u0 = 0;\n    box.x = screen[0].vx;\n}\n")
+        self.assertEqual(port.stale_local_text(path, text),
+                         '#include "../../types.h"\n' + port.STALE_INCLUDE + '\ns32 f(void)\n{\n' +
+                         quad_storage + screen_storage +
+                         "    setlen(quad, 9);\n    quad->u0 = 0;\n    box.x = screen[0].vx;\n}\n")
+        with self.assertRaises(SystemExit):   # each declaration must be there
+            port.stale_local_text(path, text.replace(screen, ""))
+
+    def test_check_reads_the_files_a_native_unit_includes(self):
+        # Shape 772's unit is a wrapper; rule 6 is on the body it includes.
+        import tempfile
+        import model_gate_port as port
+        body = "src/native_overlays/french_model_variant/image31368_entry.c"
+        unit = "src/native_overlays/model_variant/variant772_entry.c"
+        text = "s32 f(void)\n{\n" + "".join(rule[0] for rule in port.STALE_LOCALS[body]) + "}\n"
+        listed = {"model_variant_772": [unit]}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for path in (unit, body):
+                (root / path).parent.mkdir(parents=True, exist_ok=True)
+            (root / unit).write_text('#include "../french_model_variant/image31368_entry.c"\n')
+            (root / body).write_text(text)
+            self.assertEqual(len(port.stale_local_problems(listed, {"model_variant_772"}, root)), 2)
+            (root / body).write_text(port.stale_local_text(body, text))
+            self.assertEqual(port.stale_local_problems(listed, {"model_variant_772"}, root), [])
 
     def test_every_native_module_lists_its_files(self):
         listed = model_gate.listed_sources()
@@ -316,6 +440,32 @@ class OracleBackends(unittest.TestCase):
     def test_native_where_the_table_says_is_a_match(self):
         verdict = self.verdict(side("subject", "native"), side("reference", "interpreter"))
         self.assertEqual(verdict["status"], "identical")
+
+    @staticmethod
+    def with_primary(run, ways):
+        """A run that also called slot A's primary module (record 116's effect, 39)."""
+        run["calls"] = run["calls"] + [(1, "primary", "A", 39, 0)]
+        run["paths"] = dict(run["paths"], **{"primary 39 in A": [ways]})
+        return run
+
+    def test_primary_backends_are_checked_as_the_variants(self):
+        subject = self.with_primary(side("subject", "native"), "native")
+        reference = self.with_primary(side("reference", "interpreter"), "interpreter")
+        holds = {"A": True, "B": False}
+        self.assertEqual(model_oracle.compare(subject, reference, holds, (True, False), holds)["status"], "identical")
+        subject = self.with_primary(side("subject", "native"), "interpreter")
+        verdict = model_oracle.compare(subject, reference, holds, (True, False), holds)
+        self.assertEqual(verdict["status"], "error")
+        self.assertIn("slot A holds a primary module the table runs as native C and ran interpreter", verdict["why"])
+        # The reference asked for the interpreter: native C there is an error.
+        reference = self.with_primary(side("reference", "interpreter"), "native")
+        verdict = model_oracle.compare(self.with_primary(side("subject", "native"), "native"), reference, holds,
+                                       (True, False), holds)
+        self.assertIn("ran native C for its primary module", verdict["why"])
+        # A slot whose primary holds native code but made no primary call (a
+        # record without one calls none) is no error.
+        self.assertEqual(model_oracle.compare(side("subject", "native"), side("reference", "interpreter"), holds,
+                                              (True, False), {"A": True, "B": True})["status"], "identical")
 
     def test_interpreter_where_native_is_expected_is_an_error(self):
         verdict = self.verdict(side("subject", "interpreter"), side("reference", "interpreter"))
@@ -354,6 +504,166 @@ class OracleBackends(unittest.TestCase):
         # Whatever the code is, an image of other bytes is no native row's.
         self.assertIsNone(model_oracle.native_row(Disc(image), 0, 0, "A"))
         self.assertEqual(row["backend"], "native")   # and the one table row there is has no image here
+
+    # --mod: a code mod's rows (mod API 29), the trace's mod:<id>.
+
+    def test_a_mod_s_c_where_its_row_covers_is_a_match(self):
+        verdict = self.verdict(side("subject", "mod:pikachu-c"), side("reference", "interpreter"),
+                               {"A": "mod:pikachu-c", "B": False})
+        self.assertEqual(verdict["status"], "identical")
+
+    def test_native_or_interpreter_where_a_mod_row_covers_is_an_error(self):
+        for ways in ("native", "interpreter"):
+            verdict = self.verdict(side("subject", ways), side("reference", "interpreter"),
+                                   {"A": "mod:pikachu-c", "B": False})
+            self.assertEqual(verdict["status"], "error")
+            self.assertIn("pikachu-c's row runs as its C", verdict["why"])
+
+    def test_another_mod_s_c_is_an_error(self):
+        verdict = self.verdict(side("subject", "mod:other"), side("reference", "interpreter"),
+                               {"A": "mod:pikachu-c", "B": False})
+        self.assertEqual(verdict["status"], "error")
+
+    def test_a_mod_s_c_where_no_row_covers_is_an_error(self):
+        verdict = self.verdict(side("subject", "native", "mod:pikachu-c"), side("reference", "interpreter"))
+        self.assertEqual(verdict["status"], "error")
+        self.assertIn("slot B ran a mod's C (mod:pikachu-c) where no mod row covers its module", verdict["why"])
+
+    def test_a_reference_in_interpreter_mode_never_runs_a_mod_s_c(self):
+        verdict = self.verdict(side("subject", "mod:pikachu-c"), side("reference", "mod:pikachu-c"),
+                               {"A": "mod:pikachu-c", "B": False})
+        self.assertEqual(verdict["status"], "error")
+        self.assertIn("reference: slot A ran a mod's C", verdict["why"])
+
+    def test_the_expected_way_follows_the_game_s_order(self):
+        image = (0x12345).to_bytes(4, "little") + bytes(range(252)) * 4
+        digest = model_oracle.sha(image[:0x40])
+        late = ("variant", "A", 0x12345, 0x40, digest, False, "late")
+        early = ("variant", "A", 0x12345, 0x40, digest, True, "early")
+        way = model_oracle.expected_way
+        self.assertIs(way(image, "A", "variant", False, []), False)
+        self.assertEqual(way(image, "A", "variant", False, [late]), "mod:late")
+        # The disc's row before a row without OVER_DISC; one with it before the disc's.
+        self.assertIs(way(image, "A", "variant", True, [late]), True)
+        self.assertEqual(way(image, "A", "variant", True, [late, early]), "mod:early")
+        # Not for another slot, kind, identifier or bytes; of two, the later registered.
+        self.assertIs(way(image, "B", "variant", False, [late]), False)
+        self.assertIs(way(image, "A", "primary", False, [late]), False)
+        self.assertIs(way(b"\0" + image[1:], "A", "variant", False, [late]), False)
+        self.assertEqual(way(image, "A", "variant", False, [late, late[:6] + ("later",)]), "mod:later")
+
+    def test_a_return_two_primary_is_answered_before_a_late_row(self):
+        image = (0x12345).to_bytes(4, "little") + model_oracle.RETURN_TWO + bytes(0x1000 - 12)
+        digest = model_oracle.sha(image[:0x40])
+        late = ("primary", "A", 0x12345, 0x40, digest, False, "late")
+        early = ("primary", "A", 0x12345, 0x40, digest, True, "early")
+        way = model_oracle.expected_way
+        self.assertIs(way(image, "A", "primary", False, [late]), True)
+        self.assertEqual(way(image, "A", "primary", False, [late, early]), "mod:early")
+        # Not a variant: a variant has no `return 2` of the game's own.
+        self.assertEqual(way(image, "A", "variant", False, [late[:0] + ("variant",) + late[1:]]), "mod:late")
+
+    def test_a_mod_s_patches_are_what_the_disc_reads(self):
+        class Disc(model_oracle.Disc):
+            def __init__(self):
+                self.patches, self.lock, self.lba = {}, __import__("threading").Lock(), 0
+
+            def _sector(self, lba):
+                return bytes(model_oracle.SECTOR)
+
+        disc = Disc()
+        disc.patch({"data": [{"file": "\\DATA\\MODEL.MRG;1", "patch": [{"at": "0x800", "bytes": "AB01"}]}]}, "m")
+        self.assertEqual(disc.read(0, 1, 1)[:3], b"\xab\x01\x00")
+        self.assertEqual(disc.read(0, 0, 1), bytes(model_oracle.SECTOR))
+        with self.assertRaises(SystemExit):
+            disc.patch({"data": [{"file": "\\DATA\\MODEL.MRG;1", "replace": "x.bin"}]}, "m")
+        with self.assertRaises(SystemExit):
+            disc.patch({"data": [{"file": "\\DATA\\WA_MRG.MRG;1", "patch": []}]}, "m")
+        self.assertEqual(model_oracle.mod_variable("3d-monsters"), "MEMORIES_MOD_3D_MONSTERS")
+
+    def test_mods_in_the_games_load_order(self):
+        """--mod mods are taken in the game's load order: folder names byte
+        by byte, then the lowest priority whose requires/after are placed;
+        a model's id is its place among the mods' models in that order."""
+        mods = [(Path("z-pack"), {"id": "z", "models": [{"name": "a"}]}),
+                (Path("b-pack"), {"id": "b", "after": ["z"]}),
+                (Path("a-pack"), {"id": "a", "priority": 5}),
+                (Path("C-pack"), {"id": "c"})]
+        self.assertEqual([mod[1]["id"] for mod in model_oracle.load_order(mods)], ["c", "z", "b", "a"])
+        # The rank is Settings_GetNamed("mod.<id>.order", (int)priority): the
+        # priority as Json_Number reads it (a whole number, a bool or a string
+        # holding one), else 0, and never an error. A fraction is no priority
+        # the game accepts (its parser refuses the manifest): the oracle cuts
+        # it, and the last two cases are the oracle's own.
+        self.assertEqual([model_oracle.mod_rank({"priority": value}) for value in
+                          (2.0, 5, -3, "0x10", " -3 ", "7", True, "high", "1.5", "", None, [1], {}, 2.9, -2.9)],
+                         [2, 5, -3, 16, -3, 7, 1, 0, 0, 0, 0, 0, 0, 2, -2])
+        ranked = [(Path("a-pack"), {"id": "a", "priority": "high"}), (Path("b-pack"), {"id": "b", "priority": -1}),
+                  (Path("c-pack"), {"id": "c", "priority": 1})]
+        self.assertEqual([mod[1]["id"] for mod in model_oracle.load_order(ranked)], ["b", "a", "c"])
+        # A requires/after entry names a mod by its exact string (or an object's
+        # "id"), as require_id does: "z 1.0" is no mod, and a mod naming
+        # itself waits on itself (the game refuses that cycle).
+        names = [(Path("a-pack"), {"id": "a", "requires": ["z 1.0"]}), (Path("z-pack"), {"id": "z", "priority": 1}),
+                 (Path("m-pack"), {"id": "m", "after": [{"id": "z"}], "priority": -9})]
+        self.assertEqual([mod[1]["id"] for mod in model_oracle.load_order(names)], ["a", "z", "m"])
+        own = [(Path("a-pack"), {"id": "a", "requires": ["a"]}), (Path("b-pack"), {"id": "b", "priority": 3})]
+        self.assertEqual([mod[1]["id"] for mod in model_oracle.load_order(own)], ["b", "a"])
+        disc = model_oracle.Disc.__new__(model_oracle.Disc)
+        disc.model_order = ["one", "two", "one"]
+        self.assertEqual((disc.model_id("two"), disc.model_id("one")), (0x8002, 0x8003))
+
+    def test_a_model_battle_reads_the_models_images(self):
+        """--models: the battle's images are the model's stages, not a record's."""
+        disc = model_oracle.Disc.__new__(model_oracle.Disc)
+        stages = bytes(range(256)) * (44 * 2048 // 256)
+        disc.models = {"pikachu": stages}
+        battle = model_oracle.Battle(0, 1, "tie", "pikachu", 1)
+        self.assertEqual(battle.key, "model:pikachu/1/tie")
+        self.assertEqual(disc.battle_variant(battle, "B"), stages[30 * 2048:40 * 2048])
+        self.assertEqual(disc.battle_primary(battle, "B"), stages[42 * 2048:44 * 2048])
+        self.assertEqual(battle.properties()[:2], (1).to_bytes(2, "little"))
+
+
+class ModMigrate(unittest.TestCase):
+    """model_gate.py mod-migrate's text work (tools/pc/model_migrate.py);
+    tools/pc/test_model_migrate.py runs it on the disc."""
+
+    def test_a_const_definition_becomes_a_declaration(self):
+        import model_migrate
+        text = ("#include \"a.h\"\n"
+                "static const VECTOR D_8013C188 = {4096, /* x; */ 4096, 4096, 0};\n"
+                "const s16 D_8013C200[][3] = {{1, 2, 3}, {4, 5, 6}};\n"
+                "s32 f(void) { return D_8013C188.vx; }\n")
+        out = model_migrate.declare_const(text, "D_8013C188", 16)
+        self.assertIn("extern const VECTOR D_8013C188;", out)
+        self.assertNotIn("4096", out)
+        self.assertIn("return D_8013C188.vx;", out)
+        out = model_migrate.declare_const(out, "D_8013C200", 12)
+        self.assertIn("extern const s16 D_8013C200[12 / sizeof(const s16[3])][3];", out)
+        self.assertIsNone(model_migrate.declare_const(out, "D_8013C300", 4))
+
+    def test_a_models_file_stages_where_the_game_reads_them(self):
+        """A record's module stages start at sector 180; a bigger model's
+        after its own model data (its sectors less the record's other 180
+        and its texture pages), as mods.c's check_model_modules reads them."""
+        import model_migrate
+        import tempfile
+        sector = 2048
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            for sectors, pages, data in ((276, 0, 96), (276 + 30 + 2 * 16, 2, 126), (300, 0, 120)):
+                image = bytearray(sectors * sector)
+                at = (data + 84) * sector
+                image[at:at + 4] = b"MARK"
+                (folder / "m.mrg").write_bytes(bytes(image))
+                site = model_migrate.model_site(folder, {"name": "m", "file": "m.mrg", "texture_pages": pages})
+                self.assertEqual(site.stages[:4], b"MARK", (sectors, pages))
+                self.assertEqual(len(site.stages), 44 * sector)
+
+    def test_record_ranges(self):
+        import model_migrate
+        self.assertEqual(model_migrate.ranges([7, 1, 2, 3, 9, 10]), "1-3,7,9-10")
 
 
 if __name__ == "__main__":

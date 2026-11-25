@@ -232,14 +232,39 @@ static void bank_trim(void)
     if (!bank_image_count) { free(bank_images); bank_images = NULL; }
 }
 
+/* `image`'s pixels from `rgba` (width x height straight-alpha texels, copied), with its smaller levels; 0 when out
+ * of memory (the image stays without pixels). */
+static int bank_fill_rgba(BankImage *image, const unsigned char *rgba, int width, int height)
+{
+    const size_t bytes = (size_t)width * (size_t)height * 4;
+    if (!(image->level[0] = malloc(bytes))) return 0;
+    memcpy(image->level[0], rgba, bytes);
+    image->width[0] = width;
+    image->height[0] = height;
+    image->levels = 1;
+    while (image->levels < BANK_LEVELS && (image->width[image->levels - 1] > 1 || image->height[image->levels - 1] > 1))
+        if (!bank_halve(image, image->levels - 1)) break;
+    return 1;
+}
+
 /* The image of `file`, read now if it has not been (a failed one is kept,
- * so as not to be read again); NULL when out of memory. */
-static BankImage *bank_image(const char *file)
+ * so as not to be read again); NULL when out of memory. With `rgba`
+ * (width x height straight-alpha texels, copied), a new image is made from
+ * those instead of read: TexturePack_BankImageFromRgba. An image already kept
+ * under that name stays as it is, unless it has no pixels (its file read failed,
+ * or a copy ran out of memory): then it takes these. */
+static BankImage *bank_image_from(const char *file, const unsigned char *rgba, int width, int height)
 {
     BankImage *image, **more;
     int i;
     for (i = 0; i < bank_image_count; i++) {
-        if (!strcmp(bank_images[i]->file, file)) return bank_images[i];
+        if (strcmp(bank_images[i]->file, file)) continue;
+        /* A new key with the new pixels: nothing that kept the old (empty) one takes them for it. */
+        if (rgba && !bank_images[i]->level[0] && bank_fill_rgba(bank_images[i], rgba, width, height)) {
+            bank_images[i]->key = ++bank_keys;
+            bank_images[i]->released = ++bank_clock;   /* the newest spare, as a picture just made is */
+        }
+        return bank_images[i];
     }
     more = realloc(bank_images, (size_t)(bank_image_count + 1) * sizeof(*more));
     if (!more) return NULL;
@@ -247,9 +272,23 @@ static BankImage *bank_image(const char *file)
     if (!(image = calloc(1, sizeof(*image))) || !(image->file = strdup(file))) { free(image); return NULL; }
     image->key = ++bank_keys;
     image->released = ++bank_clock;
-    bank_read(image);
+    if (rgba) bank_fill_rgba(image, rgba, width, height);
+    else bank_read(image);
     bank_images[bank_image_count++] = image;
     return image;
+}
+
+static BankImage *bank_image(const char *file)
+{
+    return bank_image_from(file, NULL, 0, 0);
+}
+
+int TexturePack_BankImageFromRgba(const char *id, const unsigned char *rgba, int width, int height)
+{
+    BankImage *image;
+    if (!id || !*id || !rgba || width < 1 || height < 1 || width > 8192 || height > 8192) return 0;
+    image = bank_image_from(id, rgba, width, height);
+    return image && image->level[0];   /* not "made" when the copy ran out of memory */
 }
 
 static void bank_release(BankImage *image)

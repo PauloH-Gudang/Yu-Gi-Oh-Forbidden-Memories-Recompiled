@@ -113,16 +113,31 @@ MODULES = [
     ("duel_effects", "src/overlays/duel_effects/*.c", 0x18, 0x80146000),
     ("credits", "src/overlays/credits/*.c", 0x10, 0x80180000),
 ]
-# MODEL.MRG's variant control modules: one module per slot for each shape the
-# table (config/pc/model_gate.csv) says is native, linked at the slot base.
+# MODEL.MRG's control modules: one module per slot for each shape the tables
+# say is native (config/pc/model_gate.csv, the variant modules;
+# config/pc/model_primary_gate.csv, the primary ones), linked at the slot base.
 # Their addresses come from the C (tools/pc/model_gate.py), not from a retail
 # ELF, and they are gated like the effect bank: src/pc/overlays/model_modules.c
 # runs the C for the retail code and interprets any other.
 MODEL_MODULES = [
-    (row.module(slot), model_gate.source_patterns(row, slot), row.identifier(slot), model_gate.BASE[slot])
-    for row in model_gate.native_rows() for slot in "AB"
+    (row.module(slot), model_gate.source_patterns(row, slot), row.identifier(slot), row.KIND.base[slot])
+    for row in model_gate.native_rows() + model_gate.native_primary_rows() for slot in "AB"
 ]
 MODULES += MODEL_MODULES
+# Port functions a code mod may not bind to (src/pc/mods/exports.h): a mod
+# that reads VRAM raw would see what a kept-back raster has not drawn yet,
+# and the settle observer is the tests'. soft_gpu.h declares them only
+# outside MEMORIES_MOD. Left out of the exports, they are never pinned
+# (tools/pc/check_mod_abi.py). Mods_VramUsersChanged: the 32-bit table
+# leaves every Mods_ name out, the arm64 one only these; a mod that set it
+# would keep the software GPU from hearing of its VRAM binding.
+# SoftGpu_CopyTaken, SoftGpu_CopyPatches and SoftGpu_SetCopyReach: the OpenGL
+# picture's copy of VRAM; a mod that called them would lose the deferred
+# raster's patches.
+NOT_LENT_TO_MODS = {"SoftGpu_VramRaw", "SoftGpu_SettleObserver", "SoftGpu_SetDeferred", "SoftGpu_Deferred",
+                    "SoftGpu_SetModVramUsers", "SoftGpu_HoldClock", "SoftGpu_InTick", "SoftGpu_Clock",
+                    "SoftGpu_DeferredStats", "SoftGpu_UndoSaves", "SoftGpu_CopyTaken", "SoftGpu_CopyPatches", "SoftGpu_SetCopyReach",
+                    "Mods_VramUsersChanged"}
 MODULE_CONFIG = {"overworld": "overworld_before_coup"}
 GATED_MODULES = {"duel_effects", "credits"} | {name for name, _, _, _ in MODEL_MODULES}
 # The modules that have no retail ELF or function list in config/slus_01411.

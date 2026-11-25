@@ -8,21 +8,28 @@
 #include "game/model_slot_properties.h"
 #include "pc/guest/mips.h"
 #include "pc/guest/sha256.h"
+#include "pc/mods/model_rows.h"
+#include "pc/mods/mods.h"
 #include "pc/overlays/model_gate_command.h"
+#include "pc/overlays/model_gate_row.h"
+#include "pc/overlays/model_claim.h"
+#include "pc/overlays/model_module_class.h"
 #include "pc/debug/log.h"
 
 /* Each MODEL.MRG record carries two small MIPS control modules that the
  * loader swaps into fixed slots: a primary module (slot A 0x8013A000, slot B
- * 0x8017A000; in every record seen it is `return 2`) and a variant module
- * (0x8013B000 / 0x8017B000) holding the monster's attack choreography and
- * impact particles. The game calls each through the word at +4. There are
- * 1,181 distinct variant modules, so they are not translated one by one:
- * the default runs the loaded module through the interpreter, which keeps
- * every monster's own attack movement. A module the interpreter cannot run
- * (reported once per loaded module) falls back to the stand-in below.
+ * 0x8017A000; `return 2` in all but ten records, and the disc calls only
+ * those ten's) and a variant module (0x8013B000 / 0x8017B000) holding the
+ * monster's attack choreography and impact particles. The game calls each
+ * through the word at +4. A module no native C stands in for runs through
+ * the interpreter, which keeps every monster's own attack movement; one the
+ * interpreter cannot run (reported once per loaded module) falls back to the
+ * stand-in below.
  *
- * The decomp's C for a code shape runs in its place where the table says so
- * (config/pc/model_gate.csv, written into model_gate_table.inc by
+ * The decomp's C for a code shape runs in its place where the tables say so
+ * (config/pc/model_gate.csv for the variant modules and
+ * config/pc/model_primary_gate.csv for the primary ones, written into
+ * model_gate_table.inc and model_primary_gate_table.inc by
  * tools/pc/model_gate.py): when the module in the slot is that shape's
  * retail code and constants, the first `span` bytes of its image by SHA-256.
  * What follows is the record's own data, which the C reads where the disc
@@ -37,7 +44,13 @@
  *   `spark`          the stand-in for every module (the resident spark burst,
  *                    called `native` before native C was planned).
  * Anything else is the default, as MEMORIES_DUEL_EFFECTS takes its values,
- * and says so once on stderr. */
+ * and says so once on stderr.
+ *
+ * Code mods may give C of their own for a module (mod API 29,
+ * src/pc/mods/model_rows.h): in the default mode a mod's row whose span hashes
+ * to the module runs it, after the disc's rows, or before them with
+ * MEMORIES_MODEL_OVER_DISC. MEMORIES_MODEL_MOD_C=0 leaves the mods' rows out
+ * (the disc's C still runs), to tell a mod's C from its data. */
 
 enum { MODE_DEFAULT, MODE_INTERPRETER, MODE_SPARK };
 
@@ -58,11 +71,22 @@ static int model_mode(void)
     return mode;
 }
 
+/* Whether the mods' rows may run (MEMORIES_MODEL_MOD_C, unset or 1: yes). */
+static int mod_c(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *setting = getenv("MEMORIES_MODEL_MOD_C");
+        enabled = !(setting && strcmp(setting, "0") == 0);
+    }
+    return enabled;
+}
+
 #ifdef MEMORIES_TEST_HOOKS
 /* MEMORIES_MODEL_STACK_POISON=<byte> (tools/pc/model_oracle.py --poison, a
  * build with test hooks): the stack below run_module's frame is filled with
  * the byte before a native module runs, so a module's C that reads a local it
- * never wrote (shape 128's CVECTOR, 84's flags[]) takes the byte, where the
+ * never wrote (as 84's flags[] and 128's quad did, before rule 6) takes the byte, where the
  * interpreter takes what its own stack held. Run with two bytes, such a shape
  * differs from the interpreter for one of them; the scan does not see it. */
 static int stack_poison(void)
@@ -88,6 +112,15 @@ typedef struct {
     ModelSparkEffect effect;
     int age;
 } MemoriesModelImpact;
+
+/* A primary module that is `return 2` (jr ra; addiu v0, zero, 2 at +4): the
+ * disc's in all but ten records. native_primary answers it as the module
+ * would, and with no side effect to keep it is the native C of all of them. */
+static int primary_returns_two(uint32_t module)
+{
+    const uint32_t *code = (const uint32_t *)(uintptr_t)(module + 4);
+    return code[0] == 0x03E00008u && code[1] == 0x24020002u;
+}
 
 static int native_primary(void *context, int command)
 {
@@ -143,29 +176,41 @@ static int native_variant(void *context, int command)
 
 /* The variant modules the decomp's C stands in for: the table's native rows
  * (MODEL_GATE_ROW, model_gate_table.inc), each the entry of the C built for its
- * slot, which the build links under the module's prefix (GATED_MODULES). */
-typedef int (*ModelEntry)(void *context, int command);
-
-#define MODEL_GATE_ROW(slot, identifier, span, sha256, entry, entries, table, stride, field, index_width) \
+ * slot, which the build links under the module's prefix (GATED_MODULES). The
+ * row type (ModelGateRow) is shared with the mods' rows: model_gate_row.h. */
+#define MODEL_GATE_ROW(slot, identifier, span, sha256, entry, entries, table, stride, field, index_width, modulus) \
     extern int entry(void *context, int command);
 #include "pc/overlays/model_gate_table.inc"
 #undef MODEL_GATE_ROW
 
-typedef struct {
-    int slot;
-    uint32_t identifier; /* the first word of the image */
-    uint32_t span;       /* the bytes from the slot base the hash covers */
-    const char *sha256;
-    ModelEntry entry;
-    uint32_t entries, table, stride, field, index_width; /* the command bound: model_gate_command.h */
-} ModelGateRow;
-
 static const ModelGateRow gate_rows[] = {
-#define MODEL_GATE_ROW(slot, identifier, span, sha256, entry, entries, table, stride, field, index_width) \
-    {slot, identifier, span, sha256, entry, entries, table, stride, field, index_width},
+#define MODEL_GATE_ROW(slot, identifier, span, sha256, entry, entries, table, stride, field, index_width, modulus) \
+    MODEL_GATE_DISC_ROW(slot, identifier, span, sha256, entry, entries, table, stride, field, index_width, modulus),
 #include "pc/overlays/model_gate_table.inc"
 #undef MODEL_GATE_ROW
-    {0, 0, 0, NULL, NULL, 0, 0, 0, 0, 0}};
+    MODEL_GATE_DISC_ROW(0, 0, 0, NULL, NULL, 0, 0, 0, 0, 0, 0)};
+
+/* The primary modules the decomp's C stands in for (MODEL_PRIMARY_ROW,
+ * model_primary_gate_table.inc, from config/pc/model_primary_gate.csv): the
+ * disc calls only the ten records' with code, of five shapes; the others are
+ * `return 2`, which native_primary answers as the stand-in. */
+#define MODEL_PRIMARY_ROW(slot, identifier, span, sha256, entry, entries, table, stride, field, index_width, modulus) \
+    extern int entry(void *context, int command);
+#include "pc/overlays/model_primary_gate_table.inc"
+#undef MODEL_PRIMARY_ROW
+
+static const ModelGateRow primary_gate_rows[] = {
+#define MODEL_PRIMARY_ROW(slot, identifier, span, sha256, entry, entries, table, stride, field, index_width, modulus) \
+    MODEL_GATE_DISC_ROW(slot, identifier, span, sha256, entry, entries, table, stride, field, index_width, modulus),
+#include "pc/overlays/model_primary_gate_table.inc"
+#undef MODEL_PRIMARY_ROW
+    MODEL_GATE_DISC_ROW(0, 0, 0, NULL, NULL, 0, 0, 0, 0, 0, 0)};
+
+/* A primary that is `return 2`, as a row: what native_row picks for one once
+ * mods have rows (with none, run_module answers it before any verdict, as it
+ * always has). */
+static const ModelGateRow return_two_row =
+    MODEL_GATE_DISC_ROW(0, 0, 12, NULL, native_primary, MODEL_GATE_NO_TABLE, 0, 0, 0, 0, 0);
 
 #define IMAGE_WORDS (0x5000u / 4)
 
@@ -174,16 +219,37 @@ static const ModelGateRow gate_rows[] = {
  * catches every way a module arrives (a disc delivery, a mod's copy, a
  * state) since none has to say so. Word loops, not memcmp: in the translated
  * build each guest access is resolved. A module no row can stand in for is
- * compared by its identifier word alone. */
+ * compared by its identifier word alone. With mods' rows (mod API 29) the
+ * verdict also holds only while the rows and the applied mods are the ones it
+ * was taken with. */
 typedef struct {
     uint32_t words[IMAGE_WORDS];
-    uint32_t span; /* the words compared; 0: no verdict yet */
-    const ModelGateRow *row; /* the native row they hash to, NULL: interpret */
+    uint32_t span; /* the bytes compared, in words rounded up; 0: no verdict yet */
+    int found;               /* chosen holds the row they hash to; 0: interpret */
+    ModelGateRow chosen;     /* a copy: a mod's row may go while the verdict stands */
     int outside_logged;      /* a call outside the row's commands was logged for these words */
-    int stand_in;            /* the stand-in took the setup of the attack in progress: it owns its updates */
+    unsigned rows_generation, mods_changes; /* ModelRows_Generation, Mods_Changes (0, 0 with no rows) */
+    /* Who keeps the updates of the attack in progress (model_claim.h): the
+     * stand-in's claim, and what took the setup, with attack_row the copy
+     * of the row whose C took it. */
+    ModelClaim claim;
+    ModelGateRow attack_row;
+    /* A primary's slot: the first three words of the `return 2` module the
+     * claim was last kept for (return_two_entry), which takes no verdict. */
+    int two_seen;
+    uint32_t two_words[3];
 } ModelVerdict;
 
-static ModelVerdict verdicts[2];
+static ModelVerdict verdicts[2], primary_verdicts[2]; /* [slot], for the variant and the primary module */
+
+/* What a verdict depends on beyond the slot's words: the mods' rows and
+ * which mods are applied, both 0 while no mod has a row. */
+static void rows_state(unsigned *generation, unsigned *changes)
+{
+    int rows = mod_c() && ModelRows_Count() > 0;
+    *generation = rows ? ModelRows_Generation() : 0;
+    *changes = rows ? Mods_Changes() : 0;
+}
 
 static int hex_equal(const uint8_t digest[32], const char *hex)
 {
@@ -195,23 +261,50 @@ static int hex_equal(const uint8_t digest[32], const char *hex)
     return strcmp(text, hex) == 0;
 }
 
-/* The native row for the variant module in a slot, NULL to interpret it. */
-static const ModelGateRow *native_variant_row(uint32_t module, int slot, uint32_t identifier)
+/* Whether `module` is the `return 2` primary whose words two_words holds. */
+static int same_two_words(const ModelVerdict *verdict, uint32_t module)
 {
-    ModelVerdict *verdict = &verdicts[slot];
+    const uint32_t *guest = (const uint32_t *)(uintptr_t)module;
+    return verdict->two_seen && guest[0] == verdict->two_words[0] && guest[1] == verdict->two_words[1] &&
+           guest[2] == verdict->two_words[2];
+}
+
+static void note_two_words(ModelVerdict *verdict, uint32_t module)
+{
+    const uint32_t *guest = (const uint32_t *)(uintptr_t)module;
+    verdict->two_seen = 1;
+    verdict->two_words[0] = guest[0];
+    verdict->two_words[1] = guest[1];
+    verdict->two_words[2] = guest[2];
+}
+
+/* The native row for the variant (or primary) module in a slot, NULL to interpret it. */
+static const ModelGateRow *native_row(int primary, uint32_t module, int slot, uint32_t identifier)
+{
+    ModelVerdict *verdict = primary ? &primary_verdicts[slot] : &verdicts[slot];
     const uint32_t *guest = (const uint32_t *)(uintptr_t)module;
     const ModelGateRow *row;
-    uint32_t i, span = 0;
+    uint32_t i, span = 0, longest = 0, longest_after = 0;
     const ModelGateRow *found = NULL;
+    unsigned generation, changes;
+    int same = 0, mods;
 
+    rows_state(&generation, &changes);
+    mods = generation != 0;
     if (verdict->span) {
-        for (i = 0; i < verdict->span / 4 && guest[i] == verdict->words[i]; i++) {
+        for (i = 0; i < (verdict->span + 3) / 4 && guest[i] == verdict->words[i]; i++) {
         }
-        if (i == verdict->span / 4) {
-            return verdict->row;
+        same = i == (verdict->span + 3) / 4;
+        if (same && verdict->rows_generation == generation && verdict->mods_changes == changes) {
+            return verdict->found ? &verdict->chosen : NULL;
         }
     }
-    for (row = gate_rows; row->sha256; row++) {
+    /* The order (notes/modding.md, "Your own C for a module (API 29)"): the
+     * mods' rows that ask to go first, the disc's rows, the mods' others. */
+    if (mods) {
+        found = ModelRows_Find(primary, slot, identifier, guest, 1, &longest);
+    }
+    for (row = primary ? primary_gate_rows : gate_rows; row->sha256; row++) {
         uint8_t digest[32];
         if (row->slot != slot || row->identifier != identifier) {
             continue;
@@ -219,25 +312,71 @@ static const ModelGateRow *native_variant_row(uint32_t module, int slot, uint32_
         if (row->span > span) {
             span = row->span;
         }
+        if (found) {
+            continue;
+        }
         Sha256(guest, row->span, digest);
         if (hex_equal(digest, row->sha256)) {
             found = row;
             span = row->span;
-            break;
+            if (!mods) {
+                break;
+            }
         }
     }
+    if (mods && !found && primary && primary_returns_two(module)) {
+        found = &return_two_row;
+    }
+    if (mods && !found) {
+        found = ModelRows_Find(primary, slot, identifier, guest, 0, &longest_after);
+    }
     /* The verdict covers the identifier's longest span, so that the next call
-     * compares what it was taken from. */
+     * compares what it was taken from; with mods' rows, the longest of any
+     * row of the identifier, disc or mod. */
+    if (mods) {
+        if (longest > span) span = longest;
+        if (longest_after > span) span = longest_after;
+        if (found == &return_two_row && span < return_two_row.span) span = return_two_row.span;
+    }
     verdict->span = span ? span : 4;
-    verdict->row = found;
-    verdict->outside_logged = 0;
-    verdict->stand_in = 0; /* a new module: no attack of the old one goes on */
-    for (i = 0; i < verdict->span / 4; i++) {
+    verdict->found = found != NULL;
+    if (found) {
+        verdict->chosen = *found;
+        verdict->chosen.sha256 = NULL; /* the registry's may not outlive this call */
+    }
+    verdict->rows_generation = generation;
+    verdict->mods_changes = changes;
+    if (!same) {
+        verdict->outside_logged = 0;
+        /* A new module: no attack of the old one goes on. But words that
+         * are the `return 2` module return_two_entry kept the claim for are
+         * that module still: the verdict is new only because rows came. */
+        if (!(primary && same_two_words(verdict, module))) {
+            ModelClaim_NewWords(&verdict->claim);
+        }
+    }
+    if (primary && primary_returns_two(module)) {
+        note_two_words(verdict, module); /* the claim's words if rows go while its attack runs */
+    } else if (!same) {
+        verdict->two_seen = 0;
+    }
+    for (i = 0; i < (verdict->span + 3) / 4; i++) {
         verdict->words[i] = guest[i];
     }
-    LOG(LOG_MODS, "model variant module %u in slot %c: %s", (unsigned)identifier, slot ? 'B' : 'A',
-        found ? "retail code, native C" : span ? "changed code, interpreter" : "interpreter");
-    return found;
+    if (Log_Wanted(LOG_MODS)) {
+        /* What the interpreter runs, for a mod's author: the disc's module
+         * the port has no C for yet, or the mod's own code or tables
+         * (model_module_class.h). */
+        if (found && found->owner >= 0) {
+            LOG(LOG_MODS, "model %s module %u in slot %c: native C from mod %s", primary ? "primary" : "variant",
+                (unsigned)identifier, slot ? 'B' : 'A', Mods_Id(found->owner));
+        } else {
+            ModelModuleInfo info = ModelModule_Classify(guest, slot, primary);
+            LOG(LOG_MODS, "model %s module %u in slot %c: %s", primary ? "primary" : "variant", (unsigned)identifier,
+                slot ? 'B' : 'A', found ? "retail code, native C" : ModelModule_ClassText(info.kind));
+        }
+    }
+    return found ? &verdict->chosen : NULL;
 }
 
 /* The work area's word that tells an update which entry the setup picked: a
@@ -255,43 +394,63 @@ static uint32_t read_entry_word(const void *context, const ModelGateRow *row)
 }
 
 /* Whether the native C may take this call: the retail code is in the slot
- * (native_variant_row) and the call stays within the entries the hash covers
+ * (native_row) and the call stays within the entries the hash covers
  * (model_gate_command.h). A call outside them, which only a mod's record can
- * make, is interpreted, and logged once for the code in the slot. So is an
- * update of an attack the stand-in took (verdict->stand_in). *field is the
- * work area's entry POINTER for a pointer row's setup that goes elsewhere
- * (else -1), for run_module to clear if the stand-in takes it. */
-static ModelEntry native_variant_entry(uint32_t module, int slot, uint32_t identifier, void *context, int command,
-                                       int *field)
+ * make, is interpreted, and logged once for the code in the slot. Who
+ * keeps an update of an attack already set up is model_claim.h's to say:
+ * the stand-in's attack stays with it, and one set up under another choice
+ * with what set it up. *field is the work area's entry POINTER for a
+ * pointer row's setup that goes elsewhere (else -1), for run_module to clear
+ * if the stand-in takes it. *chosen is the row the verdict picked, whether
+ * or not it takes this call; *ran the row whose entry is returned. */
+static ModelEntry native_entry(int primary, uint32_t module, int slot, uint32_t identifier, void *context,
+                               int command, int *field, const ModelGateRow **chosen, const ModelGateRow **ran)
 {
-    const ModelGateRow *row = native_variant_row(module, slot, identifier);
+    const ModelGateRow *row = native_row(primary, module, slot, identifier);
+    ModelVerdict *verdict = primary ? &primary_verdicts[slot] : &verdicts[slot];
+    const char *kind = primary ? "primary" : "variant";
     uint32_t entry_word = 0;
     *field = -1;
+    *chosen = row;
+    *ran = NULL;
+    switch (ModelClaim_Decide(&verdict->claim, ModelClaim_Choice(row), command >= 0, ModelRows_StateLoads())) {
+    case MODEL_RUN_CLAIMED_C:
+        *ran = &verdict->attack_row;
+        return verdict->attack_row.entry;
+    case MODEL_RUN_PORT:
+        return NULL; /* the port's work area: no C takes it */
+    case MODEL_RUN_STAND_IN:
+        if (row && !verdict->outside_logged) {
+            verdict->outside_logged = 1;
+            LOG(LOG_MODS, "model %s module %u in slot %c: an update of an attack the stand-in took stays "
+                "with it", kind, (unsigned)identifier, slot ? 'B' : 'A');
+        }
+        return NULL;
+    case MODEL_RUN_CHOICE:
+        break;
+    }
     if (!row) {
         return NULL;
     }
     if (row->entries != MODEL_GATE_NO_TABLE && command < 0) {
         entry_word = read_entry_word(context, row);
     }
-    if (!ModelGate_CommandCovered(row->entries, row->table, row->stride, module, command, entry_word,
-                                  row->index_width, verdicts[slot].stand_in)) {
-        if (!verdicts[slot].outside_logged) {
-            verdicts[slot].outside_logged = 1;
+    if (!ModelGate_CommandCoveredModulo(row->entries, row->table, row->stride, module, command, entry_word,
+                                        row->index_width, verdict->claim.stand_in, row->modulus)) {
+        if (!verdict->outside_logged) {
+            verdict->outside_logged = 1;
             if (command >= 0) {
-                LOG(LOG_MODS, "model variant module %u in slot %c: command %d is past the %u entries of its table "
-                    "the hash covers, interpreter", (unsigned)identifier, slot ? 'B' : 'A', command,
+                LOG(LOG_MODS, "model %s module %u in slot %c: command %d is past the %u entries of its table "
+                    "the hash covers, interpreter", kind, (unsigned)identifier, slot ? 'B' : 'A', command,
                     (unsigned)row->entries);
-            } else if (verdicts[slot].stand_in) {
-                LOG(LOG_MODS, "model variant module %u in slot %c: an update of an attack the stand-in took stays "
-                    "with it", (unsigned)identifier, slot ? 'B' : 'A');
             } else if (row->index_width) {
-                LOG(LOG_MODS, "model variant module %u in slot %c: an attack whose index %u is not one of the "
-                    "%u the hash covers, interpreter", (unsigned)identifier, slot ? 'B' : 'A', (unsigned)entry_word,
-                    (unsigned)row->entries);
+                LOG(LOG_MODS, "model %s module %u in slot %c: an attack whose index %u is not one of the "
+                    "%u the hash covers, interpreter", kind, (unsigned)identifier, slot ? 'B' : 'A',
+                    (unsigned)entry_word, (unsigned)row->entries);
             } else {
-                LOG(LOG_MODS, "model variant module %u in slot %c: an attack whose entry (0x%08X) is not one of the "
-                    "%u the hash covers, interpreter", (unsigned)identifier, slot ? 'B' : 'A', (unsigned)entry_word,
-                    (unsigned)row->entries);
+                LOG(LOG_MODS, "model %s module %u in slot %c: an attack whose entry (0x%08X) is not one of the "
+                    "%u the hash covers, interpreter", kind, (unsigned)identifier, slot ? 'B' : 'A',
+                    (unsigned)entry_word, (unsigned)row->entries);
             }
         }
         if (command >= 0 && !row->index_width) {
@@ -299,12 +458,50 @@ static ModelEntry native_variant_entry(uint32_t module, int slot, uint32_t ident
         }
         return NULL;
     }
+    *ran = row;
     return row->entry;
+}
+
+/* A primary that is `return 2` while no mod has a row: answered before any
+ * verdict is taken or logged, as before mod rows. Its words are kept apart
+ * (two_words, not the verdict's) and the call still goes through the claim,
+ * so an attack set up on either path keeps its updates when a mod's row
+ * for the module comes or goes in the middle of it (native_row keeps the
+ * claim for these words). */
+static ModelEntry return_two_entry(uint32_t module, int slot, int command, const ModelGateRow **chosen,
+                                   const ModelGateRow **ran)
+{
+    ModelVerdict *verdict = &primary_verdicts[slot];
+    if (!same_two_words(verdict, module)) {
+        note_two_words(verdict, module);
+        ModelClaim_NewWords(&verdict->claim); /* a new module: no attack of the old one goes on */
+        /* And the verdict's words are no longer the slot's: the module the
+         * verdict was taken for, if it comes back, is new words again
+         * (native_row compares the slot with verdict->words), so its claim
+         * starts anew rather than inheriting this module's. */
+        verdict->span = 0;
+    }
+    *chosen = &return_two_row;
+    *ran = NULL;
+    switch (ModelClaim_Decide(&verdict->claim, ModelClaim_Choice(&return_two_row), command >= 0,
+                              ModelRows_StateLoads())) {
+    case MODEL_RUN_CLAIMED_C:
+        *ran = &verdict->attack_row;
+        return verdict->attack_row.entry;
+    case MODEL_RUN_PORT:
+    case MODEL_RUN_STAND_IN:
+        return NULL;
+    case MODEL_RUN_CHOICE:
+        break;
+    }
+    *ran = &return_two_row;
+    return native_primary;
 }
 
 /* module: the slot base (the identifier word; the entry is at +4). The
  * trace names the module by its slot and identifier, and what runs it:
- * "native" (the decomp's C), "interpreter" or "stand-in". */
+ * "native" (the decomp's C), "mod:<id>" (a mod's C, mod API 29),
+ * "interpreter" or "stand-in". */
 static int run_module(uint32_t module, int variant, void *context, int command)
 {
     static uint32_t failed[2][2]; /* [slot][variant]: identifier of a module that failed */
@@ -314,22 +511,64 @@ static int run_module(uint32_t module, int variant, void *context, int command)
     int mode = model_mode();
     int interpret = mode != MODE_SPARK && entry != 0 && failed[slot][variant] != identifier;
     int field = -1;
-    ModelEntry native = variant && mode == MODE_DEFAULT && entry != 0 ? native_variant_entry(module, slot, identifier, context, command, &field) : NULL;
+    ModelVerdict *verdict = variant ? &verdicts[slot] : &primary_verdicts[slot];
+    const ModelGateRow *chosen = NULL, *ran = NULL;
+    ModelEntry native = NULL;
+    int choosing = mode == MODE_DEFAULT && entry != 0, decided = 0;
+    char way[80];
 
-    /* A setup starts an attack: whoever takes it, the stand-in's claim on the
-     * slot's updates (set below) ends. */
-    if (variant && command >= 0) {
-        verdicts[slot].stand_in = 0;
+    if (choosing) {
+        /* `return 2` is answered before any verdict while no mod has a row,
+         * as it always was; with rows, native_row orders it among them. */
+        if (!variant && primary_returns_two(module) && !(mod_c() && ModelRows_Count() > 0)) {
+            native = return_two_entry(module, slot, command, &chosen, &ran);
+        } else {
+            native = native_entry(!variant, module, slot, identifier, context, command, &field, &chosen, &ran);
+        }
+        decided = 1;
     }
 
+    /* A setup starts an attack: whoever takes it, the stand-in's claim on the
+     * slot's updates (set below) ends, and what takes it now is what its
+     * updates stay with should the choice change under the same words
+     * (model_claim.h): C (a mod's even past its bound) or the port. */
+    if (command >= 0) {
+        if (!decided) {
+            ModelClaim_Decide(&verdict->claim, ModelClaim_Choice(NULL), 1, ModelRows_StateLoads());
+        }
+        if (choosing) {
+            ModelClaim_Took(&verdict->claim, ModelClaim_Choice(chosen), native != NULL, native ? ran->owner : -1,
+                            ModelRows_StateLoads());
+            if (native) {
+                verdict->attack_row = *ran;
+                verdict->attack_row.sha256 = NULL;
+            }
+        }
+    }
+    if (!native || (ran && ran->owner < 0)) {
+        ran = NULL;   /* the interpreter, the stand-in or the disc's C */
+    }
+
+    if (ran) {
+        snprintf(way, sizeof(way), "mod:%s", Mods_Id(ran->owner));
+    }
     LOG(LOG_MODEL, "%s slot=%u command=%d module %u in %c: %s", variant ? "variant" : "primary",
         (unsigned)D_8009AFA0, command, (unsigned)identifier, slot ? 'B' : 'A',
-        native ? "native" : interpret ? "interpreter" : "stand-in");
+        ran ? way : native ? "native" : interpret ? "interpreter" : "stand-in");
     if (native) {
+        uint32_t previous;
+        int result;
 #ifdef MEMORIES_TEST_HOOKS
         if (stack_poison() >= 0) paint_stack(stack_poison());
 #endif
-        return native(context, command);
+        if (!ran) {
+            return native(context, command);
+        }
+        previous = ModelRows_Running();
+        ModelRows_SetRunning(module);
+        result = native(context, command);
+        ModelRows_SetRunning(previous);
+        return result;
     }
     if (interpret) {
         uint32_t args[2], result;
@@ -343,24 +582,36 @@ static int run_module(uint32_t module, int variant, void *context, int command)
                 variant ? "variant" : "primary", (unsigned)identifier, slot ? 'B' : 'A');
         failed[slot][variant] = identifier;
     }
-    /* The stand-in takes the attack. Its work area is another structure (its
-     * first bytes are random sparks), so what the native C would read there
+    /* The stand-in takes the attack. Its work area is another structure (a
+     * variant's: its first bytes are random sparks; a primary's: native_primary
+     * set nothing up, after an interpreter that failed or no entry), so what
+     * the native C would read there
      * means nothing, and an index row cannot be told from a native setup's: an
      * index below `entries` is any small number, 0 included, and a stand-in's
      * byte lands there once in count/256 updates. The slot remembers instead
-     * (verdict->stand_in) that the stand-in ran, at the setup or at an update
+     * (the claim's stand_in) that the stand-in ran, at the setup or at an update
      * the interpreter failed in the middle of an attack (the stand-in writes
      * its sparks over that work area too), and no update of it goes native
      * until a setup or a new module ends the claim. A pointer row is also
      * cleared to 0, which is no entry, as the work area outlives the claim (a
      * new module resets the flag but not the memory). */
-    if (variant) {
-        verdicts[slot].stand_in = 1;
-    }
+    ModelClaim_StandIn(&verdict->claim);
     if (field >= 0) {
         *(uint32_t *)((uintptr_t)context + (uint32_t)field) = 0;
     }
     return variant ? native_variant(context, command) : native_primary(context, command);
+}
+
+/* The classifier's view of the mods' rows (model_module_class.h): what
+ * native_row would pick from them for an image, by the same rules. */
+const char *Memories_ModelModRowOwner(const void *image, int slot, int primary, int over_disc)
+{
+    const ModelGateRow *row;
+    if (!mod_c() || ModelRows_Count() == 0) {
+        return NULL;
+    }
+    row = ModelRows_Find(primary, slot, *(const uint32_t *)image, image, over_disc, NULL);
+    return row ? Mods_Id(row->owner) : NULL;
 }
 
 int Memories_ModelPrimaryControlA(void *context, int command) { return run_module(0x8013A000u, 0, context, command); }

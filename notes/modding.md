@@ -179,6 +179,7 @@ checked as well, when it starts.
 | 23 | the release after v0.3.0 | a `menu`'s `slide`; for a code mod, the mouse, the overlay's pictures and `clip` (`api` 23, [below](#code-mods)) |
 | 25 | the release after v0.3.0 | a frame style's `atk_label` or `dfd_label` picture on a style that keeps retail's frame (no `image`, or `"full_bleed": false`): it replaces retail's own "ATK"/"DFD" caption; a `digits` strip on such a style, in place of retail's digits ([Frame styles](#frame-styles-and-the-rules-that-pick-them)) |
 | 26 | the release after v0.3.0 | a card's `variant_permille` and `variant_label`: alternate versions of a retail card ([Variants](more-cards.md#variants-alternate-versions-of-a-card)) |
+| 27 | the release after v0.3.0 | a frame style's `stars` picture, `game_frame` and `parts_over_art`, a `color` on the ATK/DFD labels and digit strips, and a card's `art_transparent` (card_layout, [Frame styles](#frame-styles-and-the-rules-that-pick-them)); a `card_layout` of `frame_styles` alone, which no longer replaces another mod's layout ([Layouts of several mods](#layouts-of-several-mods)) |
 
 The FM Editor writes `min_api` on save as the lowest one of these that has
 everything the mod uses, never lowering one written higher, and its Mod
@@ -751,9 +752,11 @@ A record is read in seventeen stages (`func_80056D7C`,
 | 1 | metadata |
 
 The control modules are MIPS code built for their slot's addresses
-(`0x8013A000`/`0x8013B000`, `0x8017A000`/`0x8017B000`), which the port runs in
-its interpreter (`src/pc/guest/mips.c`), as it runs the disc's. A disc record
-is a starting point. Card C's (a monster: cards 301-350, 651-700 and 721 have
+(`0x8013A000`/`0x8013B000`, `0x8017A000`/`0x8017B000`). The port runs the
+disc's as the decomp's C (but for a few variant shapes still being ported),
+and anything else in its interpreter
+(`src/pc/guest/mips.c`), which is going away ([Attack code: C, not
+MIPS](#attack-code-c-not-mips)). A disc record is a starting point. Card C's (a monster: cards 301-350, 651-700 and 721 have
 none) is record number C - 1, from which take 50 when C - 1 is 350 or more,
 another 50 when it is 700 or more and another 1 when it is 721 or more; the
 record is the 276 sectors from `MODEL.MRG`'s start plus 276 times that number.
@@ -829,6 +832,386 @@ palettes changed (a megabyte).
 monsters share the frame's packets, and a bigger model there is a follow-up.
 A save state taken with a bigger model in a battle slot carries its arena
 (3 MiB more for the two slots, written once a bigger model is added).
+
+### Attack code: C, not MIPS
+
+**The MIPS interpreter is going away.** A record's control modules (the
+table above: four variant modules and two primaries) are PlayStation code.
+The port runs the disc's modules as the decomp's C, compiled into the
+game: the variant modules (the attacks), but for a few shapes still being
+ported, and the primaries (`return 2`, or one of the five shapes of the ten
+records that have code). After that, what the interpreter runs is a mod's
+own: a module the mod changed or brought.
+A later version then removes the interpreter. After that, a battle using such a module falls back to the
+stand-in's sparks instead of the attack the mod wrote. No version is set
+for it yet, and the warning below appears for as long as a mod needs the
+interpreter.
+
+**What the game says.** When a mod is applied, the game reads every
+control module it brings or changes:
+- a model's file (`models`);
+- the records of `MODEL.MRG` that its `data` replaces or patches where a
+  record keeps its modules (sectors 180 to 223).
+
+It compares each with the disc's modules (`config/pc/model_gate.csv` and
+`config/pc/model_retail.csv`) and with the rows code mods registered for
+their own C ([below](#your-own-c-for-a-module-api-29)). This runs once
+every mod has started, and again whenever a mod is applied or removed, so a
+model pack and the code mod with C for its models count together in any
+order. A mod with modules the interpreter would run shows one warning in
+the Mods window, under its status, such as `3 attack modules in model
+pikachu, MODEL.MRG card 1, 40 are MIPS code, which runs on an interpreter
+that a later version removes`; the line also says how many a code mod's C
+runs (`4 attack modules run native C from mod pikachu-c`, not a warning).
+`MEMORIES_TRACE=mods` logs each of those modules and what it is:
+- `the disc's code with other tables, interpreted, bytes 0xB10-0xB60`: the
+  code is the disc's, and the mod changed the data the decomp's C reads
+  there (the tables it indexes by the attack, or divides by). Data past
+  the second offset is the record's own, and the C reads it from wherever
+  the mod put it.
+- `changed code, interpreted`: the code of a disc module, changed.
+- `code no disc module has, interpreted`: a first word no disc module of
+  that slot has.
+- `native C from mod <id>`: a code mod's row covers it (not a warning).
+
+The records are read as the game will read them, with every applied mod's
+changes, so a mod that patches a record another mod changed is told of
+that record's modules too. The battle logs the same for the module
+in each slot when it first runs.
+It also logs an attack whose command (a word of the record) picks an entry
+past the ones the disc's table has: the interpreter runs that attack even
+with the disc's code, and loading does not see it.
+
+**What does not warn.**
+- A module that is the disc's, unchanged.
+- A module with the disc's code of a shape the port still interprets,
+  whatever data follows that code: it is the port's to finish, not the
+  mod's.
+- A module changed only past its span. The decomp's C runs it, reading
+  the mod's data.
+- A module with no entry (its second word 0, as in a model file shorter
+  than a record). The stand-in runs it, as before.
+- A module an applied code mod's row covers: that mod's C runs it.
+
+**What to do with a warning.**
+- **Tables:** keep the disc's values in the bytes the log names, and put
+  your own data past them, if the attack allows it.
+- **Code:** give the game C for the module: [Your own C for a module (API
+  29)](#your-own-c-for-a-module-api-29). `model_gate.py mod-migrate` starts
+  you from the port's C for the disc's shape your module comes from, and
+  makes all of it for a module whose changes the C reads anyway ([Moving a
+  mod's attacks from MIPS to C](#moving-a-mods-attacks-from-mips-to-c)).
+
+#### Your own C for a module (API 29)
+
+A code mod can give the game native C for a model's control module. The
+game then runs that C, not the module's MIPS, wherever the module's bytes
+hash to the row the mod registered. The C replaces the interpreter for that
+module, so the warning above goes away.
+
+**The row.** In `MemoriesModInit`, fill a `MemoriesModelModule`
+(`src/pc/mods/modapi.h`) and pass it to `host->model_module`:
+- `size`: `sizeof(MemoriesModelModule)`;
+- `kind`: `MEMORIES_MODEL_VARIANT` (the attack, 0x5000 bytes) or
+  `MEMORIES_MODEL_PRIMARY` (0x1000 bytes);
+- `slot`: `MEMORIES_MODEL_SLOT_A`, `_B`, or `_BOTH`;
+- `identifier`: the module's first word;
+- `span`: how many bytes from the slot base the hash covers, from 8 up to the
+  module's size;
+- `sha256`: the SHA-256 of those bytes, as 64 hex digits;
+- `entry`: your C, `int32_t entry(uint8_t *context, int32_t command)`. It is
+  called as the module would be: `context` is the work area the game hands
+  the module, and `command` is >= 0 for a setup and < 0 for an update. It
+  returns what the module returns.
+
+The host function returns a token for `model_module_remove`, or 0 when it
+refuses the row. The mod's status then says why: a `sha256` that is not 64
+hex digits, a span past the module, a bound outside the span, no entry.
+The game takes a copy of the row, so you need not keep the struct.
+
+**Which calls it takes.** With no flags the C takes every call to the
+module. With `MEMORIES_MODEL_BOUND` it takes only the commands a table
+covers, as the disc's rows do (`config/pc/model_gate.csv`, `command_table`):
+- `entries`, `table`, `stride`: a setup's command (taken `% modulus` when
+  `modulus` is not 0) must be below `entries`;
+- `field`, `index_width`: an update's entry, read at `field` of the work
+  area, must name one of those entries. With `index_width` 0 it is a pointer
+  to one of the `entries` entries of `stride` bytes at `table` (an offset
+  from the slot base). With 1, 2 or 4 it is the command itself, stored in
+  that many bytes. This side of the bound only matters for an attack your
+  C did not set up (one set up before your mod was on, or by the port).
+  `field` lies in the work area the module is handed: below 0x1000 for a
+  primary, 0x5000 for a variant (the disc's reach 0x4A64), and is aligned
+  to what is stored there (4 bytes for a pointer, as MIPS's `sw` stores it).
+
+Any other call does not run this C: it gets the port's own handling of the
+module (today the interpreter; the sparks stand-in once the interpreter is
+removed). An attack your C set up finishes on your C: its updates run your C
+whatever `field` holds, even if the mod is turned off before its last
+update. An attack something else set up finishes on what set it up, even if
+your mod is turned on during it. A loaded state ends that claim: the
+state's attack was not set up here, so its updates go by the bound and,
+past it, to the module's own code. That is why a module's own MIPS must be
+safe to run (below).
+
+**Disc first.** For each slot, the game looks in this order:
+1. rows flagged `MEMORIES_MODEL_OVER_DISC`;
+2. the disc's own rows (and a primary that is `return 2`, which the game
+   answers itself);
+3. the other mods' rows;
+4. the port's own handling of the module (today the interpreter; the sparks
+   stand-in once the interpreter is removed).
+
+Unknown `flags` bits are refused, as are more than 16,384 rows registered
+by all mods together (`MODEL_ROWS_MAX`; a `SLOT_BOTH` row counts twice).
+
+So a row whose bytes are the disc's own (a record copied and left
+unchanged in its span) keeps the oracle-checked C of the port. With
+`OVER_DISC` the row goes first, and `MEMORIES_TRACE=mods` logs that it
+"stands over the disc's C for shape N". Among mods, the one applied last
+wins.
+
+**Both slots.** The two slots hold different images: slot B's code is
+relocated to 0x8017xxxx. You can register one row per slot, each with its
+own entry, identifier and hash, as the port does with its slot B wrapper
+(`src/native_overlays/model_variant_slot1`). Or you can register one entry
+for both with `MEMORIES_MODEL_SLOT_BOTH`. That C finds its slot with
+`host->model_module_base(host)`, which returns 0x8013A000, 0x8013B000,
+0x8017A000 or 0x8017B000 inside an entry and 0 outside one. Its data is then
+`(T *)(uintptr_t)(base + offset)`. Both slots' images must then hash the same
+over the span.
+
+**The record's data.** Past its code, a module's image holds the record's
+tables, which the C reads where the game loaded them. The rules for each
+kind of data:
+- **A name of the module's range** (`D_8013A000` to `D_8013FFFF`,
+  `D_8017A000` to `D_8017FFFF`), declared `extern`: the 32-bit and 64-bit
+  Windows and Linux games bind it to that address, and `build_mod.py` pins
+  it to that address for the Android and macOS games
+  (`aarch64-translated`, `macos`), as their own data is. A name of the
+  range your C defines (in any of its units) stays your C's own on every
+  game.
+- **`func_` names in those ranges** are never bound: that is MIPS code.
+- **A `const` copy** in your C is only right for bytes inside the hashed
+  span, which the hash keeps equal to the image.
+- **A pointer row's table** must be the image's (`extern`, or found from
+  `model_module_base`). The bound compares the work area's pointer with the
+  slot base plus `table`.
+
+**The game's functions.** Your C calls the game's functions by the names
+they are exported under (`exports.txt` beside the SDK). In a mod, `rand` and
+`srand` are the mods' own random numbers (`mod_libc.c`). The game's, which
+a module's MIPS calls, are `Memories_Rand` and `Memories_Srand`. The
+libgte functions `ccos` and `csin` are exported as `Psx_ccos` and
+`Psx_csin`. Frames match the interpreter's only with the game's. Build the
+port's C unoptimized, as the game does (`-O0 -fwrapv`): `#pragma clang
+optimize off` before it (GCC: `#pragma GCC optimize ("O0")`), since
+`build_mod.py` compiles a mod at `-O2`. The decomp's C keeps some of the
+MIPS code's behaviour that only `-O0` keeps too: shape 109 writes a fourth
+entry of a three-entry local array, which lands in the next local as on the
+PS1 at `-O0`, and at `-O2` draws other frames (or, with `-fwrapv`, crashes).
+`tests/pc/mod_fixtures/model_c54` builds the port's own C for shape 54 into
+a mod this way, with a prefix header.
+
+**A module that is only C.** The game still needs the module in the record.
+It needs your identifier at +0 and a nonzero word at +4: for a module whose
+word at +4 is 0 the game runs the sparks stand-in and never looks at a
+mod's row. What follows is what the game runs with the mod off (today
+the interpreter; once it is removed, the sparks stand-in). Make it MIPS
+that is safe to run:
+- **A variant** must end its attack: return 0 from the setup, 3 from an
+  update to start the defender's dying animation, then 2. A variant that
+  only returns 2 (`jr ra; li v0, 2`) never ends its attack, and the battle
+  waits for ever. `tests/pc/mod_fixtures/model_both.c` gives the smallest
+  such module (56 bytes: the identifier and 13 instructions) and C that does
+  the same.
+- **A primary** can be `0x03E00008 0x24020002` (`jr ra; li v0, 2`). The game
+  answers such a primary itself, before any mod row without `OVER_DISC`, so
+  its row needs that flag. No game code reads the first word as anything
+but an identifier. Pick one no disc module has, at or above 0x10000, so
+the logs tell yours apart.
+
+**Checking it.**
+- `MEMORIES_TRACE=model` names the C that ran each call `mod:<id>`.
+- `MEMORIES_TRACE=mods` logs each row a mod registers
+  (`<id>: model_module variant slot A identifier N span S sha256 H`) and
+  each module the battle takes (`native C from mod <id>`).
+- `MEMORIES_MODEL_MOD_C=0` leaves every mod's rows out, so the disc's C and
+  the port's own handling run as without the mods' C. Use it to tell your C from
+  your data.
+- `tools/pc/model_oracle.py --mod <your mod's folder>` runs battles with
+  your mod against the interpreter, frame for frame. It checks that
+  `mod:<id>` ran where your rows cover the record (notes/pc-build.md).
+
+**Versions.** Set `"min_api": 29` in `mod.json` and check
+`host->api >= 29` before calling these entries. If the models are in a data
+mod and the C is in a code mod, the data mod `requires` the code mod, so
+the C is there whenever the models are.
+
+#### Moving a mod's attacks from MIPS to C
+
+`tools/pc/model_gate.py mod-migrate` does most of the above for a mod whose
+models come from the disc's. It needs the disc (the game's own image: the tool
+reads the modules your mod changes against it) and the port's C it starts from
+(`src/native_overlays`), which **every release's SDK carries**: `sdk/tools/`
+has the tool and `sdk/include/native_overlays/` that C (the decomp's own
+source, no disc data), with its tables in `sdk/config/`. So you need no clone
+of this repository: in the commands below, `tools/pc/` is the SDK's `tools/`
+(`python sdk/tools/model_gate.py mod-migrate ...`, `sdk/tools/build_mod.py`,
+`sdk/tools/model_oracle.py`; the report prints the commands as they are for
+the tool you ran). The tables, the hashes of the rows and the C are those of
+the game build the SDK came with, which is why the tool comes in the SDK and
+not on its own: use the SDK of the release you play with.
+`python sdk/tools/model_gate.py mod-check` says without a disc that all of
+it is there. The compiler is the one `build_mod.py` uses: the llvm-mingw the
+one-click build fetched into `sdk/toolchain` (`build-mod.bat --setup` or
+`build-mod.sh --setup` fetches it and stops), else what is on your PATH. On
+Windows with no Python of your own, the one-click build's is
+`sdk\toolchain\python-<version>\python.exe`, and runs these tools too. The
+oracle (step 4) runs the game beside the SDK, the release's `memories-pc`.
+Four steps, here for a mod in `mods/my-mod`:
+
+1. **Make the C.**
+
+   ```
+   python tools/pc/model_gate.py mod-migrate mods/my-mod --disc game/rpg-yfm.bin
+   ```
+
+   It reads every control module your mod brings or changes: those of its
+   `models` files and of the `MODEL.MRG` records its `data` replaces or
+   patches (sectors 180 to 223), the same ones the Mods window warns about.
+   For each it prints what the module is, as the game classifies it, and
+   what it did:
+   - **The disc's tables changed** (`the disc's code with other tables`):
+     the disc's shape with that first word is the source. Its C reads the
+     tables from the record, so it runs your bytes as it is, with one limit.
+     The hash of a disc row covers some data past the code on purpose
+     (`config/pc/model_gate.csv`'s note says which): the command table, and
+     words the C may divide by or index with, which native C cannot survive
+     as the interpreter does (a zero divisor stops the game; a larger count
+     writes past the C's arrays). Inside that span the tool makes C only
+     where the row's own checks still hold: the command table's entries,
+     when each is one of the disc's own entries for the shape (reordered or
+     repeated: the attack picks an entry, and every value it reads is one
+     the disc has). The span is one run of bytes, so it also covers words
+     between those that the C does not divide by or index with.
+     A change to any other word there gets `port by hand`: the tool does
+     not check those words. The report names each changed word with its
+     symbol and a label, from `config/pc/model_span_words.csv`
+     (`tools/pc/model_span_words.py` works it out from the C), saying what
+     the module's own C does with it: `unread` (not read by this module's
+     own C), `texture` (a `GsIMAGE` header handed to the page and CLUT
+     packing), `value` (computed with), what it may reach (`divisor`,
+     `index`, `bound`, `pointer`, `shift`, `address`, `copy`), or `unknown`
+     (the walk does not follow this module's C). A label is a description,
+     not a proof that the C draws what the interpreter draws: even `unread`
+     is only this module's view, and another module's C may read the bytes.
+     When the row's C, or the analysis and the headers it reads, changed
+     since the table was made (digests, checked by CTest
+     `pc_model_span_words`, which only warns, and when a release is packed,
+     which warns and goes on), the report says the labels are stale; an SDK's
+     labels are checked against the tree it was made from, so its report says
+     so only when they were already stale then or a file of the SDK was
+     changed. Your
+     next step is one of two: port the module by hand, or run mod-migrate
+     with `--accept-data`, which makes the C anyway, at your own risk, and
+     warns that the words were not checked. Then run the
+     oracle, as the next step describes (`model_oracle.py --mod ...
+     --records` or `--models`), and check that the C and the MIPS draw
+     alike. Data past the span is the
+     record's own, and the C reads whatever you put there.
+   - **A const the port's C keeps its own copy of changed** (in `changed
+     code`, the bytes of a `const` such as `D_8013BAE4`, a scale vector):
+     the C it makes defines that const with your bytes.
+   - **The code changed**: the report names the functions with bytes of
+     their own (`func_8013B2A0 (4 bytes at 0x2A4-0x2A7)`) and makes no C:
+     the C would be the disc's, not yours. Port those functions by hand,
+     starting from the shape's C (`src/native_overlays/...` in a checkout,
+     `sdk/include/native_overlays/...` in an SDK: the report names it as the
+     tree you ran it from does), and register them as [above](#your-own-c-for-a-module-api-29).
+   - **The disc's module, or one without entry:** nothing to do.
+   - **A first word no disc module has:** no source; port it by hand.
+
+   It exits with 1 when any module needs porting by hand.
+2. **What it wrote, beside your `mod.json`:**
+   - `model_c/<prefix>/`: the shape's files from `src/native_overlays`
+     (`sdk/include/native_overlays` in an SDK; slot A's C, slot B's wrapper, their headers), with their includes made
+     relative to the copy. `<prefix>` names the module copy, such as
+     `mm_v54a` for shape 54 in slot A.
+   - `<prefix>.h`: everything the module's C defines, under the prefix, so
+     two shapes in one mod do not clash. It also holds the game's functions
+     under the names a mod gets them by (`rand` as `Memories_Rand`), and
+     prototypes the Android build needs.
+   - `<prefix>_<n>.c`: one unit for each C file of the module. Its first
+     lines name `memories-build: game-flags`, for which `build_mod.py`
+     compiles it with the game's own flags for the port's C, `-O0 -fwrapv
+     -fno-strict-aliasing`, not a mod's `-O2` (and, should another builder
+     miss the marker, `#pragma clang optimize off` or GCC's `optimize`
+     with the same three). The decomp's C keeps some of the MIPS code's
+     frame: shape 109 writes a fourth entry of a three-entry local array,
+     which lands in the next local only at `-O0`. C you port by hand from
+     the port's C needs the same: put that marker in the first lines of
+     your unit.
+   - `<prefix>_data.c`: the module's own storage for the locals the
+     disc's code reads before it writes them (rule 6), and the consts with
+     your bytes. This storage is your mod's, never the port's.
+   - `model_rows.c`: one `MemoriesModelModule` row for each module, with
+     its first word, the shape's span, the SHA-256 of your bytes and the
+     shape's command bound, and a `MemoriesModInit` that registers them. If
+     your mod has its own `MemoriesModInit`, it gets
+     `MemoriesModelRows_Register(host)` instead (declared in `model_rows.h`):
+     call it from yours once `host->api >= 29`.
+   - For a mod that replaces `MODEL.MRG` or raw sectors of it (not
+     `patch`), the report gives no oracle command: `model_oracle.py` reads
+     only patches.
+   - `model_c/migrate.json`: the report, for tools.
+
+   `mod.json` gains `"library"` and `"min_api": 29` when it lacks them. Run
+   it again after any change to your modules: it removes what it wrote
+   before (every file that starts with its `Written by` line). The files are
+   yours to read, but edit only your own: the next run writes them again.
+3. **Build it.**
+
+   ```
+   python tools/pc/build_mod.py mods/my-mod --target i386
+   ```
+
+   Without `--target`, and with clang (the one-click build's, or
+   llvm-mingw), it builds the 64-bit Windows and Android objects too; with
+   GCC it builds the i386 object only. **From an SDK the report prints
+   `python sdk/tools/build_mod.py mods/my-mod` with no `--target`:** the
+   oracle runs the game beside the SDK, which may be the 64-bit Windows one
+   (it loads the `x86_64-windows` object and registers nothing from an i386
+   one), so build every target. In a checkout the oracle runs the 32-bit game
+   it builds, and the report names `--target i386`.
+4. **Check it against the interpreter.** The report ends with the command
+   for your mod. For records of `MODEL.MRG` it is like:
+
+   ```
+   python tools/pc/model_oracle.py --disc game/rpg-yfm.bin --mod mods/my-mod --records 83
+   ```
+
+   and for a model of your `models`:
+
+   ```
+   python tools/pc/model_oracle.py --disc game/rpg-yfm.bin --mod mods/my-mod --models pikachu
+   ```
+
+   Every battle must be identical, and the trace must name your C
+   (`mod:my-mod`) in the slots your rows cover (the oracle checks both). A
+   model fights by its model id, as a card that names it would.
+
+`tools/pc/test_model_migrate.py` runs these commands on mods it makes from
+the disc: a table, a table word it refuses, a raw replacement, a const,
+code and a model.
+
+`python tools/pc/model_gate.py mod-row mods/my-mod/models/pikachu.mrg --disc
+game/rpg-yfm.bin` makes the same analysis for one model file (or a
+record's 44 module sectors) without writing any C: each stage's verdict,
+and the row of each module `mod-migrate` would make C for. It exits with 1
+when one is to port by hand; `--force` prints that one's row too. A bigger
+model's texture pages come from its `models` entry when its mod's
+`mod.json` names the file, else `--texture-pages N`.
 
 ## Audio: songs, voices and sounds from files
 
@@ -1187,6 +1570,14 @@ independent paint over it, so it still dims and fades with the rest of the
 card. `"atk": {"x": 38, "y": 179, "color": {"r": 255, "g": 96, "b": 96}}`
 reddens just the ATK number, retail position and all.
 
+A tint on the *game's own* ATK/DEF numbers cannot give them a color: they are
+drawn by subtraction, so they can only darken what is behind them (a darker
+tint makes them fainter, and a strong red turns them cyan on a light card).
+Numbers drawn from a `digits` strip, and the `atk_label`/`dfd_label` pictures,
+are ordinary pictures: their `color` multiplies the picture, so a picture of
+white ink takes any color (`#000000` is black ink). `atk`'s and `def`'s
+`color` tints the strip's digits, `atk_label`'s and `dfd_label`'s their word.
+
 `digits` (optional) replaces the ATK/DFD numbers with the mod's own while the
 layout is on: `{"image": "digits.png", "width": 10, "height": 12, "step": 10}`.
 Put it inside a `frame_styles` entry to use that image only for cards wearing
@@ -1258,6 +1649,13 @@ above, not retail's right-anchored first-star position: a card can carry
 up to 12 stars at a fixed 9px each, and `func_80028B08.c` centres however
 many a card has around this point so a wide row never runs past the frame.
 
+A style's `stars` takes an `"image"` too (a PNG, any size, drawn square; only
+while the layout is on): the stars are then that picture instead of the game's
+round star, `"width"` and `"height"` card units each (9 and 9, at most 32), a
+row going left from the first by `"step"` units (the width left out), in the
+part's `"color"`, which multiplies the picture (white ink takes any color):
+`"stars": {"image": "star.png", "x": 130, "y": 30, "color": {"r": 255, "g": 176, "b": 32}}`.
+
 Retail draws a small frame with a title plate, the card's picture at its
 own fixed size, and ATK/DEF stacked under a separate plaque. A mod's own
 `full_bleed` setting (a `bool` the mod declares, as every setting is)
@@ -1297,6 +1695,36 @@ use retail's art rectangle (`x: 19`, `y: 50`, `width: 102`, `height: 96`).
 This makes a position-only override such as `"art": {"y": 84}` valid: it
 keeps the retail size and X position while moving the picture down. Leave
 the whole `art` object out to keep the unmodified retail art draw path.
+
+The rectangle may be bigger than the card, or start before its top-left corner
+(`"art": {"x": -5, "y": 0, "width": 150, "height": 205}`): what is past the
+card's edges (its `width` x `height`, 140 x 196 as the frame's own) is cut off,
+so a full art card's picture can run past its frame. The picture is always
+stretched whole into the rectangle: a card's own `art` PNG is cut to the
+picture's 102:96 shape when it is read, so a picture of another shape (a tall
+one for a full art card) is squeezed to that shape in the PNG, and the
+rectangle gives it its own shape back.
+
+A card's own `art` PNG may have transparent parts (a cut-out figure on a clear
+background) when the card says `"art_transparent": true`: a pixel under half
+alpha is then see-through, so the frame behind the picture shows there; the
+card's `thumbnail` (the small picture the hand shows) and the larger copies of
+both keep it too. (Left out, a picture is drawn over black, as always.)
+
+The picture is drawn over the card's name, stars, element and ATK/DEF, which
+a layout like the HD pack's relies on (it covers the game's own "[Trap Card]"
+captions with it). A frame style with `"parts_over_art": true` draws the
+picture under them instead (and still over the frame), so a picture that runs
+past its window does not hide them.
+
+A full-bleed style with no `image` has no frame at all (the game's own is
+left out, the card is the picture and its parts). `"game_frame": true` keeps
+the game's own frame behind it: the card's colour (monster, magic, trap...),
+its name bar and stat boxes, under a picture and parts the style places where
+it likes (a full art card's). On that frame the card's name, its
+ATK and DFD words and its numbers are the game's own, where the game puts them
+(`title`, `atk_label`, `dfd_label` and `digits`' `atk`/`def` left out), and a
+part the style gives is the style's, as in any full bleed.
 
 ### Frame styles and the rules that pick them
 
@@ -1364,7 +1792,8 @@ disagree. Three keys say it:
   kind, a style named for the card's six-color `"frame"`, the first
   `frame_for` rule that applies, `default_style`, then retail. This lets a
   cards mod opt into a new frame without using a tag as an implementation
-  detail. `null` clears an inherited named style.
+  detail. `null` clears an inherited named style. The style may be one of
+  another mod's layout ([Layouts of several mods](#layouts-of-several-mods)).
 - `frame_for`: a list of rules, the first that applies to a card wins. A rule
   says `"style"` and, to limit it, any of `"class"` (what the card is, below),
   `"tag"` (one of the card's [`tags`](more-cards.md#tags)) and `"setting"` (a
@@ -1447,9 +1876,11 @@ there (a card-kind badge, say) has nowhere resident to read one from yet;
 a Build Deck badge sheet and a duel-resident word texture were both tried
 and backed out (wrong VRAM residency and wrong shape, respectively).
 
-Only one mod's `card_layout` is read at a time -- the last applied one that
-declares it, the same "a later mod wins" rule other singular keys follow --
-so two layout mods together is the last one's layout, not a merge of both.
+The shared keys of a `card_layout` are read from one mod at a time -- the last
+applied one that declares more than `frame_styles`, the same "a later mod
+wins" rule other singular keys follow -- so two whole layouts together are the
+last one's, not a merge of both. Frame styles do combine
+([Layouts of several mods](#layouts-of-several-mods)).
 Forbidden Memories HD carries this as its own `full_bleed` setting, no code
 of its own needed: `tools/pc/hd_assets_pack.py`'s `--anime-frame-<kind>`
 flags default to `tools/pc/hd_recipes/anime_frame_<kind>.png` if present,
@@ -1458,6 +1889,46 @@ none` gives a kind no picture even where `hd_recipes` has one (effect monsters
 then wear the monster frame). A model for writing another: a pure data mod, no
 `library`, with one `full_bleed` setting, frame styles and rules, and the
 positions above.
+
+### Layouts of several mods
+
+Every applied mod's `frame_styles` is read, and a style is drawn by the mod
+that declared it: its pictures are in that mod's folder, its own parts
+(`art`, `atk`, `stars`, ...) place the card's elements, and it is on while
+**that mod's** `full_bleed` setting is: off until the player turns it on, or
+on from the start when the mod's `settings` entry for `full_bleed` has
+`"default": 1`. (A mod whose `card_layout` holds only `frame_styles`, below,
+and that declares no `full_bleed` setting has its styles always on: only the
+cards that name one, or whose `frame` color is a style's name (below), are
+drawn in it.) The shared keys (`frame_for`,
+`default_style`, `default_styles`, the layout's own `art`, `atk`, `def`,
+`stars`, `attribute`, `spell`, `digits` and `type_label`, and the older
+per-kind `frame`) come from one layout, as above.
+
+A `card_layout` with **nothing but `frame_styles`** adds styles and takes none
+of that away from the layout before it. A cards mod that brings its own
+frames is written that way: its cards name its styles with `frame_style`, and
+everything else keeps the frames and positions of the player's other layout
+(Forbidden Memories HD's anime frames, or retail's). Put every part a style
+needs inside the style (`art`, `atk`, `def`, `stars`, `attribute`, `title`):
+with no shared layout of its own, what it leaves out is retail's place.
+
+How a card finds its style:
+
+- A card's own `frame_style` is looked up in the mod that declared the card
+  (the one its identity names), then in the newest mod that has it. The style
+  is used while its owner's `full_bleed` is on; off, the card is drawn as any
+  other card of the player's frames (so a card made as a copy wears what its
+  original does). A name no layout has is noted in the Mods window and the card keeps
+  retail's frame.
+- Every other card is picked by the shared layout's rules, as before. The rules
+  look a name up in the shared layout's own styles first, then the others'. A
+  style named for the card's `frame` color may be any layout's, a mod's of
+  styles alone too: a cards mod's `"frame": "gold"` card wears the `gold` of
+  such a mod while that mod is on, even with the HD pack off.
+- A name two mods declare is taken from the newer one, with a note, unless the
+  shared layout's own rules or the declaring mod named it: prefix the styles
+  of a cards mod (`foil-rainbow`) so they cannot meet another mod's `gold`.
 
 **Known limitation**: the frame image itself does not render in the duel's
 own card viewer (opened from the hand) -- `CardLayout_DrawFrame` submits
@@ -2261,7 +2732,7 @@ the player's settings file as `mod.<id>.<key>`, and read from
 `MEMORIES_MOD_<ID>_<KEY>` first when that is set; a key is letters, digits,
 `_` and `-`, and `order` is the manager's), `disc_file_start`/
 `disc_read`, `pad`, and from mod API 2 `now_us` (a clock) and `map_fixed`
-(memory at an address the mod chooses, as 3D Monsters' model arenas need). API 4 adds `hook`/`unhook`/`symbol`, below; API 5 adds `duelist_id`, which resolves an added duelist's identity to the id it has this run as `card_id` does for a card. API 7 adds `card_notes` and `card_tag`, a card's [notes](more-cards.md#notes-on-a-card) and the `<tag: value>` tags in them. API 8 adds `limit`, the numbers the game caps and its other values as the mods' `limits` set them ([Gameplay tables](gameplay-tables.md#values-atk-def-lp-starchips-and-more)): `host->limit(host, "attack")` is 9999 without such a mod, `host->limit(host, "deck_copies")` 3. API 9 adds `menu_item`, the name of an item of the title's menus, and the event `MEMORIES_EVENT_MENU` ([The title's menus](#the-titles-menus)). API 10 adds the event `MEMORIES_EVENT_MONSTER`: a monster summoned, flipped, at its owner's draw, in a battle, destroyed or destroying the monster it battled, for every monster, with `handled` to skip a card's own `monster_effects` ([Monster effects](more-cards.md#monster-effects)). API 11 adds no entry or event; it marks the mod.json features a game of API 10 leaves out ([Which game a mod needs](#which-game-a-mod-needs)). API 12 adds `sound_add`, `sound_play` and `sound_free`, sounds of the mod's own: `sound_add` copies signed 16-bit PCM at any rate and channel count and returns a handle, and `sound_play(host, sound, volume, pan)` plays it once on the channels the audio replacement mixes the game's replaced sound effects on ([Audio](#audio-songs-voices-and-sounds-from-files)), under the player's sound-effect volume, restarting it if it is still playing, as a game sound effect takes its own voice again. Both work only while the mod is applied, not from `MemoriesModInit`: the host frees a mod's sounds when it is turned off, so a mod adds them when it needs them, or in `applied(1)`. 3D Monsters plays its fighters' arena sounds this way (`fight_sounds.c`). API 14 adds no entry or event either; it marks the [tower](tower-mode.md)'s mod.json features, API 17 a duelist's [bust](more-duelists.md#bust--the-large-character), and API 18 the [card frames](#frame-styles-and-the-rules-that-pick-them)'s keys. API 23 adds the mouse, for a mod that steers with it: `mouse(host, &dx, &dy, &buttons)` gives the motion gathered since the last call, in window pixels, and the buttons held (bit 0 left, 1 right, 2 middle), over the picture only and nothing while a menu is open; `capture_mouse(host, 1)` hides the pointer and holds it in the window so the motion never stops at an edge, and while it is captured the mouse's buttons do nothing in the game itself (the right and middle buttons are otherwise Circle and Triangle). The capture lets go by itself while a menu, a notice or one of the port's windows has the mouse or the window loses focus, comes back after, and ends with `capture_mouse(host, 0)` or the mod being turned off. `capture_mouse(host, 1)` also takes Escape from the port, and `capture_mouse(host, 2)` takes only Escape and leaves the pointer free, for a pause screen where the player has the menu bar and their mouse: while a mod has Escape, pressing it (or whatever key or button the player gave Exit game in Game > Controls) in the game's window, with no menu, notice or port panel up, does not ask to quit; `mouse` sets `MEMORIES_MOUSE_ESCAPE` (0x100) in the buttons once for that press, on the claiming mod's next call. Under 1 the pointer is let go at that press, so the mod can switch to 2 for its pause screen and back to 1 to play on. Escape still leaves fullscreen and closes an open menu first, File > Exit still quits, and `capture_mouse(host, 0)` or the mod being turned off gives Escape back. API 23 also adds `overlay_picture(host, &x, &y, &w, &h, &game_width)`, where the game's picture is on the overlay's canvas and how many game pixels it is across (320, or 426 widened), so an overlay can put something over a point of the game's own picture; `overlay_size` is the whole window, menu bar included. And `draw_text_alpha`, `draw_text` blended in at an alpha (0-255), for text that should not hide what is under it. And `hide_hud(host, mask)`, for a mod that draws a battle of its own over the duel: while the mod is applied the parts of the port's HUD in `mask` are not drawn, `MEMORIES_HUD_FUSION_HELPER` (1) the fusion helper and `MEMORIES_HUD_RANK` (2) the duel rank meter, and `MEMORIES_HUD_FREE_DUEL_PROGRESS` (4) View > Free Duel progress's count over the Free Duel screen. `hide_hud(host, 0)` shows them again, and they come back when the mod is turned off. The player's settings stay as they are. With several mods, a part any of them hides is hidden. And pictures on the overlay: `load_image(host, "path.png", &w, &h)` reads a PNG under the mod's directory into `w` x `h` 0xAARRGGBB pixels (NULL when it cannot; `free_image` frees them), and `draw_image(host, pixels, w, h, x, y, dw, dh, alpha)` stretches such pixels, or any the mod made itself, smoothly over `dw` x `dh` at (`x`, `y`), blended by their own alpha times `alpha`. And `clip(host, x, y, w, h)`, which keeps the overlay's drawing inside a rectangle of the canvas until it is called again with no size or the callback returns (a list scrolling inside its panel). And for speed: `alloc_image(host, w, h)` gives a clear picture of the mod's own to draw into (freed with `free_image`); the host keeps what it made of a picture from `alloc_image` or `load_image` and does not compare its pixels again each time it is drawn, so after writing into one again the mod calls `image_changed(host, pixels)` (a picture made any other way is compared pixel by pixel on every draw). `prefetch_image(host, "path.png")` reads a PNG on another thread so the `load_image` that asks for it soon returns at once. `picture_only_frame(host)`, called from the frame callback, has this frame's full-screen drawing shown only in the GPU's raised-resolution picture and not also rastered by the CPU into VRAM, for a scene nothing reads back from the frame buffer; it lapses when the frame is shown. The frame dumps take the mods' overlays too with `MEMORIES_DUMP_OVERLAY=1`. API 24 adds the mouse as a pointer, for a mod that points with it where API 23's `mouse` steers: `pointer(host, &x, &y, &buttons)` returns 1 with the pointer's place in the game's picture coordinates (320x240; in widescreen x runs from -53 to 372, the 4:3 picture centred in the wider frame, as `rank_art.c` maps them) and the buttons held (bit 0 left, 1 right, 2 middle), whatever else they do in the game (right is Circle and middle Triangle as before; left is still the menu bar's). It returns 0 when the window has no focus, the pointer is a touch's, outside the picture or on the menu bar, or a menu, a notice or a port window has it, or the mod has `capture_mouse(host, 1)`; either pointer may be NULL. And `wheel(host)` returns (and clears) the notches turned since the last call, positive away from the player, with `take_wheel(host, 1)` making the wheel the mod's: until `take_wheel(host, 0)`, the mod being turned off or another mod taking it, notches are kept for it and are no longer D-pad Up or Down presses. Without it each notch is such a press, which a mod cannot tell from the keyboard, and nothing is kept. The control channel's `pointer` and `wheel` commands stand in for the mouse in tests ([Agent control](agent-control.md)). The X11 backend answers no pointer and no notches for now. API 25 adds no entry or event: it marks a frame style's `atk_label`/`dfd_label` picture or `digits` strip on a style that keeps retail's frame ([card frames](#frame-styles-and-the-rules-that-pick-them)). API 26 adds none either: it marks a card's `variant_permille` and `variant_label` ([Variants](more-cards.md#variants-alternate-versions-of-a-card)).
+(memory at an address the mod chooses, as 3D Monsters' model arenas need). API 4 adds `hook`/`unhook`/`symbol`, below; API 5 adds `duelist_id`, which resolves an added duelist's identity to the id it has this run as `card_id` does for a card. API 7 adds `card_notes` and `card_tag`, a card's [notes](more-cards.md#notes-on-a-card) and the `<tag: value>` tags in them. API 8 adds `limit`, the numbers the game caps and its other values as the mods' `limits` set them ([Gameplay tables](gameplay-tables.md#values-atk-def-lp-starchips-and-more)): `host->limit(host, "attack")` is 9999 without such a mod, `host->limit(host, "deck_copies")` 3. API 9 adds `menu_item`, the name of an item of the title's menus, and the event `MEMORIES_EVENT_MENU` ([The title's menus](#the-titles-menus)). API 10 adds the event `MEMORIES_EVENT_MONSTER`: a monster summoned, flipped, at its owner's draw, in a battle, destroyed or destroying the monster it battled, for every monster, with `handled` to skip a card's own `monster_effects` ([Monster effects](more-cards.md#monster-effects)). API 11 adds no entry or event; it marks the mod.json features a game of API 10 leaves out ([Which game a mod needs](#which-game-a-mod-needs)). API 12 adds `sound_add`, `sound_play` and `sound_free`, sounds of the mod's own: `sound_add` copies signed 16-bit PCM at any rate and channel count and returns a handle, and `sound_play(host, sound, volume, pan)` plays it once on the channels the audio replacement mixes the game's replaced sound effects on ([Audio](#audio-songs-voices-and-sounds-from-files)), under the player's sound-effect volume, restarting it if it is still playing, as a game sound effect takes its own voice again. Both work only while the mod is applied, not from `MemoriesModInit`: the host frees a mod's sounds when it is turned off, so a mod adds them when it needs them, or in `applied(1)`. 3D Monsters plays its fighters' arena sounds this way (`fight_sounds.c`). API 14 adds no entry or event either; it marks the [tower](tower-mode.md)'s mod.json features, API 17 a duelist's [bust](more-duelists.md#bust--the-large-character), and API 18 the [card frames](#frame-styles-and-the-rules-that-pick-them)'s keys. API 23 adds the mouse, for a mod that steers with it: `mouse(host, &dx, &dy, &buttons)` gives the motion gathered since the last call, in window pixels, and the buttons held (bit 0 left, 1 right, 2 middle), over the picture only and nothing while a menu is open; `capture_mouse(host, 1)` hides the pointer and holds it in the window so the motion never stops at an edge, and while it is captured the mouse's buttons do nothing in the game itself (the right and middle buttons are otherwise Circle and Triangle). The capture lets go by itself while a menu, a notice or one of the port's windows has the mouse or the window loses focus, comes back after, and ends with `capture_mouse(host, 0)` or the mod being turned off. `capture_mouse(host, 1)` also takes Escape from the port, and `capture_mouse(host, 2)` takes only Escape and leaves the pointer free, for a pause screen where the player has the menu bar and their mouse: while a mod has Escape, pressing it (or whatever key or button the player gave Exit game in Game > Controls) in the game's window, with no menu, notice or port panel up, does not ask to quit; `mouse` sets `MEMORIES_MOUSE_ESCAPE` (0x100) in the buttons once for that press, on the claiming mod's next call. Under 1 the pointer is let go at that press, so the mod can switch to 2 for its pause screen and back to 1 to play on. Escape still leaves fullscreen and closes an open menu first, File > Exit still quits, and `capture_mouse(host, 0)` or the mod being turned off gives Escape back. API 23 also adds `overlay_picture(host, &x, &y, &w, &h, &game_width)`, where the game's picture is on the overlay's canvas and how many game pixels it is across (320, or 426 widened), so an overlay can put something over a point of the game's own picture; `overlay_size` is the whole window, menu bar included. And `draw_text_alpha`, `draw_text` blended in at an alpha (0-255), for text that should not hide what is under it. And `hide_hud(host, mask)`, for a mod that draws a battle of its own over the duel: while the mod is applied the parts of the port's HUD in `mask` are not drawn, `MEMORIES_HUD_FUSION_HELPER` (1) the fusion helper and `MEMORIES_HUD_RANK` (2) the duel rank meter, and `MEMORIES_HUD_FREE_DUEL_PROGRESS` (4) View > Free Duel progress's count over the Free Duel screen. `hide_hud(host, 0)` shows them again, and they come back when the mod is turned off. The player's settings stay as they are. With several mods, a part any of them hides is hidden. And pictures on the overlay: `load_image(host, "path.png", &w, &h)` reads a PNG under the mod's directory into `w` x `h` 0xAARRGGBB pixels (NULL when it cannot; `free_image` frees them), and `draw_image(host, pixels, w, h, x, y, dw, dh, alpha)` stretches such pixels, or any the mod made itself, smoothly over `dw` x `dh` at (`x`, `y`), blended by their own alpha times `alpha`. And `clip(host, x, y, w, h)`, which keeps the overlay's drawing inside a rectangle of the canvas until it is called again with no size or the callback returns (a list scrolling inside its panel). And for speed: `alloc_image(host, w, h)` gives a clear picture of the mod's own to draw into (freed with `free_image`); the host keeps what it made of a picture from `alloc_image` or `load_image` and does not compare its pixels again each time it is drawn, so after writing into one again the mod calls `image_changed(host, pixels)` (a picture made any other way is compared pixel by pixel on every draw). `prefetch_image(host, "path.png")` reads a PNG on another thread so the `load_image` that asks for it soon returns at once. `picture_only_frame(host)`, called from the frame callback, has this frame's full-screen drawing shown only in the GPU's raised-resolution picture and not also rastered by the CPU into VRAM, for a scene nothing reads back from the frame buffer; it lapses when the frame is shown. The frame dumps take the mods' overlays too with `MEMORIES_DUMP_OVERLAY=1`. API 24 adds the mouse as a pointer, for a mod that points with it where API 23's `mouse` steers: `pointer(host, &x, &y, &buttons)` returns 1 with the pointer's place in the game's picture coordinates (320x240; in widescreen x runs from -53 to 372, the 4:3 picture centred in the wider frame, as `rank_art.c` maps them) and the buttons held (bit 0 left, 1 right, 2 middle), whatever else they do in the game (right is Circle and middle Triangle as before; left is still the menu bar's). It returns 0 when the window has no focus, the pointer is a touch's, outside the picture or on the menu bar, or a menu, a notice or a port window has it, or the mod has `capture_mouse(host, 1)`; either pointer may be NULL. And `wheel(host)` returns (and clears) the notches turned since the last call, positive away from the player, with `take_wheel(host, 1)` making the wheel the mod's: until `take_wheel(host, 0)`, the mod being turned off or another mod taking it, notches are kept for it and are no longer D-pad Up or Down presses. Without it each notch is such a press, which a mod cannot tell from the keyboard, and nothing is kept. The control channel's `pointer` and `wheel` commands stand in for the mouse in tests ([Agent control](agent-control.md)). The X11 backend answers no pointer and no notches for now. API 25 adds no entry or event: it marks a frame style's `atk_label`/`dfd_label` picture or `digits` strip on a style that keeps retail's frame ([card frames](#frame-styles-and-the-rules-that-pick-them)). API 26 adds none either: it marks a card's `variant_permille` and `variant_label` ([Variants](more-cards.md#variants-alternate-versions-of-a-card)). API 28 adds typed text, for a mod with a text field of its own (a password, a name): `text_capture(host, 1)` makes the keyboard the mod's until `text_capture(host, 0)`, the mod being turned off or another mod taking it, and `text_key(host)` returns the next key kept, in the order it was typed: 32 to 126 a printable ASCII character (what the player's keyboard layout and input method make of the keys, so the number pad's and the number row's digits are both '0' to '9'; Ctrl+V, Command+V or Shift+Insert gives the clipboard's printable ASCII as if it were typed), `MEMORIES_KEY_BACKSPACE` (8), `MEMORIES_KEY_ENTER` (13) or `MEMORIES_KEY_ESCAPE` (27), 0 when none is waiting. While a mod has it no key does anything in the game (Enter is not Start, Escape asks nothing), keys held when it begins end as they were pressed, and nothing is kept while a menu, a notice or a port window has the keyboard. The pad is not touched. The control channel's `key N` command stands in for the keyboard in tests ([Agent control](agent-control.md)). API 30 adds `draw_text_px(host, x, middle, text, rgb, px, alpha)` and `text_width_px(host, text, px)`, overlay text at any size: `draw_text` and `text_width` take a whole-number `scale` (the menu font at 13 pixels times it, so 13, 26, 39...), these take the size itself in canvas pixels (4 to 512; anything else is held to that), drawn as `draw_text_alpha` draws (`x`, the vertical `middle` of the line, an 0xRRGGBB color, an `alpha` of 0 to 255) and, like it, only in the overlay callback and inside `clip`. The glyphs are rendered at that size, not magnified, and spaced by their own advances, so a text can be fitted to a box exactly (`text_width_px` to measure it). A mod that wants it on a game without it checks `host->api >= 30` and keeps `draw_text`. API 30 also covers text and pictures a mod makes itself for the game's own picture (not the overlay), so they are layered with the game, fade with it and sit under its pop-ups: the port exports `Menu_TextBitmap(text, px, &pixels, &width, &height, &middle_row)`, which renders a string with the menu font at `px` pixels (4 to 512) into white-on-transparent straight-alpha 0xAARRGGBB pixels (`Menu_TextBitmapFree` frees them; `middle_row` is the row of the line's vertical middle, what `draw_text_px`'s `middle` is), and `TexturePack_BankImageFromRgba(id, rgba, width, height)`, which makes a bank sprite image from memory instead of a PNG file, to be named as the `file` of `TexturePack_AddBankSpriteCrop` (the same id is the same picture, so an id has to change with its pixels). A mod looks them up with `host->symbol` (NULL on a game without them). The recipe: write the picture's texels at the console's size (16 bits, 0 transparent) into a free texture bank (`SoftGpu_Bank`, soft_gpu.h lists which are taken), register the same picture at its full size as that rectangle's high-resolution version (`TexturePack_AddBankSpriteCrop`, depth 2), and each frame sort a textured polygon that samples it into a game ordering table (`GsSortPoly`; lower depths are nearer). Above 1x the renderers sample the high-resolution picture a texel to a pixel, so make it exactly the polygon's size in device pixels (its size in game pixels times the internal scale) and put any fraction of a game pixel into the picture's own padding: a picture of another size has texels repeated or skipped, and the polygon itself can only be at whole game pixels.
 A mod that uses an entry newer than API 1 should refuse to start when
 `host->api` is older.
 
@@ -2307,6 +2778,14 @@ byte. `hook` returns 0 for anything that is not a game function (the port's
 own code, the C library, a function of another mod). `host->unhook` removes
 one hook, and `host->symbol("name")` looks a name up at run time, for a mod
 that can do without it.
+
+A mod must not call a game function that **returns a structure by value**
+(`CardLayout_HandGet`, `CardLayout_Get`, `CardLayout_Part`): the structure comes
+back through a hidden pointer the mod's compiler and the game's handle
+differently, and the stack and the locals after the call are wrong (a mod that
+called `CardLayout_HandGet` drew a card as a spell). Its pointer version,
+`void CardLayout_HandPlace(int card_id, int element, int *out)` (five ints:
+visible, x, y, width, height), is the one to call.
 
 How it works: every game unit is compiled with
 `-fpatchable-function-entry=8,6`, which leaves six bytes of `nop` before
@@ -2498,7 +2977,11 @@ object per target. Beside a released game the same script is
 `sdk/tools/build_mod.py`, and it builds against `sdk/include` there. The
 release's `sdk/` also carries `extract_images.py` and `upscale_pack.py` in
 `sdk/tools`, the example mods in `sdk/examples/mods`, and this note with
-`mod-api-3.md` and `more-cards.md` in `sdk/notes`.
+`mod-api-3.md` and `more-cards.md` in `sdk/notes`. The tool that moves a
+mod's attacks from MIPS to C (`model_gate.py`, `model_oracle.py` and what they
+import, in `sdk/tools`, with their tables in `sdk/config` and the port's C in
+`sdk/include/native_overlays`) is there too: [Moving a mod's attacks from MIPS
+to C](#moving-a-mods-attacks-from-mips-to-c).
 
 What it needs:
 

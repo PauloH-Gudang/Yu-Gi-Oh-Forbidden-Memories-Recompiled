@@ -246,8 +246,26 @@ int VSyncCallback(void (*callback)(void))
  * a counter that is still -1 afterwards as a lag frame and publishes every
  * press a second time on the next frame (doubled inputs at 300%). */
 /* Entered through the assembly VSync, which records the caller's registers
- * for save states (src/pc/guest/state_i386.S). */
+ * for save states (src/pc/guest/state_i386.S). The present, the clock's
+ * passes and the callbacks they run are all in vsync() below this frame, and
+ * what they leave on the stack is cleared before the game gets it back
+ * (platform.h, PLATFORM_SCRUB_DEAD_STACK). */
+#define VSYNC_SCRUB_BYTES (256u * 1024u)
+#define VSYNC_POLL_SCRUB_BYTES (8u * 1024u)
+static int vsync(int mode, void *caller);
+
 int Memories_VSync(int mode)
+{
+    int result = vsync(mode, __builtin_return_address(0));
+    if (mode == 0) {
+        PLATFORM_SCRUB_DEAD_STACK(VSYNC_SCRUB_BYTES); /* the one that presents */
+    } else {
+        PLATFORM_SCRUB_DEAD_STACK(VSYNC_POLL_SCRUB_BYTES); /* a poll: the games spin on it */
+    }
+    return result;
+}
+
+__attribute__((noinline)) static int vsync(int mode, void *caller)
 {
     unsigned now, elapsed;
     /* The game's time between two calls here, whatever the mode: the
@@ -391,7 +409,7 @@ int Memories_VSync(int mode)
         exit(0);
     }
     clock_gettime(CLOCK_MONOTONIC, &service_left);
-    if (mode == 1) return AiTrace_VSync1((int)(elapsed * 263u), __builtin_return_address(0));
+    if (mode == 1) return AiTrace_VSync1((int)(elapsed * 263u), caller);
     return (int)(elapsed * 263u);
 }
 

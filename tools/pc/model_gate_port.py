@@ -31,17 +31,22 @@ by these rules, which are the whole difference between the two trees:
   6. A local that the retail code reads before the call writes it (STALE_LOCALS)
      takes the storage src/pc/overlays/model_stale_locals.h declares, one per
      slot, in place of the stack: the MIPS code reads what the slot's previous
-     call left there, which native C would take from the host's stack. The
+     call left there (or, where no call writes it, what the oracle shows acts
+     as zero), which native C would take from the host's stack. A struct local
+     becomes a pointer to its storage, and a file may take several. The
      storage is a game unit's (src/pc/game/zzz_model_stale_locals.c), so it is
      in every save state as the game stack is. `model_gate.py check` fails a
      native row whose C lacks the rule.
+  7. A slot whose images have several layouts takes the shortest when every
+     other is it plus `c` files that no image of theirs can reach (no j/jal
+     to them, no word or lui/addiu pair building their address): code the
+     linker left behind (shared_layout).
 
 The module's file list (slot A, slot B) goes to config/pc/model_gate_sources.txt,
 which the build compiles: the names of the upstream files do not say which
 shape they belong to (shape 59 is french_model_variant/variant76_entry.c,
 shape 433 has two of header 450's). The layouts of a shape's images must name
-the same files, or the shape is refused (668 and 552 have an image with code
-after the data the others lack).
+the same files, but for rule 7, or the shape is refused.
 
 The resident functions the C calls by a name the port spells otherwise
 (upstream's Model_CopySlotPosition is the port's Model_CopySlotU16Values,
@@ -60,12 +65,19 @@ import struct
 import subprocess
 import sys
 
-ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import model_layout as layout  # noqa: E402  (the repository's, or an SDK's: model_layout.py)
+
+ROOT = layout.ROOT
 NATIVE = "src/native_overlays"
-SOURCES = ROOT / "config/pc/model_gate_sources.txt"
-NAMES = ROOT / "config/pc/model_gate_names.txt"
-OVERLAY_FOLDERS = ("model_variant", "french_model_variant", "spanish_model_variant")
+SOURCES = layout.path("config/pc/model_gate_sources.txt")
+NAMES = layout.path("config/pc/model_gate_names.txt")
+OVERLAY_FOLDERS = ("model_variant", "french_model_variant", "spanish_model_variant", "spanish_model_primary")
 BASES = {"A": 0x8013B000, "B": 0x8017B000}
+# The upstream module names of each kind (model_gate.Kind): the variant
+# modules (model_variant_*, model_image_*) and the primaries (model_primary_*,
+# whose C upstream keeps in spanish_model_primary for every region).
+MODULE_PREFIXES = {"variant": ("model_variant_", "model_image_"), "primary": ("model_primary_",)}
 INCLUDE = re.compile(r'^(\s*#\s*include\s+")([^"]+)(")', re.M)
 SUBSEGMENT = re.compile(r"^\s*-\s*\[(0x[0-9A-Fa-f]+|\d+),\s*([\w.]+),\s*([^\],]+)\]", re.M)
 
@@ -105,7 +117,7 @@ class Upstream:
 
 # --- the upstream layouts --------------------------------------------------------------
 
-def layouts(upstream: Upstream, disc) -> dict[int, dict[str, list[dict]]]:
+def layouts(upstream: Upstream, disc, kind=None) -> dict[int, dict[str, list[dict]]]:
     """{slot A identifier: {"A": [layout, ...], "B": [...]}} for the US
     MODEL.MRG variant modules. A layout: the module names, the `c`
     subsegments' paths (from src/, no extension) and offsets, the data start
@@ -116,20 +128,27 @@ def layouts(upstream: Upstream, disc) -> dict[int, dict[str, list[dict]]]:
     for module in modules:
         if not module["archive"].upper().endswith("MODEL.MRG"):
             continue
-        slot = {BASES["A"]: "A", BASES["B"]: "B"}.get(int(module["load_address"], 16))
-        if slot is None or not module["name"].startswith(("model_variant_", "model_image_")):
+        bases = kind.base if kind is not None else BASES
+        image_size = kind.image_size if kind is not None else 0x5000
+        slot = {bases["A"]: "A", bases["B"]: "B"}.get(int(module["load_address"], 16))
+        if slot is None or not module["name"].startswith(MODULE_PREFIXES[kind.name if kind is not None else "variant"]):
             continue
         text = upstream.text(module["layout"])
         subsegments = [(int(at, 0), kind, path.strip()) for at, kind, path in SUBSEGMENT.findall(text)]
         files = tuple(path for at, kind, path in subsegments if kind == "c")
+        # Where each `c` file ends: the next subsegment, or the image's end.
+        offsets = sorted({at for at, _, _ in subsegments} | {image_size})
+        ends = [next(o for o in offsets if o > at) for at, kind, path in subsegments if kind == "c"]
         starts = tuple(at for at, kind, path in subsegments if kind == "c")
-        data_start = min((at for at, kind, path in subsegments if kind in ("data", "bin") and at > 0), default=0x5000)
+        data_start = min((at for at, kind, path in subsegments if kind in ("data", "bin") and at > 0), default=image_size)
         word = disc.module_word(module["sector_offset"])
         first_words[module["name"]] = word
         key = (files, starts, data_start)
         entry = by_word[word][slot].setdefault(key, {"files": list(files), "starts": list(starts),
-                                                     "data_start": data_start, "modules": []})
+                                                     "data_start": data_start, "modules": [], "sectors": [],
+                                                     "base": bases[slot], "ends": ends})
         entry["modules"].append(module["name"])
+        entry["sectors"].append(module["sector_offset"])
     return {word: {slot: list(found[slot].values()) for slot in "AB"} for word, found in by_word.items()}
 
 
@@ -143,6 +162,53 @@ class MergeDisc:
 
     def module_word(self, sector_offset: int) -> int:
         return struct.unpack_from("<I", self.disc._sector(self.disc.lba + sector_offset), 0)[0]
+
+    def references(self, sector_offset: int, base: int, ranges: list[tuple[int, int]], sectors: int = 10) -> bool:
+        """Whether the module image at `sector_offset` (loaded at `base`) can
+        reach an address of `ranges` ([low, high) each) from outside them: a
+        j or jal into one, a word holding one (any segment), or an addiu/ori
+        whose immediate is one's low half (the second half of a lui pair, how
+        MIPS code builds a pointer to call)."""
+        image = b"".join(self.disc._sector(self.disc.lba + sector_offset + n) for n in range(sectors))
+
+        def inside(address: int) -> bool:
+            return any(low <= address < high for low, high in ranges)
+
+        lows = {address & 0xFFFF for low, high in ranges for address in range(low, high, 4)}
+        for at, word in enumerate(struct.unpack_from("<%dI" % (len(image) // 4), image)):
+            if inside(base + 4 * at):
+                continue
+            if (word >> 26) in (0x02, 0x03) and inside((base & 0xF0000000) | ((word & 0x3FFFFFF) << 2)):
+                return True
+            if inside((word & 0x1FFFFFFF) | (base & 0xE0000000)):
+                return True
+            if (word >> 26) in (0x09, 0x0D) and word & 0xFFFF in lows:
+                return True
+        return False
+
+
+def shared_layout(options: list[dict], disc) -> dict | None:
+    """Rule 7: a slot whose images have several layouts takes the shortest when
+    every other is it plus `c` files after its data that no image of theirs
+    can reach from outside them, at any address of theirs
+    (MergeDisc.references): code the linker left behind, which the shared C
+    stands in for (shape 402's variant552_strand in one slot B image,
+    668's variant685_rings in one slot A image). None otherwise."""
+    shortest = min(options, key=lambda option: len(option["files"]))
+    count = len(shortest["files"])
+    for option in options:
+        if (option["files"][:count] != shortest["files"] or option["starts"][:count] != shortest["starts"]
+                or option["data_start"] != shortest["data_start"]):
+            return None
+        ranges = [(option["base"] + start, option["base"] + end)
+                  for start, end in zip(option["starts"][count:], option["ends"][count:])]
+        if any(low < option["base"] + option["data_start"] for low, _ in ranges):
+            return None   # extra code before the data: not left behind
+        if ranges and any(disc.references(sector, option["base"], ranges) for sector in option["sectors"]):
+            return None
+    merged = dict(shortest)
+    merged["modules"] = [name for option in options for name in option["modules"]]
+    return merged
 
 
 # --- copying -------------------------------------------------------------------------
@@ -219,11 +285,14 @@ class Plan:
 
 
 def plan_shape(upstream: Upstream, shape: int, found: dict[str, list[dict]], plan: Plan,
-               root: Path = ROOT) -> dict | None:
+               root: Path = ROOT, disc=None) -> dict | None:
     """Add a shape's files to the plan. Returns {"data_start", "files": {slot: [...]}} or None (refused)."""
     lists = {}
     for slot in "AB":
         options = found.get(slot, [])
+        if len(options) > 1 and disc is not None:
+            shared = shared_layout(options, disc)
+            options = [shared] if shared else options
         if len(options) != 1:
             plan.refused.append(f"shape {shape}: slot {slot} has {len(options)} layouts: "
                                 + "; ".join(f"{', '.join(PurePosixPath(p).name for p in o['files'])} "
@@ -338,46 +407,125 @@ def write_plan(plan: Plan, root: Path = ROOT) -> None:
         target.write_text(text, encoding="utf-8", newline="\n")
 
 
-# Rule 6: {unit: (the local's declaration, what takes its place)}. Shape 169's
-# trail aims its ratan2 at vertices[0].vy/.vz, which only the waiting branch
-# writes (retail images wait 65 frames first); the oracle matches the
+# Rule 6: {file: ((the local's declaration, what takes its place, the name of
+# a struct local whose uses become a pointer's, and any (old, new) rewrites of
+# uses that reach the local through another's address), ...)}. Shape 169's trail
+# aims its ratan2 at vertices[0].vy/.vz, which only the waiting branch writes
+# (retail images wait 65 frames first). Shapes 89, 137 and 163 submit `quad` in
+# frames that do not write its colour, so the packet carries the colour of the
+# last frame that did. Shape 102 reads depths[109] and flags[109], one past
+# what its RotTransPersN writes. Shape 831's halo reads `points`, which only
+# the gathering frames write. Shape 769 and image31368_entry.c (shape 772's
+# body, and the French header 789's) submit `quad` after the burst without
+# writing its UVs, and their spray reads screen[0], which only the gathering
+# frames and the burst's first frames write. The oracle matches the
 # interpreter with the slot's last value (notes/pc-build.md).
+def _stale_quad(name: str) -> tuple[str, str, str]:
+    return ("    POLY_FT4 quad;\n",
+            f"    POLY_FT4 *quad = &{name}Quad[Model_GetActiveSlotIndex() & 1];\n", "quad")
+
+
+def _stale_screen(name: str) -> tuple[str, str, None]:
+    return ("    DVECTOR screen[128];\n",
+            f"    DVECTOR *screen = {name}Screen[Model_GetActiveSlotIndex() & 1];\n", None)
+
+
 STALE_LOCALS = {
-    f"{NATIVE}/model_variant/variant169_entry.c": (
+    f"{NATIVE}/model_variant/variant169_entry.c": ((
         "    SVECTOR vertices[4];\n",
-        "    SVECTOR *vertices = gModelVariant169Vertices[Model_GetActiveSlotIndex() & 1];\n"),
+        "    SVECTOR *vertices = gModelVariant169Vertices[Model_GetActiveSlotIndex() & 1];\n", None),),
+    **{f"{NATIVE}/model_variant/variant{shape}_entry.c": (_stale_quad(f"gModelVariant{shape}"),)
+       for shape in (89, 137, 163)},
+    f"{NATIVE}/model_variant/variant102_entry.c": ((
+        "    u16 depths[110], projection[110], flags[110];\n",
+        "    u16 *depths = gModelVariant102Depths[Model_GetActiveSlotIndex() & 1], projection[110],"
+        " *flags = gModelVariant102Flags[Model_GetActiveSlotIndex() & 1];\n", None),),
+    f"{NATIVE}/model_variant/variant831_entry.c": ((
+        "    SVECTOR points[2];\n",
+        "    SVECTOR *points = gModelVariant831Points[Model_GetActiveSlotIndex() & 1];\n", None),),
+    f"{NATIVE}/model_variant/variant769_entry.c": (
+        _stale_quad("gModelVariant769"), _stale_screen("gModelVariant769")),
+    f"{NATIVE}/french_model_variant/image31368_entry.c": (
+        _stale_quad("gModelImage31368"), _stale_screen("gModelImage31368")),
+    f"{NATIVE}/french_model_variant/variant101_entry.c": ((
+        "    u16 flags[96];\n",
+        "    u16 *flags = gModelFrenchVariant101Flags[Model_GetActiveSlotIndex() & 1];\n", None),),
+    f"{NATIVE}/model_variant/variant783_entry.c": (
+        _stale_quad("gModelVariant783"), _stale_screen("gModelVariant783")),
+    # Shape 448's fan never names `col`: it reaches it as (s32)&rot + 240..331,
+    # where the MIPS frame keeps it, which native C's frame does not. The
+    # storage takes it, and the uses address it from there: (s32)&rot + 240
+    # is col. A game unit's storage has a 32-bit address, as the casts need.
+    # Shape 128 reads bytes no code of its own writes. quad's x0/y0 feed a
+    # ratan2: on the PS1 they hold whatever other code left at that depth (the
+    # other slot's module, a palette pass), so no value is the retail one; the
+    # storage defines them as zero, which the interpreter also read there once
+    # no other module ran interpreted. The tint colours' fourth bytes: the
+    # game overwrites the start's (Model_QueueTintRequestForParts, b3 = mode)
+    # and never reads the end's; zeroed so they come from no host stack.
+    f"{NATIVE}/model_variant/variant128_entry.c": (
+        _stale_quad("gModelVariant128"),
+        ("    ModelTintColor tint_start, tint_end;\n",
+         "    ModelTintColor tint_start = {0}, tint_end = {0};\n", None)),
+    f"{NATIVE}/model_variant/variant448_fan.c": ((
+        "    u8 col[6][16];\n",
+        "    u8 (*col)[16] = gModelVariant448Col[Model_GetActiveSlotIndex() & 1];\n", None,
+        ("(s32)&rot", "((s32)col - 240)")),),
 }
 STALE_INCLUDE = '#include "pc/overlays/model_stale_locals.h"\n'
 
 
 def stale_local_text(path: str, text: str) -> str:
-    """Rule 6 on a copied file's text: the declaration once, replaced, and the
-    storage's header included after the file's first include."""
-    rule = STALE_LOCALS.get(path)
-    if rule is None:
+    """Rule 6 on a copied file's text: each declaration once, replaced, a
+    struct local's uses made a pointer's, and the storage's header included
+    after the file's first include."""
+    rules = STALE_LOCALS.get(path)
+    if rules is None:
         return text
-    declaration, replacement = rule
-    if text.count(declaration) != 1:
-        raise SystemExit(f"model_gate port: rule 6: {path} does not declare `{declaration.strip()}` once")
-    text = text.replace(declaration, replacement)
+    for declaration, replacement, pointer, *uses in rules:
+        if text.count(declaration) != 1:
+            raise SystemExit(f"model_gate port: rule 6: {path} does not declare `{declaration.strip()}` once")
+        text = text.replace(declaration, replacement)
+        if pointer is not None:
+            text = re.sub(rf"&{pointer}\b(?!\.)", pointer, text)
+            text = re.sub(rf"(?<![\w.>]){pointer}\.", f"{pointer}->", text)
+        # A local the code reaches only through another's address (shape
+        # 448's col, as (s32)&rot + 240): its uses, written from the storage.
+        for old, new in uses:
+            if old not in text:
+                raise SystemExit(f"model_gate port: rule 6: {path} has no `{old}`")
+            text = text.replace(old, new)
     first = text.find("#include")
     end = text.index("\n", first) + 1 if first >= 0 else 0
     return text[:end] + STALE_INCLUDE + text[end:]
 
 
 def stale_local_problems(listed: dict[str, list[str]], native_modules: set[str], root: Path = ROOT) -> list[str]:
-    """`model_gate.py check`: a listed native unit that rule 6 names but whose
-    text lacks it (a copy made without the rule reads the host's stack)."""
-    bad = []
+    """`model_gate.py check`: a file of a native unit (the unit or one it
+    includes, as variant772_entry.c includes image31368_entry.c) that rule 6
+    names but whose text lacks it (a copy made without the rule reads the
+    host's stack)."""
+    from model_gate import port_closure
+    bad, seen = [], set()
     for module in sorted(native_modules):
-        for path in listed.get(module, []):
-            rule = STALE_LOCALS.get(path)
-            if rule is None or not (root / path).is_file():   # a missing file: check_sources says so
+        for unit in listed.get(module, []):
+            if not (root / unit).is_file():   # a missing file: check_sources says so
                 continue
-            text = (root / path).read_text(encoding="utf-8").replace("\r\n", "\n")
-            if rule[1] not in text or STALE_INCLUDE not in text:
-                bad.append(f"{path}: `{rule[0].strip()}` is read before the call writes it, and the C lacks "
-                           f"rule 6's storage (model_gate_port.py STALE_LOCALS): port the shape again")
+            for one in port_closure(root / unit, root):
+                path = Path(os.path.relpath(one, root)).as_posix()
+                rules = STALE_LOCALS.get(path)
+                if rules is None or path in seen:
+                    continue
+                seen.add(path)
+                text = (root / path).read_text(encoding="utf-8").replace("\r\n", "\n")
+                for declaration, replacement, _, *uses in rules:
+                    if replacement not in text or STALE_INCLUDE not in text:
+                        bad.append(f"{path}: `{declaration.strip()}` is read before the call writes it, and the C "
+                                   f"lacks rule 6's storage (model_gate_port.py STALE_LOCALS): port the shape again")
+                    for old, _new in uses:
+                        if old in text:
+                            bad.append(f"{path}: `{old}` is still there, which rule 6 rewrites "
+                                       f"(model_gate_port.py STALE_LOCALS): port the shape again")
     return bad
 
 
@@ -414,30 +562,32 @@ def cast_pass(units: list[str], jobs: int) -> list[str]:
     return report + unreadable
 
 
-def port(shapes: list[int], disc_path: Path, revision: str, jobs: int, root: Path = ROOT) -> int:
+def port(shapes: list[int], disc_path: Path, revision: str, jobs: int, root: Path = ROOT, kind=None) -> int:
     """Copy the shapes' C and slot B wrappers, list their files, apply the
     cast rule over every listed unit, and give the table rows their data
     start and sources. Backend, span and command_table are not set here."""
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import model_gate
+    kind = kind or model_gate.VARIANT
     upstream = Upstream(revision, root)
-    found = layouts(upstream, MergeDisc(disc_path))
+    disc = MergeDisc(disc_path)
+    found = layouts(upstream, disc, kind)
     plan = Plan()
     ported = {}
-    pairs = {row.shape: row.identifier("B") for row in model_gate.load_table()}
+    pairs = {row.shape: row.identifier("B") for row in model_gate.load_table(kind.table, kind)}
     for shape in shapes:
         if shape not in found or shape not in pairs:
             plan.refused.append(f"shape {shape}: upstream has no US module with that first word, or the table no row")
             continue
         both = {"A": found[shape]["A"], "B": found.get(pairs[shape], {}).get("B", [])}
-        result = plan_shape(upstream, shape, both, plan, root)
+        result = plan_shape(upstream, shape, both, plan, root, disc)
         if result:
             ported[shape] = result
     for line in plan.refused:
         print("model_gate port: refused " + line, file=sys.stderr)
     write_plan(plan, root)
     sections = read_sections(SOURCES)
-    rows = model_gate.load_table()
+    rows = model_gate.load_table(kind.table, kind)
     by_shape = {row.shape: row for row in rows}
     for shape, result in ported.items():
         row = by_shape[shape]
@@ -446,9 +596,9 @@ def port(shapes: list[int], disc_path: Path, revision: str, jobs: int, root: Pat
         row["data_start"] = f"0x{result['data_start']:X}"
         headers = sorted({int(n) for path in result["files"]["A"]
                           for n in re.findall(r"(?:variant|image)(\d+)", PurePosixPath(path).name)[:1]})
-        row["sources"] = "" if headers == [shape] else ";".join(str(n) for n in headers)
+        row["sources"] = "" if headers == [shape] or kind.name == "primary" else ";".join(str(n) for n in headers)
     write_sections(SOURCES, SOURCES_HEADER, sections)
-    model_gate.write_table(rows)
+    model_gate.write_table(rows, kind.table)
     names = resident_names(upstream, [path for files in sections.values() for path in files], root)
     write_sections_flat(NAMES, NAMES_HEADER, names)
     units = sorted({path for files in sections.values() for path in files})

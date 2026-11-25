@@ -173,6 +173,30 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME pc_rank_art COMMAND memories_rank_art_test)
     set_tests_properties(pc_rank_art PROPERTIES SKIP_RETURN_CODE 77)
+    # Which MODEL.MRG control modules are a mod's MIPS, against the disc
+    # (MEMORIES_DISC; skipped without one).
+    add_executable(memories_model_module_class_test tests/pc/model_module_class_test.c
+        src/pc/overlays/model_module_class.c src/pc/guest/sha256.c)
+    target_include_directories(memories_model_module_class_test PRIVATE src)
+    if(NOT MSVC)
+        target_compile_options(memories_model_module_class_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    endif()
+    add_test(NAME pc_model_module_class COMMAND memories_model_module_class_test)
+    set_tests_properties(pc_model_module_class PROPERTIES SKIP_RETURN_CODE 77)
+    # The control-module rows code mods register (mod API 29, src/pc/mods/model_rows.c).
+    add_executable(memories_model_rows_test tests/pc/model_rows_test.c src/pc/mods/model_rows.c src/pc/guest/sha256.c)
+    target_include_directories(memories_model_rows_test PRIVATE src)
+    if(NOT MSVC)
+        target_compile_options(memories_model_rows_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    endif()
+    add_test(NAME pc_model_rows COMMAND memories_model_rows_test)
+    # Who runs an update of a control module (src/pc/overlays/model_claim.h).
+    add_executable(memories_model_claim_test tests/pc/model_claim_test.c)
+    target_include_directories(memories_model_claim_test PRIVATE src)
+    if(NOT MSVC)
+        target_compile_options(memories_model_claim_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    endif()
+    add_test(NAME pc_model_claim COMMAND memories_model_claim_test)
     add_executable(memories_deck_shop_test tests/pc/deck_shop_test.c src/pc/saves/deck_shop.c)
     add_executable(memories_entry_layout_test tests/pc/entry_layout_test.c src/pc/text/entry_layout.c)
     add_executable(memories_state_remap_test tests/pc/state_remap_test.c src/pc/guest/state_remap.c)
@@ -182,12 +206,16 @@ if(BUILD_TESTING)
     add_executable(memories_control_protocol_test tests/pc/control_protocol_test.c src/pc/debug/control_protocol.c)
     add_executable(memories_control_net_test tests/pc/control_net_test.c src/pc/debug/control_net.c)
     add_executable(memories_symbols_test tests/pc/symbols_test.c src/pc/debug/symbols.c src/pc/compat/fs.c)
+    add_executable(memories_dead_stack_test tests/pc/dead_stack_test.c)
     if(WIN32)
         target_link_libraries(memories_control_net_test PRIVATE ws2_32)
+    else()
+        # Symbols_Module's dladdr: in libc since glibc 2.34, in libdl before.
+        target_link_libraries(memories_symbols_test PRIVATE ${CMAKE_DL_LIBS})
     endif()
     foreach(target memories_deck_shop_test memories_entry_layout_test memories_state_remap_test
             memories_state_io_test memories_control_protocol_test memories_control_net_test memories_symbols_test
-            memories_translated_state_symbols_test)
+            memories_translated_state_symbols_test memories_dead_stack_test)
         target_include_directories(${target} PRIVATE src)
         if(NOT MSVC)
             target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Werror)
@@ -206,6 +234,8 @@ if(BUILD_TESTING)
     add_test(NAME pc_control_protocol COMMAND memories_control_protocol_test)
     add_test(NAME pc_control_net COMMAND memories_control_net_test)
     add_test(NAME pc_symbols COMMAND memories_symbols_test)
+    # What a host call leaves below a game call's frame is cleared (platform.h).
+    add_test(NAME pc_dead_stack COMMAND memories_dead_stack_test)
     set_tests_properties(pc_control_net PROPERTIES TIMEOUT 15)
     add_executable(memories_fusion_test tests/pc/fusion_test.c src/pc/cards/fusion.c)
     target_include_directories(memories_fusion_test PRIVATE src)
@@ -345,6 +375,26 @@ if(BUILD_TESTING)
     add_executable(memories_soft_gpu_test tests/pc/soft_gpu_test.c)
     target_link_libraries(memories_soft_gpu_test PRIVATE memories_pc_core)
     add_test(NAME pc_soft_gpu COMMAND memories_soft_gpu_test)
+    # Each reader inside the software GPU settles what it reads
+    # (notes/pc-build.md, "Settling VRAM before it is read").
+    add_executable(memories_soft_gpu_settle_test tests/pc/soft_gpu_settle_test.c)
+    target_link_libraries(memories_soft_gpu_settle_test PRIVATE memories_pc_core)
+    if(WIN32)
+        target_link_libraries(memories_soft_gpu_settle_test PRIVATE memories_pc_fs) # setenv, for the texture dump
+    endif()
+    add_test(NAME pc_soft_gpu_settle COMMAND memories_soft_gpu_settle_test)
+    # Kept back or rastered as it comes, the same VRAM, stores, states, tags
+    # (notes/pc-build.md, "The deferred raster").
+    add_executable(memories_soft_gpu_deferred_test tests/pc/soft_gpu_deferred_test.c)
+    target_link_libraries(memories_soft_gpu_deferred_test PRIVATE memories_pc_core)
+    if(NOT MSVC AND NOT APPLE)
+        # The test counts what is allocated from its stand-in for the clock's
+        # tick, where nothing may be (a patch is made without allocating).
+        target_link_options(memories_soft_gpu_deferred_test PRIVATE
+            -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc)
+        target_compile_definitions(memories_soft_gpu_deferred_test PRIVATE SOFT_GPU_TEST_WRAP_ALLOC=1)
+    endif()
+    add_test(NAME pc_soft_gpu_deferred COMMAND memories_soft_gpu_deferred_test)
     add_executable(memories_settings_test tests/pc/settings_test.c src/pc/platform/settings.c
         src/pc/platform/paths.c)
     target_include_directories(memories_settings_test PRIVATE src)
@@ -496,7 +546,7 @@ if(BUILD_TESTING)
     # mod_libc.c lends mods the indirect-branch thunks (src/pc/guest/branch_thunks.c).
     add_executable(memories_mods_test tests/pc/mods_test.c src/pc/platform/loading.c src/pc/mods/mods.c src/pc/mods/events.c src/pc/mods/hooks.c src/pc/mods/manager.c src/pc/mods/overlap.c src/pc/mods/mod_libc.c
         src/pc/mods/object_loader.c src/pc/mods/json.c src/pc/guest/branch_thunks.c src/pc/mod_packets.c
-        src/pc/platform/paths.c src/pc/platform/settings.c)
+        src/pc/mods/model_rows.c src/pc/guest/sha256.c src/pc/platform/paths.c src/pc/platform/settings.c)
     target_include_directories(memories_mods_test PRIVATE src)
     # The mod C library hands mods the maths functions and reads the monotonic
     # clock, which on Windows (clock_gettime) comes from the threads library;
@@ -510,7 +560,7 @@ if(BUILD_TESTING)
     add_test(NAME pc_mods COMMAND memories_mods_test)
     set(MOD_TEST_SOURCES src/pc/platform/loading.c src/pc/mods/mods.c src/pc/mods/manager.c src/pc/mods/overlap.c src/pc/mods/events.c src/pc/mods/hooks.c
         src/pc/mods/mod_libc.c src/pc/mods/object_loader.c src/pc/mods/json.c src/pc/guest/branch_thunks.c src/pc/mod_packets.c
-        src/pc/platform/paths.c src/pc/platform/settings.c)
+        src/pc/mods/model_rows.c src/pc/guest/sha256.c src/pc/platform/paths.c src/pc/platform/settings.c)
     add_executable(memories_mods_signature_test tests/pc/mods_signature_test.c ${MOD_TEST_SOURCES})
     target_include_directories(memories_mods_signature_test PRIVATE src)
     target_link_libraries(memories_mods_signature_test PRIVATE m Threads::Threads PNG::PNG)
@@ -938,6 +988,40 @@ if(BUILD_TESTING)
         target_compile_options(memories_audio_replace_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
     endif()
     add_test(NAME pc_audio_replace COMMAND memories_audio_replace_test)
+    # The mixer against a golden stream, with a save state's round trip
+    # (tests/pc/spu_mix_test.c). The digests are the same on every compiler
+    # and width, so Linux also runs it as an i386 program (the 32-bit game's).
+    # spu.c naps in Spu_Hold (nanosleep: POSIX, and winpthreads on Windows).
+    # -fwrapv as every game build compiles it (build_game32.py, guest_build.py):
+    # the master volume's product wraps there when two dozen loud voices
+    # overflow it, and the digests hold that.
+    set(memories_spu_mix_tests memories_spu_mix_test)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        list(APPEND memories_spu_mix_tests memories_spu_mix_m32_test)
+    endif()
+    foreach(target IN LISTS memories_spu_mix_tests)
+        add_executable(${target} tests/pc/spu_mix_test.c src/pc/audio/spu.c)
+        target_include_directories(${target} PRIVATE src)
+        target_compile_definitions(${target} PRIVATE _POSIX_C_SOURCE=200809L)
+        if(NOT MSVC)
+            target_compile_options(${target} PRIVATE -O2 -fwrapv -Wall -Wextra -Wpedantic -Werror)
+        endif()
+        if(target STREQUAL "memories_spu_mix_m32_test")
+            target_compile_options(${target} PRIVATE -m32)
+            target_link_options(${target} PRIVATE -m32)
+        else()
+            find_package(Threads REQUIRED)
+            target_link_libraries(${target} PRIVATE Threads::Threads)
+        endif()
+        if(MEMORIES_SANITIZERS)
+            target_compile_options(${target} PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+            target_link_options(${target} PRIVATE -fsanitize=address,undefined)
+        endif()
+    endforeach()
+    add_test(NAME pc_spu_mix COMMAND memories_spu_mix_test)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_test(NAME pc_spu_mix_m32 COMMAND memories_spu_mix_m32_test)
+    endif()
     add_executable(memories_controls_test tests/pc/controls_test.c src/pc/platform/controls.c)
     target_include_directories(memories_controls_test PRIVATE src)
     if(NOT MSVC)
@@ -958,6 +1042,38 @@ if(BUILD_TESTING)
     target_sources(memories_audio_replace_test PRIVATE ${memories_platform_support})
     target_sources(memories_disc_test PRIVATE ${memories_platform_support})
     target_link_libraries(memories_audio_replace_test PRIVATE Threads::Threads)
+    # The software SPU's master volume with two dozen loud voices
+    # (tests/pc/spu_master_test.c). -fwrapv as every game build compiles it
+    # (build_game32.py, guest_build.py), so the old 32-bit product wraps the
+    # same way everywhere and the test fails on it. Linux also runs it as an
+    # i386 program, the 32-bit game's width. spu.c naps in Spu_Hold
+    # (nanosleep: POSIX, and winpthreads on Windows).
+    set(memories_spu_master_tests memories_spu_master_test)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        list(APPEND memories_spu_master_tests memories_spu_master_m32_test)
+    endif()
+    foreach(target IN LISTS memories_spu_master_tests)
+        add_executable(${target} tests/pc/spu_master_test.c src/pc/audio/spu.c)
+        target_include_directories(${target} PRIVATE src)
+        target_compile_definitions(${target} PRIVATE _POSIX_C_SOURCE=200809L)
+        if(NOT MSVC)
+            target_compile_options(${target} PRIVATE -O2 -fwrapv -Wall -Wextra -Wpedantic -Werror)
+        endif()
+        if(target STREQUAL "memories_spu_master_m32_test")
+            target_compile_options(${target} PRIVATE -m32)
+            target_link_options(${target} PRIVATE -m32)
+        else()
+            target_link_libraries(${target} PRIVATE Threads::Threads)
+        endif()
+        if(MEMORIES_SANITIZERS)
+            target_compile_options(${target} PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+            target_link_options(${target} PRIVATE -fsanitize=address,undefined)
+        endif()
+    endforeach()
+    add_test(NAME pc_spu_master COMMAND memories_spu_master_test)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_test(NAME pc_spu_master_m32 COMMAND memories_spu_master_m32_test)
+    endif()
     # controls_evdev_test.c drives the /dev/input reader, which is Linux only.
     set(memories_controls_parts config runtime window)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -1293,14 +1409,49 @@ if(Python3_Interpreter_FOUND)
         add_test(NAME pc_replay_check
             COMMAND "${Python3_EXECUTABLE}" tests/pc/replay_check_test.py
             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        # yfm_control.py's replies against a made-up game: slow, closed, hung
+        # (notes/agent-control.md).
+        add_test(NAME pc_control_client
+            COMMAND "${Python3_EXECUTABLE}" tests/pc/control_client_test.py
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        set_tests_properties(pc_control_client PROPERTIES TIMEOUT 60)
+        # config/pc/model_span_words.csv covers every native row's span words,
+        # and each row's digest is the C the tree has (no compiler needed);
+        # with clang as the check compiler also the analysis of a few rows
+        # and of made-up modules (tools/pc/model_span_words.py).
+        add_test(NAME pc_model_span_words
+            COMMAND "${Python3_EXECUTABLE}" tools/pc/test_model_span_words.py
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        # The model-migration tool in an SDK, without a disc: an SDK written
+        # as a build writes it, moved outside the checkout, and `model_gate.py
+        # mod-check` run from it (tools/pc/model_sdk.py, model_layout.py).
+        add_test(NAME pc_model_sdk
+            COMMAND "${Python3_EXECUTABLE}" tools/pc/test_model_sdk.py
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        set_tests_properties(pc_model_sdk PROPERTIES TIMEOUT 1800)
         # model_oracle.py's comparison and coverage on made-up games
         # (notes/pc-build.md, "MIPS-only effects").
         add_test(NAME pc_model_oracle_check
             COMMAND "${Python3_EXECUTABLE}" tests/pc/model_oracle_test.py
             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        # model_gate.py mod-migrate's classifier (tools/pc/model_migrate.py)
+        # says what the game's says of the disc's modules, changed here
+        # (MEMORIES_DISC; skipped without it).
+        if(TARGET memories_model_module_class_test)
+            add_test(NAME pc_model_migrate_class
+                COMMAND "${Python3_EXECUTABLE}" tools/pc/test_model_migrate.py --only class
+                        --classifier "$<TARGET_FILE:memories_model_module_class_test>"
+                        --out "${CMAKE_CURRENT_BINARY_DIR}/model-migrate-class"
+                WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+            set_tests_properties(pc_model_migrate_class PROPERTIES SKIP_RETURN_CODE 77)
+        endif()
         # Native units that name files reach compat/fs.h (notes/pc-build.md).
         add_test(NAME pc_utf8_paths
             COMMAND "${Python3_EXECUTABLE}" tools/pc/check_utf8_paths.py
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        # And so do the readers outside it (the same notes, "Settling").
+        add_test(NAME pc_vram_readers
+            COMMAND "${Python3_EXECUTABLE}" tools/pc/check_vram_readers.py
             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     endif()
 endif()

@@ -37,6 +37,16 @@ have been in its slot and called there, on both sides.
     python tools/pc/model_oracle.py --records gated                      # the records that have a native-C image
     python tools/pc/model_oracle.py --reference-mode "" --reverse-reference   # the default against itself
     python tools/pc/model_oracle.py --mode spark --records 34 --shots 1   # a difference, with pictures
+    python tools/pc/model_oracle.py --records 34 --mod my-mod            # a code mod's C for its modules
+
+With --mod DIR (repeatable) both sides run with that mod on, copied into
+each game's own mods folder. The images the battles load are then the disc's
+with the mods' "data" patches of MODEL.MRG applied (the only data --mod
+reads), and a code mod's registered rows (mod API 29: the "model_module"
+lines of the mods trace) are expected to run as "mod:<id>" in a default-mode
+side wherever one hashes to the slot's image: before the disc's rows for an
+OVER_DISC row, after them for the others. --no-mod-c runs the subject with
+MEMORIES_MODEL_MOD_C=0 and expects no mod's C.
 
 Exit status 0 when every battle agrees and every image was covered.
 """
@@ -61,9 +71,10 @@ from typing import NamedTuple
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from yfm_control import Game, GameHung, OUTPUT  # noqa: E402
 import model_gate  # noqa: E402
+import model_layout as layout  # noqa: E402  (the repository's, or an SDK's: model_layout.py)
 
-ROOT = Path(__file__).resolve().parents[2]
-MODEL_HEADER = ROOT / "src/game/model.h"
+ROOT = layout.ROOT
+MODEL_HEADER = layout.path("src/game/model.h")
 SECTOR = 2048
 # A record's load (model_texture_transfer.c, func_80056D7C): stages 7-10 are
 # the variant images, ten sectors each (alternative 0 slot A, 0 B, 1 A, 1 B),
@@ -94,8 +105,16 @@ ANIMATED_BATTLE = 1
 CALL = re.compile(r"frame (\d+) vb \d+ model\] (primary|variant) slot=(\d) command=(-?\d+)"
                   r"(?: module (\d+) in ([AB]): (\S+))?")
 CANNOT = re.compile(r"model (primary|variant) module (\d+) \(slot ([AB])\) cannot run")
+# A code mod's row (mod API 29), as host->model_module logs it on the mods channel.
+CLAIM = re.compile(r"mods\] (\S+): model_module (primary|variant) slot ([AB]) identifier (\d+) span (\d+) "
+                   r"sha256 ([0-9a-f]{64})( over the disc)?")
+# What the mods say about their models' control modules (mods.c's module notes).
+MOD_NOTE = re.compile(r"(attack modules? .*(?:MIPS code|native C from mod)|model_module refused|"
+                      r"MODEL\.MRG record \d+ \(card \d+\): .*|: native C from mod \S+)")
 STAMP = re.compile(r"\[t \d+ us frame (\d+) ")
 HASH = re.compile(r"(\d+) ([0-9a-f]{16})$")
+# A primary module's words at +4 that are `return 2` (jr ra; addiu v0, zero, 2).
+RETURN_TWO = struct.pack("<II", 0x03E00008, 0x24020002)
 
 
 def model_ids(header: Path = MODEL_HEADER) -> list[int]:
@@ -145,12 +164,24 @@ def parse_record_selection(text: str | None, disc: "Disc", alternatives: list[in
             if any(native_row(disc, record, alternative, slot) for alternative in alternatives for slot in "AB")]
 
 
-def native_row(disc: "Disc", record: int, alternative: int, slot: str) -> "model_gate.Row | None":
+def native_row(disc: "Disc", record: int, alternative: int, slot: str, image: bytes | None = None) \
+        -> "model_gate.Row | None":
     """The native row whose code (the first `span` bytes of the image,
-    SHA-256) the record's image in a slot has, None when the interpreter
-    is to run it."""
-    image = disc.variant(record, alternative, slot)
+    SHA-256) the record's image in a slot has (or `image`, a model's), None
+    when the interpreter is to run it."""
+    if image is None:
+        image = disc.variant(record, alternative, slot)
     for row in model_gate.native_rows():
+        if hashlib.sha256(image[:row.span]).hexdigest() == row.sha256(slot):
+            return row
+    return None
+
+
+def native_primary_row(disc: "Disc", record: int, slot: str, image: bytes | None = None) -> "model_gate.Row | None":
+    """The same for the record's primary module (config/pc/model_primary_gate.csv)."""
+    if image is None:
+        image = disc.primary(record, slot)
+    for row in model_gate.native_primary_rows():
         if hashlib.sha256(image[:row.span]).hexdigest() == row.sha256(slot):
             return row
     return None
@@ -160,13 +191,19 @@ class Battle(NamedTuple):
     record: int
     alternative: int
     outcome: str
+    model: str = ""     # a mod's model (--models): `record` is then the record whose card fights as it
+    card: int = 0       # what D_800EF658 holds for it: a card id, or a mod model's id (Disc.model_id)
 
     @property
     def key(self) -> str:
-        return f"{self.record}/{self.alternative}/{self.outcome}"
+        return f"{f'model:{self.model}' if self.model else self.record}/{self.alternative}/{self.outcome}"
+
+    @property
+    def place(self) -> str:
+        return f"model {self.model}" if self.model else f"record {self.record}"
 
     def properties(self) -> bytes:
-        card, (first, second) = record_card(self.record), OUTCOMES[self.outcome]
+        card, (first, second) = self.card or record_card(self.record), OUTCOMES[self.outcome]
         return (PROPERTIES.pack(card, first, 0, 0, self.alternative) +
                 PROPERTIES.pack(card, second, 0, 0, self.alternative))
 
@@ -181,6 +218,30 @@ class Disc:
         self.lba, size = self._find(["DATA", "MODEL.MRG;1"])
         if size != RECORDS * 0x114 * SECTOR:
             raise SystemExit(f"{path}: MODEL.MRG is {size} bytes, not {RECORDS} records")
+        self.patches: dict[int, int] = {}   # MODEL.MRG offset: byte, the --mod mods' "data" patches
+        self.models: dict[str, bytes] = {}  # a --mod mod's model: its 44 module sectors (model_migrate.model_site)
+        self.model_order: list[str] = []    # every model of the --mod mods, in their order
+
+    def patch(self, manifest: dict, where: str) -> None:
+        """A mod's "data" patches of MODEL.MRG, applied to what read() gives,
+        later mods over earlier ones as the game applies them, and its
+        "models", whose modules a battle of --models reads. Anything else a
+        mod's data does is refused: the oracle would not see it."""
+        import model_migrate
+        for entry in manifest.get("models", []) or []:
+            site = model_migrate.model_site(Path(where), entry)
+            if site is None:
+                raise SystemExit(f"--mod {where}: model {entry.get('name')} has no file")
+            self.models[site.model] = site.stages   # a later mod's model of one name wins, as in the game
+            self.model_order.append(site.model)
+        for entry in manifest.get("data", []):
+            name = str(entry.get("file", "")).upper().replace("/", "\\")
+            if name not in ("\\DATA\\MODEL.MRG;1", "\\DATA\\MODEL.MRG") or "replace" in entry or "patch" not in entry:
+                raise SystemExit(f"--mod {where}: the oracle reads only \"patch\" entries of \\DATA\\MODEL.MRG;1")
+            for run in entry["patch"]:
+                at = run["at"] if isinstance(run["at"], int) else int(str(run["at"]), 0)
+                for n, byte in enumerate(bytes.fromhex(run["bytes"])):
+                    self.patches[at + n] = byte
 
     def _sector(self, lba: int) -> bytes:
         self.file.seek(lba * 2352 + 24)
@@ -205,7 +266,15 @@ class Disc:
 
     def read(self, record: int, sector: int, count: int) -> bytes:
         with self.lock:
-            return b"".join(self._sector(self.lba + record * 0x114 + sector + n) for n in range(count))
+            data = b"".join(self._sector(self.lba + record * 0x114 + sector + n) for n in range(count))
+        if self.patches:
+            first = (record * 0x114 + sector) * SECTOR
+            changed = bytearray(data)
+            for at, byte in self.patches.items():
+                if first <= at < first + len(changed):
+                    changed[at - first] = byte
+            data = bytes(changed)
+        return data
 
     def variant(self, record: int, alternative: int, slot: str) -> bytes:
         stage = 2 * alternative + (slot == "B")
@@ -213,6 +282,27 @@ class Disc:
 
     def primary(self, record: int, slot: str) -> bytes:
         return self.read(record, PRIMARY_SECTOR + PRIMARY_SECTORS * (slot == "B"), PRIMARY_SECTORS)
+
+    def battle_variant(self, battle: "Battle", slot: str) -> bytes:
+        """The variant image a battle loads in a slot: its record's, or its model's."""
+        if not battle.model:
+            return self.variant(battle.record, battle.alternative, slot)
+        at = (VARIANT_SECTORS * (2 * battle.alternative + (slot == "B"))) * SECTOR
+        return self.models[battle.model][at:at + VARIANT_SECTORS * SECTOR]
+
+    def model_id(self, name: str) -> int:
+        """What a card that names model `name` has as its model, which the
+        battle reads in D_800EF658: CARDS_MODEL_MOD_FIRST (0x8000, src/pc/cards/
+        cards.h) plus one plus the model's place among every mod's models
+        (the --mod mods in the game's load order, load_order: a later model
+        of one name is the one named)."""
+        return 0x8001 + len(self.model_order) - 1 - self.model_order[::-1].index(name)
+
+    def battle_primary(self, battle: "Battle", slot: str) -> bytes:
+        if not battle.model:
+            return self.primary(battle.record, slot)
+        at = (PRIMARY_SECTOR - VARIANT_SECTOR + PRIMARY_SECTORS * (slot == "B")) * SECTOR
+        return self.models[battle.model][at:at + PRIMARY_SECTORS * SECTOR]
 
 
 def sha(data: bytes) -> str:
@@ -232,10 +322,11 @@ class Side:
     its frame count starts again."""
 
     def __init__(self, name: str, executable: Path | None, env: dict[str, str], out: Path, disc: Path,
-                 chunk: int, cap: int):
+                 chunk: int, cap: int, mods: list[tuple[Path, str]] | None = None):
         self.name, self.executable, self.env = name, executable, env
         self.out = out.resolve()   # the game runs elsewhere: MEMORIES_FRAME_HASHES must be absolute
         self.disc, self.chunk, self.cap = disc, chunk, cap
+        self.mods = mods or []     # (folder, id): copied into each game's own mods folder and turned on
         self.games = 0
         self.lock = threading.Lock()
 
@@ -245,8 +336,14 @@ class Side:
             self.games += 1
         shutil.rmtree(folder, ignore_errors=True)
         (folder / "mods").mkdir(parents=True)
-        env = {**self.env, "MEMORIES_DISC": str(self.disc), "MEMORIES_TRACE": "model",
+        env = {**self.env, "MEMORIES_DISC": str(self.disc), "MEMORIES_TRACE": "model,mods" if self.mods else "model",
                "MEMORIES_FRAME_HASHES": str(folder / "hashes.txt")}
+        for directory, identifier in self.mods:
+            # Without its sources, which the game never reads (a mod that
+            # model_gate.py mod-migrate wrote C for has megabytes of them).
+            shutil.copytree(directory, folder / "mods" / directory.name,
+                            ignore=shutil.ignore_patterns("*.c", "*.h", "*.inc", "model_c"))
+            env[mod_variable(identifier)] = "1"
         game = Game(self.executable, out=folder, mods_dir=folder / "mods", env=env, command_timeout=120)
         game.goto("debug")
         game.save("base.state")
@@ -343,6 +440,8 @@ def read_traces(folder: Path, results: list[dict]) -> None:
         pass
     calls: list[tuple] = []
     cannot: list[tuple[int, str]] = []
+    claims: list[tuple] = []
+    notes: list[str] = []
     frame = 0
     try:
         log = (folder / "game.log").read_text(errors="replace").splitlines()
@@ -352,6 +451,14 @@ def read_traces(folder: Path, results: list[dict]) -> None:
         stamp = STAMP.search(line)
         if stamp:
             frame = int(stamp.group(1))
+        match = CLAIM.search(line)
+        if match:
+            claims.append((match.group(2), match.group(3), int(match.group(4)), int(match.group(5)), match.group(6),
+                           bool(match.group(7)), match.group(1)))
+            continue
+        match = MOD_NOTE.search(line)
+        if match and line.split("] ", 1)[-1] not in notes:
+            notes.append(line.split("] ", 1)[-1])
         match = CALL.search(line)
         if match:
             kind, active, command = match.group(2), int(match.group(3)), int(match.group(4))
@@ -377,6 +484,8 @@ def read_traces(folder: Path, results: list[dict]) -> None:
         result["updates"] = updates
         result["paths"] = {module: sorted(ways) for module, ways in paths.items()}
         result["cannot_run"] = sorted({what for at, what in cannot if start <= at <= end})
+        result["claims"] = claims   # the game's, from its start: every battle it ran has them
+        result["mod_notes"] = notes
 
 
 # --- comparing --------------------------------------------------------------------
@@ -392,46 +501,153 @@ def first_difference(mine: array, theirs: array) -> int | None:
     return None
 
 
-def backends(side: dict) -> dict[str, set[str]]:
-    """{slot: what ran its variant module calls} from a side's paths."""
+def backends(side: dict, kind: str = "variant") -> dict[str, set[str]]:
+    """{slot: what ran its variant (or primary) module calls} from a side's paths."""
     found: dict[str, set[str]] = {}
     for module, ways in side["paths"].items():
-        kind, _, slot = module.rpartition(" in ")
-        if kind.startswith("variant "):
+        what, _, slot = module.rpartition(" in ")
+        if what.startswith(kind + " "):
             found.setdefault(slot, set()).update(ways)
     return found
 
 
-def backend_errors(side: dict, expected: dict[str, bool], native_allowed: bool) -> list[str]:
+def backend_errors(side: dict, expected: dict[str, bool | str], native_allowed: bool,
+                   kind: str = "variant") -> list[str]:
     """Where a side ran something other than what the table says: native C
     in the slots whose image is a native row's code, if it is a default-mode
     side, and the interpreter in the others; never native for a side that
-    asked for the interpreter or the stand-in."""
+    asked for the interpreter or the stand-in. An expected "mod:<id>" (--mod)
+    is a slot whose image a code mod's row covers: a default-mode side must
+    have run that mod's C there, and no mod's C anywhere else."""
     errors = []
-    ran = backends(side)
+    ran = backends(side, kind)
+    what = "primary " if kind == "primary" else ""   # the variants' messages keep their words
     # A slot that holds a native row's code and made no variant call at all
     # is an error too (compare() has already said so for the slots a battle's
     # outcome runs; expected holds only those).
     for slot in sorted(expected):
-        if native_allowed and expected[slot] and slot not in ran:
+        # A primary module is called only by the records with one (the disc
+        # calls no `return 2`): a slot that made no primary call is no error.
+        if native_allowed and expected[slot] and slot not in ran and kind == "variant":
             errors.append(f"{side['side']}: slot {slot} holds a module the table runs as native C and made no call")
     for slot, ways in sorted(ran.items()):
-        want_native = native_allowed and expected.get(slot, False)
-        if want_native and ways != {"native"}:
-            errors.append(f"{side['side']}: slot {slot} holds a module the table runs as native C and ran "
+        want = expected.get(slot, False) if native_allowed else False
+        mods = sorted(way for way in ways if way.startswith("mod:"))
+        if isinstance(want, str):
+            if ways != {want}:
+                errors.append(f"{side['side']}: slot {slot} holds a {what}module {want[4:]}'s row runs as its C and "
+                              f"ran {', '.join(sorted(ways))}")
+        elif want and ways != {"native"}:
+            errors.append(f"{side['side']}: slot {slot} holds a {what}module the table runs as native C and ran "
                           f"{', '.join(sorted(ways))}")
-        elif not want_native and "native" in ways:
-            errors.append(f"{side['side']}: slot {slot} ran native C where the table says "
+        elif not want and "native" in ways:
+            errors.append(f"{side['side']}: slot {slot} ran native C{' for its primary module' if what else ''} where the table says "
                           f"{'interpreter' if native_allowed else 'the mode asks for no native C'}")
+        if not isinstance(want, str) and mods:
+            errors.append(f"{side['side']}: slot {slot} ran a mod's C ({', '.join(mods)}) where "
+                          f"{'no mod row covers its module' if native_allowed else 'the mode asks for no native C'}")
     return errors
 
 
+WHOLE_NUMBER = re.compile(r"^\s*[+-]?(?:0[xX][0-9a-fA-F]+|[0-9]+)\s*$", re.ASCII)
+
+
+def json_number(value, fallback: int = 0) -> int:
+    """Json_Number (src/pc/mods/json.c): a number, a bool, or a string that
+    holds a whole one ("0x" hexadecimal, else decimal); anything else is the
+    fallback. The game's parser refuses a number that is not whole and a
+    manifest that holds one never loads; a fraction is cut here (the oracle
+    is lenient), where the game would not have the mod at all."""
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value == value and abs(value) != float("inf") else fallback
+    if isinstance(value, str) and WHOLE_NUMBER.match(value):
+        return int(value.strip(), 16 if re.match(r"^[+-]?0[xX]", value.strip()) else 10)
+    return fallback
+
+
+def mod_rank(manifest: dict) -> int:
+    """The rank the game orders a mod by: Settings_GetNamed("mod.<id>.order",
+    (int)priority). Here the default only: a saved "mod.<id>.order" is not
+    consulted. The cast to int wraps."""
+    return (json_number(manifest.get("priority")) + 2 ** 31) % 2 ** 32 - 2 ** 31
+
+
+def load_order(mods: list[tuple[Path, dict]]) -> list[tuple[Path, dict]]:
+    """The mods in the order the game loads them (src/pc/mods/mods.c scan,
+    manager.c order_ranked): their folders by name, byte by byte, then
+    repeatedly the first with the lowest rank (mod_rank) that no mod of these
+    still to place blocks. A "requires" or "after" entry blocks by its exact
+    string (an object's "id" when it is not one), as require_id does, and a
+    mod that names itself is blocked for good: a cycle."""
+    pending = sorted(mods, key=lambda mod: mod[0].name.encode("utf-8"))
+    placed: list[tuple[Path, dict]] = []
+    while pending:
+        ids = {str(manifest.get("id")) for _, manifest in pending}
+        best = None
+        for mod in pending:
+            manifest = mod[1]
+            names = []
+            for key in ("requires", "after"):
+                entries = manifest.get(key)
+                for item in entries if isinstance(entries, list) else ():
+                    if isinstance(item, str):
+                        names.append(item)
+                    else:
+                        name = item.get("id") if isinstance(item, dict) else None
+                        names.append(name if isinstance(name, str) else "")
+            if any(name in ids for name in names):
+                continue
+            if best is None or mod_rank(manifest) < mod_rank(best[1]):
+                best = mod
+        if best is None:   # a cycle: the game refuses it; keep the name order
+            best = pending[0]
+        placed.append(best)
+        pending.remove(best)
+    return placed
+
+
+def mod_variable(identifier: str) -> str:
+    """The variable that turns a mod on (mods.c, environment_choice)."""
+    return "MEMORIES_MOD_" + re.sub(r"[^A-Z0-9]", "_", identifier.upper())
+
+
+def expected_way(image: bytes, slot: str, kind: str, disc_native: bool, claims: list[tuple]) -> bool | str:
+    """What a default-mode side runs a slot's module with, for compare():
+    "mod:<id>" where a code mod's row covers the image (an OVER_DISC row
+    before the disc's rows, the others after them; of two, the one
+    registered later), else whether a disc row does (True: native C). A
+    primary that is `return 2` the game answers itself after the disc's rows
+    and before the others (model_modules.c, return_two_row): native."""
+    identifier = int.from_bytes(image[:4], "little")
+    if kind == "primary" and image[4:12] == RETURN_TWO:
+        disc_native = True
+    def claimed(over: bool) -> str | None:
+        found = None
+        for claim_kind, claim_slot, claim_identifier, span, digest, claim_over, owner in claims:
+            if (claim_kind, claim_slot, claim_identifier, claim_over) == (kind, slot, identifier, over) and \
+                    sha(image[:span]) == digest:
+                found = "mod:" + owner
+        return found
+    return claimed(True) or disc_native or claimed(False) or False
+
+
 def compare(subject: dict, reference: dict, holds_native: dict[str, bool] | None = None,
-            native_allowed: tuple[bool, bool] = (False, False)) -> dict:
+            native_allowed: tuple[bool, bool] = (False, False),
+            holds_native_primary: dict[str, bool] | None = None) -> dict:
     """What one battle's two runs say: its verdict and why. `holds_native` says
-    which slots hold a native row's code; `native_allowed` whether each side
-    (subject, reference) is in the mode that runs native C."""
-    verdict = {"battle": subject["battle"], "frames": [len(subject.get("hashes", ())), len(reference.get("hashes", ()))]}
+    which slots hold a native row's code, `holds_native_primary` which hold a
+    native primary row's; `native_allowed` whether each side (subject,
+    reference) is in the mode that runs native C."""
+    verdict = {"battle": subject["battle"], "frames": [len(subject.get("hashes", ())), len(reference.get("hashes", ()))],
+               # Each side's frame hashes in one digest, to compare runs (test_model_mod_c.py).
+               "digests": [hashlib.sha256(side["hashes"].tobytes()).hexdigest()[:16] if side.get("hashes") else ""
+                           for side in (subject, reference)],
+               # The subject's setup commands ("variant A 3"): the entries the battle's attacks pick.
+               "setups": sorted({f"{kind} {slot} {command}" for _, kind, slot, _, command in subject.get("calls", ())})}
     errors = [f"{side['side']}: {side['error']}" for side in (subject, reference) if side.get("error")]
     errors += [f"{side['side']}: no frame hash for {side['hashes'].count(0)} of its {len(side['hashes'])} frames"
                for side in (subject, reference) if not side.get("error") and
@@ -447,6 +663,8 @@ def compare(subject: dict, reference: dict, holds_native: dict[str, bool] | None
     if not errors and holds_native is not None:
         for side, allowed in zip((subject, reference), native_allowed):
             errors += backend_errors(side, holds_native, allowed)
+            if holds_native_primary is not None:
+                errors += backend_errors(side, holds_native_primary, allowed, "primary")
     if errors:
         verdict.update(status="error", why="; ".join(errors))
         return verdict
@@ -490,9 +708,9 @@ def coverage(battles: list[Battle], subject: dict, reference: dict, disc: Disc) 
     mismatched = []
     for battle in battles:
         for slot in running_slots(battle.outcome):   # slot B's image only where its module runs
-            image = sha(disc.variant(battle.record, battle.alternative, slot))
-            on_disc[slot].setdefault(image, f"record {battle.record} stage {stage_of(battle.alternative, slot)}")
-            primary = sha(disc.primary(battle.record, slot))
+            image = sha(disc.battle_variant(battle, slot))
+            on_disc[slot].setdefault(image, f"{battle.place} stage {stage_of(battle.alternative, slot)}")
+            primary = sha(disc.battle_primary(battle, slot))
             primary_disc[slot].add(primary)
             ran = True
             for side in (subject[battle.key], reference[battle.key]):
@@ -507,7 +725,8 @@ def coverage(battles: list[Battle], subject: dict, reference: dict, disc: Disc) 
                                       f"before its module ran")
                     ran = False
                 elif side["images"][slot] != image:
-                    mismatched.append(f"{battle.key} slot {slot} ({side['side']}): not the disc's stage "
+                    mismatched.append(f"{battle.key} slot {slot} ({side['side']}): not the "
+                                      f"{'model' if battle.model else 'disc'}'s stage "
                                       f"{stage_of(battle.alternative, slot)} image")
                     ran = False
                 if first_call is None:
@@ -529,7 +748,7 @@ def coverage(battles: list[Battle], subject: dict, reference: dict, disc: Disc) 
 
 def pictures(side: Side, battle: Battle, offsets: list[int], folder: Path) -> list[Path]:
     """The battle's frames at these offsets from its start, as PNGs."""
-    game = side._start(f"pictures-{battle.record}-{battle.alternative}")
+    game = side._start(f"pictures-{battle.model or battle.record}-{battle.alternative}")
     shots = []
     try:
         game.load("base.state")
@@ -540,7 +759,8 @@ def pictures(side: Side, battle: Battle, offsets: list[int], folder: Path) -> li
         for offset in sorted(offsets):
             while game.frame < start + offset:
                 game.step(1)
-            name = f"{side.name}-record{battle.record}-alt{battle.alternative}-{battle.outcome}-frame+{offset}.png"
+            name = (f"{side.name}-{battle.place.replace(' ', '')}-alt{battle.alternative}-{battle.outcome}"
+                    f"-frame+{offset}.png")
             shots.append(game.shot(folder / name))
     finally:
         game.close()
@@ -588,19 +808,52 @@ def main() -> int:
                              "differing frame, the one before and the one after (the hash sees the frame being "
                              "drawn, the screen shows it a frame later)")
     parser.add_argument("--pictures", help="frame offsets to picture the first battle at, both sides (\"300,900\")")
-    parser.add_argument("--out", type=Path, help="where it all goes (default a new tmp/pc/control/model-oracle-*)")
+    parser.add_argument("--out", type=Path, help="where it all goes (default a new model-oracle-* folder in yfm_control's output folder: "
+                        "tmp/pc/control in a checkout, the system's temporary folder in an SDK)")
     parser.add_argument("--keep", action="store_true", help="keep each game's log, frame hashes and state")
+    parser.add_argument("--mod", action="append", type=Path, default=[],
+                        help="a mod's folder, on for both sides, copied into each game's own mods folder "
+                             "(repeatable; its \"data\" may only patch MODEL.MRG)")
+    parser.add_argument("--models", help="models of the --mod mods (\"models\" in mod.json), by name and "
+                                         "comma-separated: each fights by its model id, as a card that names it "
+                                         "would, its own modules in both slots. With "
+                                         "--models and no --records, only the models are battled")
+    parser.add_argument("--no-mod-c", action="store_true",
+                        help="the subject runs with MEMORIES_MODEL_MOD_C=0: no mod's C is expected")
     arguments = parser.parse_args()
     if not arguments.disc or not Path(arguments.disc).is_file():
         parser.error("no disc image: --disc or MEMORIES_DISC")
     disc = Disc(Path(arguments.disc).resolve())
+    mods = []
+    found = []
+    for directory in arguments.mod:
+        directory = directory.resolve()
+        try:
+            manifest = json.loads((directory / "mod.json").read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError) as error:
+            parser.error(f"--mod {directory}: {error}")
+        found.append((directory, manifest))
+    # In the game's load order, which places the mods' data and models (a
+    # model's id is its place among every mod's models).
+    for directory, manifest in load_order(found):
+        disc.patch(manifest, str(directory))
+        mods.append((directory, str(manifest["id"])))
     alternatives = [int(a) for a in arguments.alternatives.split(",")]
-    records = parse_record_selection(arguments.records, disc, alternatives)
+    if arguments.models and not arguments.records:
+        records = []
+    else:
+        records = parse_record_selection(arguments.records, disc, alternatives)
+    models = [name.strip() for name in (arguments.models or "").split(",") if name.strip()]
+    for name in models:
+        if name not in disc.models:
+            parser.error(f"--models: no --mod mod has a model named {name!r}")
     outcomes = [o.strip() for o in arguments.outcomes.split(",")]
     for outcome in outcomes:
         if outcome not in OUTCOMES:
             parser.error(f"--outcomes: {outcome}? ({', '.join(OUTCOMES)})")
     battles = [Battle(r, a, o) for r in records for a in alternatives for o in outcomes]
+    battles += [Battle(0, a, o, name, disc.model_id(name)) for name in models
+                for a in alternatives for o in outcomes]
     if arguments.out:
         out = arguments.out.resolve()
         out.mkdir(parents=True, exist_ok=True)
@@ -617,10 +870,12 @@ def main() -> int:
         except ValueError:
             parser.error(f"--poison: {arguments.poison}? (a byte, 0x00 to 0xFF)")
         subject_env["MEMORIES_MODEL_STACK_POISON"] = arguments.poison
+    if arguments.no_mod_c:
+        subject_env["MEMORIES_MODEL_MOD_C"] = "0"
     sides = {"subject": Side("subject", subject_exe, subject_env, out / "subject", disc.path,
-                             arguments.chunk, arguments.cap),
+                             arguments.chunk, arguments.cap, mods),
              "reference": Side("reference", reference_exe, side_env(arguments.reference_mode), out / "reference",
-                               disc.path, arguments.chunk, arguments.cap)}
+                               disc.path, arguments.chunk, arguments.cap, mods)}
     reference_battles = battles[::-1] if arguments.reverse_reference else battles
     reference_size = arguments.shard + 1 if arguments.reverse_reference else arguments.shard
     tasks = [("subject", f"shard{n:03}", part) for n, part in enumerate(shards(battles, arguments.shard))]
@@ -628,7 +883,8 @@ def main() -> int:
               for n, part in enumerate(shards(reference_battles, reference_size))]
     tasks.sort(key=lambda task: task[1])   # both sides of the first shards first
     began = time.monotonic()
-    print(f"model oracle: {len(battles)} battles ({len(records)} records x {len(alternatives)} alternatives x "
+    print(f"model oracle: {len(battles)} battles ({len(records)} records"
+          f"{f' and {len(models)} models' if models else ''} x {len(alternatives)} alternatives x "
           f"{len(outcomes)} outcomes), subject {arguments.mode or 'default'}, reference "
           f"{arguments.reference_mode or 'default'}, {arguments.jobs} games at once; {out}", flush=True)
     results = {"subject": {}, "reference": {}}
@@ -653,23 +909,40 @@ def main() -> int:
     elapsed = time.monotonic() - began
     # The slots whose disc image is a native row's code: where a default-mode
     # side must have run the decomp's C (compare).
-    expected = {b.key: {slot: native_row(disc, b.record, b.alternative, slot) is not None
+    expected = {b.key: {slot: native_row(disc, b.record, b.alternative, slot, disc.battle_variant(b, slot)) is not None
                         for slot in running_slots(b.outcome)} for b in battles}
     allowed = tuple(mode not in ("interpreter", "spark") for mode in (arguments.mode, arguments.reference_mode))
-    verdicts = [compare(results["subject"][b.key], results["reference"][b.key], expected[b.key], allowed)
-                for b in battles]
+    primaries = {b.key: {slot: native_primary_row(disc, b.record, slot, disc.battle_primary(b, slot)) is not None
+                         for slot in "AB"}
+                 for b in battles}
+    # With --mod: the rows the mods registered (each game logs them; the
+    # subject's, which the expectation is for) and where they run instead.
+    claims = list(dict.fromkeys(claim for result in results["subject"].values() for claim in result.get("claims", ())))
+    mod_notes = sorted({note for side in results.values() for result in side.values()
+                        for note in result.get("mod_notes", ())})
+    if claims and not arguments.no_mod_c:
+        for b in battles:
+            for slot in running_slots(b.outcome):
+                expected[b.key][slot] = expected_way(disc.battle_variant(b, slot), slot, "variant",
+                                                     expected[b.key][slot], claims)
+            for slot in "AB":
+                primaries[b.key][slot] = expected_way(disc.battle_primary(b, slot), slot, "primary",
+                                                      primaries[b.key][slot], claims)
+    verdicts = [compare(results["subject"][b.key], results["reference"][b.key], expected[b.key], allowed,
+                        primaries[b.key]) for b in battles]
     cover = coverage(battles, results["subject"], results["reference"], disc)
     bases = sorted({r["base_hash"] for side in results.values() for r in side.values() if "base_hash" in r})
 
     lines = []
-    by_record: dict[int, list[dict]] = {}
+    by_record: dict[str, list[dict]] = {}
     for battle, verdict in zip(battles, verdicts):
-        by_record.setdefault(battle.record, []).append(verdict)
+        by_record.setdefault(f"model {battle.model} (model id 0x{battle.card:X})" if battle.model else
+                             f"record {battle.record} (card {record_card(battle.record)})", []).append(verdict)
     for record, found in by_record.items():
         modules = sorted({m for v in found for m in v.get("modules", ())})
         cannot = sorted({c for v in found for c in v.get("cannot_run", ())})
         bad = [v for v in found if v["status"] != "identical"]
-        text = (f"record {record} (card {record_card(record)}): " +
+        text = (f"{record}: " +
                 ("identical" if not bad else "; ".join(f"{v['battle']} {v['status']}: {v.get('why', '')}" for v in bad)) +
                 f" | ran: {', '.join(modules) or 'nothing'}" + (f" | cannot run: {', '.join(cannot)}" if cannot else ""))
         lines.append(text)
@@ -696,7 +969,13 @@ def main() -> int:
     summary.append("  backends (battle slots; what ran the variant module): " + "; ".join(
         f"{name} " + (", ".join(f"{way} {count}" for way, count in sorted(counts.items())) or "none")
         for name, counts in ran.items()) +
-        f"; {sum(held for slots in expected.values() for held in slots.values())} of them hold a native row's code")
+        f"; {sum(held is True for slots in expected.values() for held in slots.values())} of them hold a native row's code"
+        + (f", {sum(isinstance(held, str) for slots in expected.values() for held in slots.values())} a mod row's"
+           if claims else ""))
+    if mods:
+        summary.append(f"  mods: {', '.join(identifier for _, identifier in mods)}; {len(claims)} module rows registered"
+                       + (" (the subject runs with MEMORIES_MODEL_MOD_C=0)" if arguments.no_mod_c else ""))
+        summary.extend(f"  mod note: {note}" for note in mod_notes[:12])
     stand_in = sorted({f"{v['battle']}: {module}" for v in verdicts for side in ("subject", "reference")
                        if (side == "subject" and arguments.mode != "spark") or
                        (side == "reference" and arguments.reference_mode != "spark")
@@ -708,7 +987,9 @@ def main() -> int:
     (out / "report.txt").write_text(text + "\n", encoding="utf-8")
     with (out / "report.json").open("w", encoding="utf-8") as file:
         json.dump({"arguments": {k: str(v) for k, v in vars(arguments).items()}, "elapsed": elapsed,
-                   "verdicts": verdicts, "coverage": cover, "base_hashes": bases}, file, indent=1)
+                   "verdicts": verdicts, "coverage": cover, "base_hashes": bases,
+                   "mods": [identifier for _, identifier in mods], "claims": claims, "mod_notes": mod_notes},
+                  file, indent=1)
     print("\n".join(lines if len(lines) <= 40 else [l for l in lines if "identical |" not in l][:200]))
     print("\n".join(summary))
 

@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 """Check release archives without a ROM: layout, modes, no user data."""
 import argparse
+import hashlib
 import json
+import os
 import struct
+import subprocess
+import sys
+import tempfile
 from pathlib import Path, PurePosixPath
 import tarfile
 import zipfile
+
+from pe_layout import link_layout_problems, pe_layout_gaps
 
 # build_mod.py's targets: each has its export list in every SDK.
 TARGETS = ("i386", "x86_64-windows", "aarch64-translated")
@@ -40,6 +47,11 @@ def check_pe(image, label):
     assert symbols == 0 and symbol_count == 0, f"{label} keeps its COFF symbol table"
     assert len(image) == end, f"{label} has {len(image) - end} bytes after its last section"
     assert b".rsrc" in names, f"{label} has no resources (version information)"
+    # Sections adjacent from the headers on: with a hole Windows does not
+    # load it at all (pe_layout.py; master's packages after the model
+    # modules, whose empty sections grew lld's headers).
+    gaps = pe_layout_gaps(image)
+    assert not gaps, f"{label} has a hole in its image, which Windows will not load: {'; '.join(gaps)}"
     # The PE checksum package.py fills in after the strip: ImageHlp's sum
     # of the file's 16-bit words (its own field as 0), folded, plus the length.
     field = header + 24 + 64
@@ -50,6 +62,45 @@ def check_pe(image, label):
         total = (total & 0xFFFF) + (total >> 16)
     assert stored == total + len(image), f"{label}'s PE checksum is {stored:#x}, not {total + len(image):#x}"
     return header
+
+
+def check_layout_guard():
+    """pe_layout.py on images made here: sections adjacent from the headers
+    on pass; a stripped master build's shape (.text at 0x6000 behind 0x400
+    bytes of headers), a hole between two sections, a SectionAlignment of 0
+    or below a page do not; a VirtualSize of 0 counts SizeOfRawData; and a
+    link whose headers are over one page is refused before any strip."""
+    def image(text, data, alignment=0x1000, headers=0x400, sizes=(0x1800, 0x1800), raw=0):
+        made = bytearray(0x400)
+        made[:2] = b"MZ"
+        struct.pack_into("<I", made, 0x3C, 0x80)
+        made[0x80:0x84] = b"PE\0\0"
+        struct.pack_into("<HH", made, 0x84, 0x14C, 2)                  # i386, two sections
+        struct.pack_into("<H", made, 0x94, 0xE0)                       # SizeOfOptionalHeader
+        struct.pack_into("<H", made, 0x98, 0x10B)                      # PE32
+        struct.pack_into("<II", made, 0x98 + 32, alignment, 0x200)     # SectionAlignment, FileAlignment
+        struct.pack_into("<I", made, 0x98 + 60, headers)               # SizeOfHeaders
+        for index, (name, address, size) in enumerate(((b".text", text, sizes[0]), (b".data", data, sizes[1]))):
+            at = 0x98 + 0xE0 + 40 * index
+            made[at:at + 8] = name.ljust(8, b"\0")
+            struct.pack_into("<III", made, at + 8, size, address, raw)  # VirtualSize, VirtualAddress, SizeOfRawData
+        return bytes(made)
+    assert not pe_layout_gaps(image(0x1000, 0x3000)), "pe_layout_gaps refuses adjacent sections"
+    assert pe_layout_gaps(image(0x6000, 0x8000)), "pe_layout_gaps passes a hole after the headers"
+    assert pe_layout_gaps(image(0x1000, 0x4000)), "pe_layout_gaps passes a hole between sections"
+    assert pe_layout_gaps(image(0x1000, 0x3000, alignment=0)), "pe_layout_gaps passes a SectionAlignment of 0"
+    assert pe_layout_gaps(image(0x200, 0x1A00, alignment=0x200)), "pe_layout_gaps passes an alignment below a page"
+    # VirtualSize 0: the section takes SizeOfRawData (0x1800), so .data follows at 0x3000.
+    assert not pe_layout_gaps(image(0x1000, 0x3000, sizes=(0, 0x1800), raw=0x1800)), \
+        "pe_layout_gaps does not take SizeOfRawData for a VirtualSize of 0"
+    assert pe_layout_gaps(image(0x1000, 0x2000, sizes=(0, 0x1800), raw=0x1800)), \
+        "pe_layout_gaps lets .data overlap a section of VirtualSize 0"
+    # The link: adjacent, headers within one page; and the master link's
+    # shape (0x5200 bytes of headers, .text at 0x6000), adjacent until stripped.
+    assert not link_layout_problems(image(0x1000, 0x3000)), "link_layout_problems refuses a good link"
+    assert not pe_layout_gaps(image(0x6000, 0x8000, headers=0x5200)), "pe_layout_gaps refuses the unstripped master link"
+    assert link_layout_problems(image(0x6000, 0x8000, headers=0x5200)), \
+        "link_layout_problems passes headers over one page"
 
 
 def check_exe(image):
@@ -68,6 +119,76 @@ def check_exe(image):
     # test path, which a release leaves out (MEMORIES_TEST_HOOKS).
     for name in (b"SetProcessDEPPolicy", b"GetProcessDEPPolicy", b"GetSystemDEPPolicy", b"MEMORIES_TEST_EXEC_GUEST"):
         assert name not in image, f"memories-pc.exe contains {name.decode()}"
+
+
+# Where an SDK keeps what the repository calls tools/pc, config/pc and src (tools/pc/model_layout.py).
+SDK_FOLDERS = {"src/": "sdk/include/", "config/pc/": "sdk/config/", "tools/pc/": "sdk/tools/"}
+
+
+def sdk_files(path, root):
+    """{name inside the archive's top folder: bytes} of the SDK's tools/,
+    config/ and include/, in one pass: a .tar.gz is decompressed from its start
+    for every member opened by name (about 1,700 of them here), so it is read
+    once."""
+    prefixes = tuple(f"{root}/sdk/{folder}/" for folder in ("tools", "config", "include"))
+    found = {}
+    if path.suffix == ".zip":
+        with zipfile.ZipFile(path) as archive:
+            for info in archive.infolist():
+                if info.filename.startswith(prefixes) and not info.is_dir() and "memories-guest-ir" not in info.filename:
+                    found[info.filename[len(root) + 1:]] = archive.read(info)
+    else:
+        with tarfile.open(path) as archive:
+            for member in archive:
+                if member.isfile() and member.name.startswith(prefixes) and "memories-guest-ir" not in member.name:
+                    found[member.name[len(root) + 1:]] = archive.extractfile(member).read()
+    return found
+
+
+def check_model_tool(path, root, contents):
+    """The model-migration tool in the SDK (tools/pc/model_sdk.py): its Python,
+    its tables and the C of every native row are there, each as the stamp
+    says, and `model_gate.py mod-check` passes from the SDK unpacked on its
+    own, outside any checkout. Whether the span-word labels were current when
+    it was packed is told (a warning), not asserted: stale labels block nothing.
+    Nothing here reads a disc: the C is the decomp's own, the tables hold
+    offsets, symbols, hashes and labels."""
+    blobs = sdk_files(path, root)
+    assert "sdk/config/model_sdk.json" in blobs, "the SDK has no sdk/config/model_sdk.json (its model tool's stamp)"
+    stamp = json.loads(blobs["sdk/config/model_sdk.json"])
+    for problem in stamp["labels"]["problems"][:1]:
+        print(f"{path.name}: WARNING: the SDK's span-word labels were stale when it was made: {problem}",
+              file=sys.stderr)
+    assert stamp["native_rows"] > 300, f"the SDK's tool knows {stamp['native_rows']} native rows"
+    shipped = {}
+    for name, digest in stamp["files"].items():
+        folder = next((folder for folder in SDK_FOLDERS if name.startswith(folder)), None)
+        assert folder, f"the stamp names {name}, which has no place in the SDK"
+        shipped[name] = SDK_FOLDERS[folder] + name[len(folder):]
+        assert shipped[name] in blobs, f"the SDK lacks {shipped[name]}, which its model tool needs"
+        found = hashlib.sha256(blobs[shipped[name]]).hexdigest()
+        assert found == digest, f"{shipped[name]} is not the file the SDK was stamped with"
+    tools = {name for name in shipped.values() if name.startswith("sdk/tools/")}
+    assert {"sdk/tools/model_gate.py", "sdk/tools/model_migrate.py", "sdk/tools/model_oracle.py",
+            "sdk/tools/model_layout.py", "sdk/tools/yfm_control.py"} <= tools, "the SDK lacks a file of its model tool"
+    modules = [name for name in shipped.values() if name.startswith("sdk/include/native_overlays/") and name.endswith(".c")]
+    assert len(modules) > 1000, f"the SDK has only {len(modules)} of the native modules' C files"
+    assert not any(PurePosixPath(name).suffix.lower() in {".bin", ".cue", ".iso", ".mrg"} for name in shipped.values())
+    with tempfile.TemporaryDirectory(prefix="model-tool-") as work:
+        release = Path(work) / "release"
+        for name, data in blobs.items():   # the SDK's headers (include/) are most of what the C includes
+            target = release / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+        elsewhere = Path(work) / "elsewhere"
+        elsewhere.mkdir()
+        environment = dict(os.environ, PYTHONIOENCODING="utf-8")
+        done = subprocess.run([sys.executable, str(release / "sdk/tools/model_gate.py"), "mod-check"], cwd=elsewhere,
+                              env=environment, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        said = done.stdout + done.stderr
+        assert done.returncode == 0 and "(the SDK's)" in done.stdout, \
+            f"mod-check from the unpacked SDK failed: {said}"
+        print(f"{path.name}: {done.stdout.strip()}")
 
 
 def check_launchers(path, root, contents, windows):
@@ -179,6 +300,7 @@ def check(path, guest_ir_wanted=True):
                 member = archive.getmember(f"{next(iter(roots))}/{guest_ir}")
                 assert member.mode & 0o111, f"{guest_ir} must be executable"
     check_launchers(path, next(iter(roots)), contents, windows)
+    check_model_tool(path, next(iter(roots)), contents)
     shipped = {name: read_member(path, f"{next(iter(roots))}/{name}") for name in sorted(lists)}
     assert all(len(text.split()) > 1000 for text in shipped.values()), "an SDK export list is (nearly) empty"
     if not wide:
@@ -201,6 +323,7 @@ def main():
                         help="archives packed with package.py --no-guest-ir (a pull request's check, where the "
                              "pass was not built): the SDK must not have one")
     args = parser.parse_args()
+    check_layout_guard()
     archives = sorted(args.archives.glob("*.zip")) + sorted(args.archives.glob("*.tar.gz"))
     assert archives, "no release archives found"
     sdks = {path: check(path, not args.no_guest_ir) for path in archives}

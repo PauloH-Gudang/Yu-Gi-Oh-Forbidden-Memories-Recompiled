@@ -33,7 +33,9 @@
 #include "controls_runtime.h"
 #include "update_check.h"
 #include "pc/debug/monitor.h"
+#include "pc/overlays/model_module_class.h"
 #include "pc/saves/deck_menu.h"
+#include "pc/sdk/disc.h"
 #include "pc/text/language.h"
 #ifdef _WIN32
 #include "win32.h"
@@ -119,6 +121,12 @@ enum { MENU_FILE, MENU_VIDEO, MENU_AUDIO, MENU_GAME, MENU_VIEW, MENU_DEBUG, MENU
 #define HELP_ITEMS 6
 #endif
 enum { SUB_SCALE, SUB_MENU_SIZE, SUB_SPEED, SUB_FPS, SUB_CHEATS, SUB_TRACE, SUB_SCALING, SUB_ASPECT, SUB_RESOLUTION, SUB_COLOR, SUB_EFFECTS, SUB_JUMP, SUB_ANTIALIAS, SUB_FILTER, SUB_RANK, SUB_LANGUAGE, SUB_PGXP, SUB_TOUCH, SUB_ROTATION, SUB_HD_FAST, SUB_COUNT };
+#ifdef __ANDROID__
+#define RESOLUTION_ITEMS 3
+#else
+#define RESOLUTION_ITEMS 4 /* with Internal 8x */
+#endif
+#define RESOLUTION_8X_HINT "needs a strong graphics card"
 #ifdef __ANDROID__
 #define VIDEO_ITEMS 16 /* with Screen rotation */
 #else
@@ -256,9 +264,15 @@ static Menu submenus[SUB_COUNT] = {
     {"Aspect Ratio", {{"4:3 aspect", 0, ITEM_RADIO, MENU_ITEM_ASPECT_4_3, SET_ASPECT, 0},
                        {"Square pixels", 0, ITEM_RADIO, MENU_ITEM_ASPECT_SQUARE, SET_ASPECT, 1},
                        {"Widescreen (16:9)", 0, ITEM_RADIO, MENU_ITEM_ASPECT_WIDESCREEN, SET_ASPECT, 2}}, 3},
+    /* 8x is a desktop's: the picture and its copy are 128 MiB each (1 GB with
+     * 8x anti-aliasing), more than OpenGL ES here gives (gl_picture.c). */
     {"Resolution", {{"Console resolution", 0, ITEM_RADIO, 0, SET_INTERNAL_SCALE, 1},
                      {"Internal 2x", 0, ITEM_RADIO, 0, SET_INTERNAL_SCALE, 2},
-                     {"Internal 4x", 0, ITEM_RADIO, 0, SET_INTERNAL_SCALE, 4}}, 3},
+                     {"Internal 4x", 0, ITEM_RADIO, 0, SET_INTERNAL_SCALE, 4}
+#ifndef __ANDROID__
+                     , {"Internal 8x", RESOLUTION_8X_HINT, ITEM_RADIO, 0, SET_INTERNAL_SCALE, 8}
+#endif
+                     }, RESOLUTION_ITEMS},
     /* The present pass (src/pc/render/present_pass.c); 100 is the picture as is. */
     {"Color", {{"Brightness", 0, ITEM_SLIDER, 0, SET_BRIGHTNESS},
                {"Contrast", 0, ITEM_SLIDER, 0, SET_CONTRAST},
@@ -758,15 +772,26 @@ void Menu_DrawText(MenuCanvas *into, int x, int y, const char *text, uint32_t co
 
 int Menu_TextWidth(const char *text) { return text_width(text); }
 
-int Menu_TextWidthScaled(const char *text, int scale) { return text_width(text) * scale / ui; }
+static int text_width_px(const char *text, int px);
+
+int Menu_TextWidthScaled(const char *text, int scale)
+{
+    if (scale & MENU_TEXT_PX_FLAG) return text_width_px(text, scale & 0xFFFF);
+    return text_width(text) * scale / ui;
+}
 /* Characters bigger than the menu's own (Menu_DrawTextScaled at a scale
  * above it: the title's text lines, the side windows), rendered at their
  * size rather than magnified, kept by character and scale until the table
- * fills, when it starts again. */
-typedef struct { uint32_t code; int scale, missing; Glyph glyph; } BigGlyph;
+ * fills, or its coverage reaches BIG_GLYPH_BYTES, when it starts again. The
+ * byte bound is for a mod's text at large pixel sizes (draw_text_px goes to
+ * 512, about 256 KB a glyph): at the title's sizes the table holds well under
+ * a megabyte and only the count clears it. */
+typedef struct { uint32_t code; int px, missing; Glyph glyph; } BigGlyph;
 #define BIG_GLYPHS 1024
+#define BIG_GLYPH_BYTES (8u << 20)
 static BigGlyph big_glyphs[BIG_GLYPHS];
 static int big_count;
+static size_t big_bytes;
 
 static void forget_big_glyphs(void)
 {
@@ -774,36 +799,86 @@ static void forget_big_glyphs(void)
     for (i = 0; i < BIG_GLYPHS; i++) free(big_glyphs[i].glyph.coverage);
     memset(big_glyphs, 0, sizeof(big_glyphs));
     big_count = 0;
+    big_bytes = 0;
 }
 
-static const Glyph *big_glyph_for(uint32_t character, int scale)
+static const Glyph *big_glyph_at(uint32_t character, int px)
 {
-    unsigned slot = (character * 2654435761u + (unsigned)scale * 40503u) & (BIG_GLYPHS - 1);
+    unsigned slot = (character * 2654435761u + (unsigned)px * 40503u) & (BIG_GLYPHS - 1);
     BigGlyph *b;
     for (b = &big_glyphs[slot]; b->code; slot = (slot + 1) & (BIG_GLYPHS - 1), b = &big_glyphs[slot]) {
-        if (b->code == character && b->scale == scale) return b->missing ? NULL : &b->glyph;
+        if (b->code == character && b->px == px) return b->missing ? NULL : &b->glyph;
     }
-    if (big_count * 2 >= BIG_GLYPHS) {
+    if (big_count * 2 >= BIG_GLYPHS || big_bytes >= BIG_GLYPH_BYTES) {
         forget_big_glyphs();
-        slot = (character * 2654435761u + (unsigned)scale * 40503u) & (BIG_GLYPHS - 1);
+        slot = (character * 2654435761u + (unsigned)px * 40503u) & (BIG_GLYPHS - 1);
         b = &big_glyphs[slot];
     }
     b->code = character;
-    b->scale = scale;
+    b->px = px;
     big_count++;
     /* The face is the menu's: at the character's size for this one, then
      * back to the menu's for everything else. */
     FT_Face face = character_face(character);
-    b->missing = FT_Set_Pixel_Sizes(face, 0, (FT_UInt)(13 * scale)) ||
+    b->missing = FT_Set_Pixel_Sizes(face, 0, (FT_UInt)px) ||
                  !FT_Get_Char_Index(face, (FT_ULong)character) ||
                  !render_glyph(face, (FT_ULong)character, &b->glyph);
     FT_Set_Pixel_Sizes(face, 0, FONT_PX);
+    if (!b->missing) big_bytes += (size_t)b->glyph.w * (size_t)b->glyph.h + 1;
     return b->missing ? NULL : &b->glyph;
+}
+
+static const Glyph *big_glyph_for(uint32_t character, int scale) { return big_glyph_at(character, 13 * scale); }
+
+/* Text at any size in pixels (MENU_TEXT_PX): each glyph rendered at that size, advanced by its own advance; a
+ * character the face has no glyph at that size for is the menu-size one, scaled. */
+static int text_width_px(const char *text, int px)
+{
+    int width = 0;
+    if (px < 1) px = 1;
+    if (!font_loaded) return text_width(text) * px / FONT_PX;
+    while (*text) {
+        uint32_t character = Glyphs_NextCharacter(&text);
+        const Glyph *big = font_face ? big_glyph_at(character, px) : NULL;
+        width += big ? big->advance : glyph_for(character)->advance * px / FONT_PX;
+    }
+    return width;
+}
+
+static void draw_text_px(int x, int middle, const char *text, uint32_t color, int px)
+{
+    int baseline;
+    if (px < 1) px = 1;
+    if (!font_loaded) {
+        int previous = ui;
+        ui = (px + 6) / 13 < 1 ? 1 : (px + 6) / 13;
+        draw_bitmap_text(x, middle, text, color);
+        ui = previous;
+        return;
+    }
+    baseline = middle + (font_ascent - font_descent + 1) * px / (2 * FONT_PX);
+    while (*text) {
+        uint32_t character = Glyphs_NextCharacter(&text);
+        const Glyph *g = glyph_for(character), *big = font_face ? big_glyph_at(character, px) : NULL;
+        if (big) {
+            for (int row = 0; row < big->h && big->coverage; row++)
+                for (int col = 0; col < big->w; col++)
+                    put(x + big->left + col, baseline - big->top + row, color, big->coverage[row * big->w + col]);
+            x += big->advance;
+            continue;
+        }
+        for (int row = 0; row < g->h * px / FONT_PX && g->coverage; row++)
+            for (int col = 0; col < g->w * px / FONT_PX; col++)
+                put(x + g->left * px / FONT_PX + col, baseline - g->top * px / FONT_PX + row, color,
+                    g->coverage[(row * FONT_PX / px) * g->w + col * FONT_PX / px]);
+        x += g->advance * px / FONT_PX;
+    }
 }
 
 void Menu_DrawTextScaled(MenuCanvas *into, int x, int middle, const char *text, uint32_t color, int scale)
 {
     canvas = into;
+    if (scale & MENU_TEXT_PX_FLAG) { draw_text_px(x, middle, text, color, scale & 0xFFFF); return; }
     if (scale == ui) { draw_text(x, middle, text, color); return; }
     if (!font_loaded) {
         int previous = ui; ui = scale; draw_bitmap_text(x, middle, text, color); ui = previous; return;
@@ -830,6 +905,39 @@ void Menu_DrawTextScaled(MenuCanvas *into, int x, int middle, const char *text, 
                     g->coverage[(row * ui / scale) * g->w + col * ui / scale]);
         advance += g->advance;
     }
+}
+
+/* The text as a picture: `px` pixels (4 to 512, as MENU_TEXT_PX), white on transparent, straight alpha, a margin of a
+ * few pixels all round for what a glyph reaches past its box. *pixels is malloc'ed (Menu_TextBitmapFree); *middle_row
+ * is the row of the line's vertical middle (what Menu_DrawTextScaled's `middle` is). For a mod that makes pictures of its own (bank sprites) of text at any size. */
+int Menu_TextBitmap(const char *text, int px, uint32_t **pixels, int *width, int *height, int *middle_row)
+{
+    MenuCanvas into;
+    const int ascent = (font_loaded ? font_ascent : 10) * px / (font_loaded ? FONT_PX : 13);
+    const int descent = (font_loaded ? font_descent : 3) * px / (font_loaded ? FONT_PX : 13);
+    int pad, w, h, middle;
+    if (!text || !pixels || px < 4 || px > 512) return 0;
+    pad = px / 4 + 2;
+    w = Menu_TextWidthScaled(text, MENU_TEXT_PX(px)) + 2 * pad;
+    h = ascent + descent + 2 * pad;
+    if (w < 1 || h < 1 || w > 8192 || !(into.pixels = calloc((size_t)w * (size_t)h, sizeof(uint32_t)))) return 0;
+    into.stride = w;
+    into.width = w;
+    into.height = h;
+    into.alpha = 1;
+    /* Menu_DrawTextScaled puts the baseline at middle + (ascent - descent + 1) / 2 of the size's own. */
+    middle = pad + ascent - (ascent - descent + 1) / 2;
+    Menu_DrawTextScaled(&into, pad, middle, text, 0xFFFFFFu, MENU_TEXT_PX(px));
+    *pixels = into.pixels;
+    if (width) *width = w;
+    if (height) *height = h;
+    if (middle_row) *middle_row = middle;
+    return 1;
+}
+
+void Menu_TextBitmapFree(uint32_t *pixels)
+{
+    free(pixels);
 }
 
 void Menu_LoadSettingsWithoutMods(void)
@@ -863,6 +971,10 @@ void Menu_LoadSettingsWithoutMods(void)
 
 void Menu_LoadMods(void)
 {
+    /* Which mods' models still need the MIPS interpreter, and which a code
+     * mod's C runs (model_module_class.h, mod API 29). */
+    ModelModule_SetModRows(Memories_ModelModRowOwner);
+    Mods_SetModuleCheck(ModelModule_StagesMips, Memories_DiscReadSectorsUntracked, ModelModule_DiscShape);
     Mods_Load(); /* the mods the settings say are applied, once they are read */
 }
 
@@ -1014,6 +1126,90 @@ void Menu_SetPlatformItems(int windows, int window_modes, int update_check)
 
 static int hd_picture, present_pass = 1;
 
+/* Video > Resolution rows. A scale the picture could not be made at
+ * (Memories_ScaleRefused) is dimmed with the reason beside it, and so is every
+ * scale above it; the scale that runs instead is the one shown as chosen
+ * (item_state), the saved setting being left as it was so that the next start
+ * tries again, say after a driver update or with another program closed.
+ * Internal 8x is for the OpenGL picture pass: with no pass (the X11 backend,
+ * MEMORIES_GL_PICTURE=0, an older GL) the software GPU would draw every
+ * primitive 64 times, far too slow to play, so the row says what it needs
+ * instead of "needs a strong graphics card". */
+static int refused_why[9];   /* by scale: 0, or MEMORIES_REFUSED_* */
+static int scale_ceiling = 8; /* the highest scale that works this session */
+
+static const char *refused_text(int why)
+{
+    return why == MEMORIES_REFUSED_SIZE ? "too large for this graphics card"
+         : why == MEMORIES_REFUSED_ES ? "not with OpenGL ES" : "no room on this graphics card";
+}
+
+static void update_resolution_rows(void)
+{
+    Menu *m = &submenus[SUB_RESOLUTION];
+    int i;
+    for (i = 0; i < m->count; i++) {
+        Item *item = &m->items[i];
+        int scale = item->value;
+        if (item->setting != SET_INTERNAL_SCALE || scale < 2 || scale > 8) continue;
+        if (refused_why[scale]) {
+            item->shortcut = refused_text(refused_why[scale]);
+            item->flags |= ITEM_DISABLED;
+        } else if (scale == 8 && !hd_picture) {
+            item->shortcut = "needs OpenGL 3";
+            item->flags |= ITEM_DISABLED;
+        } else {
+            item->shortcut = scale == 8 ? RESOLUTION_8X_HINT : NULL;
+            item->flags &= ~ITEM_DISABLED;
+        }
+    }
+}
+
+/* One notice for what was refused, shown as soon as no other is up
+ * (Menu_TakeChanged). A second refusal before it is shown (8x, then 4x) is
+ * told in the same notice. */
+static int notice_top, notice_low, notice_why, notice_fallback;
+
+void Menu_ScaleRefused(int refused, int fallback, int why)
+{
+    int scale;
+    for (scale = refused; scale <= 8; scale++) {
+        if (scale >= 2 && !refused_why[scale]) refused_why[scale] = why;
+    }
+    scale_ceiling = fallback;
+    update_resolution_rows();
+    if (!notice_top) {
+        notice_top = refused;
+        notice_why = why;
+    }
+    notice_low = refused;
+    notice_fallback = fallback;
+    LOG(LOG_MENU, "internal %dx refused (%s), running at %dx", refused, refused_text(why), fallback);
+    changed = 1;
+}
+
+static void tell_scale_refused(void)
+{
+    static const char *const ok[] = {"OK"};
+    char text[320], what[160], now[64];
+    if (!notice_top || Menu_NoticeShown()) return;
+    if (notice_top != notice_low) {
+        snprintf(what, sizeof(what), "This graphics card could not make Internal %dx or %dx", notice_top, notice_low);
+    } else if (notice_why == MEMORIES_REFUSED_SIZE) {
+        snprintf(what, sizeof(what), "This graphics card cannot make a picture as large as Internal %dx", notice_top);
+    } else if (notice_why == MEMORIES_REFUSED_ES) {
+        snprintf(what, sizeof(what), "OpenGL ES does not do Internal %dx", notice_top);
+    } else {
+        snprintf(what, sizeof(what), "This graphics card has no room for Internal %dx", notice_top);
+    }
+    if (notice_fallback < 2) snprintf(now, sizeof(now), "the console's resolution");
+    else snprintf(now, sizeof(now), "Internal %dx", notice_fallback);
+    snprintf(text, sizeof(text), "%s, so the game runs at %s for now. Your setting stays, and the next start tries again.",
+             what, now);
+    Menu_ShowNotice("Internal resolution lowered", text, ok, 1, 0, NULL);
+    notice_top = notice_low = 0;
+}
+
 /* An item's reason beside it, and dimmed while it has one. Only a row
  * dimmed here is enabled again (these rows have no shortcut of their own):
  * a backend may dim one for good (x11.c, Sharp bilinear). */
@@ -1081,6 +1277,7 @@ static void update_hd_items(void)
 #else
     update_effect_items(console, "needs OpenGL 3");
 #endif
+    update_resolution_rows();
 }
 
 void Menu_SetHdPicture(int on)
@@ -1391,6 +1588,10 @@ static int item_state(const Item *item)
     if (item->id == RADIO_STATE_SLOT) return Platform_StateSlot() == item->value;
     if (item->id == CHECK_TRACE) return Log_Enabled((LogChannel)item->value);
     if (item->setting >= 0 && item->kind == ITEM_CHECK) return Settings_Get(item->setting) != 0;
+    if (item->setting == SET_INTERNAL_SCALE && item->kind == ITEM_RADIO) {
+        int scale = Settings_Get(item->setting); /* the one that runs, when the saved one did not fit */
+        return (scale > scale_ceiling ? scale_ceiling : scale) == item->value;
+    }
     if (item->setting >= 0 && item->kind == ITEM_RADIO) return Settings_Get(item->setting) == item->value;
     return 0;
 }
@@ -1580,6 +1781,7 @@ int Menu_TakeChanged(void)
 {
     int was;
     tell_settings_error();
+    tell_scale_refused();
     was = changed;
     changed = 0;
     return was;

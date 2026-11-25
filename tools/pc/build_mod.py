@@ -214,7 +214,41 @@ def objcopy_for(clang):
 def clang_candidates(named):
     """The compilers build_mod.py tries, in order (programs): `named`
     (MEMORIES_MOD_CC) alone when set."""
-    return [named] if named else [os.path.join(LLVM_MINGW, "clang"), "clang", "gcc"]
+    return [named] if named else [*one_click_clangs(), os.path.join(LLVM_MINGW, "clang"), "clang", "gcc"]
+
+
+def one_click_clangs():
+    """The clang of the llvm-mingw the SDK's one-click build (build-mod.bat,
+    build-mod.sh) fetched into sdk/toolchain/llvm-mingw-<the pinned release>,
+    so that the SDK's other tools that compile with this module's compiler
+    (model_gate.py mod-migrate) find the one the launcher builds with, run
+    on their own. Only when it starts here: an SDK folder that was copied or
+    shared from the other system holds that system's clang, which would stop
+    the build with "not a valid Win32 application" where PATH has a good one
+    (the next candidates then). None in the repository, whose own is LLVM_MINGW. A
+    MEMORIES_SDK_TOOLCHAIN (the launchers' own variable: a folder with clang
+    in it, or in its bin/, for a system where the download does not run)
+    is the one then (before PATH), as it is for the launchers."""
+    if not SHIPPED:
+        return []
+    own = os.environ.get("MEMORIES_SDK_TOOLCHAIN")
+    if own:
+        return [os.path.join(os.path.join(own, "bin") if os.path.isdir(os.path.join(own, "bin")) else own, "clang")]
+    # clang.exe on Windows and clang elsewhere, not whichever is there: under WSL the Windows
+    # clang.exe starts (interop) and then cannot compile a /mnt path.
+    program = os.path.join(SDK, "toolchain", f"llvm-mingw-{LLVM_MINGW_RELEASE}", "bin",
+                           "clang.exe" if os.name == "nt" else "clang")
+    return [program] if os.path.isfile(program) and clang_starts(program) else []
+
+
+@functools.lru_cache(maxsize=None)
+def clang_starts(path):
+    """Whether `path --version` runs (a program of another system, or a file
+    that is not one, does not)."""
+    try:
+        return subprocess.run([path, "--version"], capture_output=True, timeout=60).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def resolve(candidate):
@@ -499,6 +533,28 @@ def settings_digest(directory, extra_flags, target="i386"):
 LINE_MARKER = re.compile(rb'^(#(?: line)? \d+) "((?:[^"\\]|\\.)*)"', re.M)
 
 
+# A unit that asks to be built as the game builds the port's C (the units
+# model_gate.py mod-migrate writes around the port's C): unoptimized, with
+# wrapping arithmetic and no type-based alias analysis, build_game32.py's
+# CFLAGS. The decomp's C counts on them: shape 109's writes a fourth entry
+# of a three-entry local array, which only an -O0 frame lays out as the
+# PS1's (notes/modding.md). The marker is in the source's first KiB (a
+# comment); a flagged unit's preprocessed copy is remembered here, so the
+# object is compiled from it with the same flags.
+GAME_FLAGS_MARKER = b"memories-build: game-flags"
+GAME_FLAGS = ["-O0", "-fwrapv", "-fno-strict-aliasing"]
+_game_units = set()
+
+
+def unit_flags(source):
+    """GAME_FLAGS for a source that names GAME_FLAGS_MARKER in its first KiB, else none."""
+    try:
+        with open(source, "rb") as handle:
+            return list(GAME_FLAGS) if GAME_FLAGS_MARKER in handle.read(1024) else []
+    except OSError:
+        return []
+
+
 def inputs_key(directory, sources, extra_flags, into, target="i386"):
     """The key an object is kept under in tmp/pc/mod-build: settings_digest
     and each source after the preprocessor, which takes in every header it
@@ -515,10 +571,15 @@ def inputs_key(directory, sources, extra_flags, into, target="i386"):
     digest = settings_digest(directory, extra_flags, target)
     started = time.time()
     preprocessed = [os.path.join(into, os.path.basename(source) + ".i") for source in sources]
+    own = [unit_flags(source) for source in sources]
     with concurrent.futures.ThreadPoolExecutor(len(sources)) as pool:
-        list(pool.map(lambda pair: run(cc + flags + ["-E", pair[0], "-o", pair[1]]), zip(sources, preprocessed)))
+        list(pool.map(lambda job: run(cc + flags + job[2] + ["-E", job[0], "-o", job[1]]),
+                      zip(sources, preprocessed, own)))
     read, unnamed = set(), False
-    for source, path in zip(sources, preprocessed):
+    for source, path, extra in zip(sources, preprocessed, own):
+        if extra:
+            _game_units.add(os.path.abspath(path))
+            digest.update(b"game-flags\0" + " ".join(extra).encode() + b"\0")
         with open(path, "rb") as handle:
             text = handle.read().replace(b"\r\n", b"\n")   # clang on Windows writes CRLF
         for match in LINE_MARKER.finditer(text):
@@ -617,6 +678,16 @@ def compile_object(sources, output, objects_dir, extra_flags=(), target="i386"):
     os.makedirs(os.path.dirname(os.path.abspath(output)), exist_ok=True)
     clang = True if target == TRANSLATED else programs()[1]
     entry = False
+    own = [GAME_FLAGS if os.path.abspath(source) in _game_units else [] for source in sources]
+    defined = set()
+    if target == TRANSLATED:
+        # Every module-range name any unit defines, before any is translated:
+        # one unit's own copy is never pinned in another (module_pins).
+        for index, source in enumerate(sources):
+            raw = os.path.join(objects_dir, os.path.basename(source) + ".defs.ll")
+            run(cc + flags + [*extra_flags, *own[index], "-S", "-emit-llvm", source, "-o", raw])
+            with open(raw, encoding="utf-8") as handle:
+                defined |= module_definitions(handle.read())
     for index, source in enumerate(sources):
         obj = os.path.join(objects_dir, os.path.basename(source) + ".o")
         # clang names the compile unit after the file it compiles, here the
@@ -626,12 +697,12 @@ def compile_object(sources, output, objects_dir, extra_flags=(), target="i386"):
         # the first line marker instead, the source's, as GCC does.
         named = ["-Xclang", "-main-file-name", "-Xclang", source] if clang and "cpp-output" in extra_flags else []
         if target == "aarch64":
-            through_pass(cc + flags + [*extra_flags, *named], source, obj)
+            through_pass(cc + flags + [*extra_flags, *named, *own[index]], source, obj)
         elif target == TRANSLATED:
-            if translate_unit(cc + flags + [*extra_flags, *named], source, obj, index):
+            if translate_unit(cc + flags + [*extra_flags, *named, *own[index]], source, obj, index, defined):
                 entry = True
         else:
-            run(cc + flags + [*extra_flags, *named, "-c", source, "-o", obj])
+            run(cc + flags + [*extra_flags, *named, *own[index], "-c", source, "-o", obj])
         objects.append(obj)
     if target == TRANSLATED:
         if not entry:
@@ -1015,9 +1086,10 @@ def check_signatures(found, expected, source):
     return has_entry
 
 
-def translate_unit(command, source, obj, index):
+def translate_unit(command, source, obj, index, mod_defined=()):
     """An aarch64-translated unit (above): to IR, through the guest pass,
     then to the object with the translated game's own object flags.
+    `mod_defined`: the module-range names the mod's units define (module_pins).
     Returns whether it defines MemoriesModInit."""
     context = translation_context()
     raw = obj[:-2] + ".raw.ll"
@@ -1028,8 +1100,8 @@ def translate_unit(command, source, obj, index):
                       drop_definitions=[], export_functions=[])
     entry = check_signatures(guest_pass("inspect", text)["signatures"], context["signatures"], source)
     text = guest_pass("normalize", text, renames=context["runtime"], drop_definitions=[], export_functions=[])
-    text = guest_pass("translate", text, pins=context["pins"], registration=f"MemoriesModRegisterUnit_{index}",
-                      mod_unit=True)
+    text = guest_pass("translate", text, pins=module_pins(text, context["pins"], mod_defined),
+                      registration=f"MemoriesModRegisterUnit_{index}", mod_unit=True)
     ir = obj[:-2] + ".ll"
     with open(ir, "w", encoding="utf-8", newline="\n") as handle:
         handle.write(text)
@@ -1202,12 +1274,74 @@ def undefined_names(output):
     return undefined
 
 
+# A data name of a model control module's range (D_8013Axxx to D_8013Fxxx,
+# D_8017Axxx to D_8017Fxxx): a record's own data where the game loaded it,
+# which a mod's C for the module (mod API 29) reads as the port's does. A
+# fixed-memory game binds any such name to its address (mods.c, resolve), so
+# it needs no export; func_ names in the ranges are MIPS and never bound.
+MODULE_DATA = re.compile(r"^D_801[37][A-F][0-9A-F]{3}$")
+
+
+def module_data(name):
+    """Whether the game binds `name` by its address (MODULE_DATA, in range)."""
+    if not MODULE_DATA.match(name):
+        return False
+    address = int(name[2:], 16)
+    return 0x8013A000 <= address < 0x80140000 or 0x8017A000 <= address < 0x80180000
+
+
+# A global of a unit's LLVM IR: its name and what follows "=" (the linkage
+# first: "external" for a declaration).
+IR_GLOBAL = re.compile(r'^@"?([\w.$]+)"? = (\S+)', re.M)
+
+
+def module_definitions(text):
+    """The module-range data names (module_data) a unit's LLVM IR defines."""
+    return {name for name, linkage in IR_GLOBAL.findall(text) if module_data(name) and linkage != "external"}
+
+
+def module_pins(text, pins, mod_defined=()):
+    """The pins a translated unit (aarch64-translated here, macOS in
+    build_mod_arm64.py) goes through the guest pass with: `pins` (the
+    game's pinned data), plus each module-range data name (module_data) the
+    unit declares and does not define, pinned to its address as the game's
+    own data is, so the C reads the record where the game loaded it. A
+    module-range name the unit defines is left out, even one the game pins:
+    the pass replaces every global of a pinned name, a definition too, and
+    the mod's own copy must stay its own; so is one another of the mod's
+    units defines (`mod_defined`), which the unit then reaches as the mod's.
+    """
+    declared, defined = set(), set(mod_defined)
+    for name, linkage in IR_GLOBAL.findall(text):
+        if module_data(name):
+            (declared if linkage == "external" else defined).add(name)
+    if not declared and not defined:
+        return pins
+    pins = {name: address for name, address in pins.items() if name not in defined}
+    for name in declared - defined:
+        pins.setdefault(name, int(name[2:], 16))
+    return pins
+
+
 def check(output, games, undefined=None, target="i386"):
     """What the object leaves undefined must be there on every game build
     of its target. Returns whether any build (or list) was there to check
     against."""
     if undefined is None:
         undefined = undefined_names(output)
+    bound = {name for name in undefined if module_data(name)}
+    if bound and target == TRANSLATED:
+        # The guest pass pins every module-range name a unit declares
+        # (module_pins), so the object has none left undefined; one that is
+        # would reach no data, since the translated game binds none by name.
+        exports = set()
+        for build in games:
+            exports |= provided(build, target) or set()
+        missing = sorted(bound - exports)
+        if missing:
+            sys.exit(f"build_mod: {output}: the {TRANSLATED} object leaves a model module's data undefined, which "
+                     f"the guest pass should have pinned to its address: {' '.join(missing)}")
+    undefined = set(undefined) - bound
     for bad, why in (("_GLOBAL_OFFSET_TABLE_", "it is position-independent"),
                      ("__stack_chk_fail", "it uses the stack protector"),
                      ("__stack_chk_fail_local", "it uses the stack protector")):
