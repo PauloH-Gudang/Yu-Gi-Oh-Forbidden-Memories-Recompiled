@@ -826,6 +826,35 @@ int main(void)
         CHECK(strstr(why, "more than 256 mods") != NULL);
         CHECK(!exists("mods/m000"));
     }
+    /* Mods_ImportIsLink (a modpack's export leaves links out): a folder is
+     * not one; a link to it is, a junction on Windows. */
+    {
+        char target[2048], link[2048];
+        int made;
+        snprintf(target, sizeof(target), "%s/link-target", root);
+        snprintf(link, sizeof(link), "%s/link", root);
+        CHECK(!mkdir(target, 0777) && !Mods_ImportIsLink(target) && !Mods_ImportIsLink(zip));
+#ifdef _WIN32
+        {
+            wchar_t line[5000], *a = Memories_Utf8ToWide(link), *b = Memories_Utf8ToWide(target);
+            for (wchar_t *at = a; at && *at; at++) if (*at == L'/') *at = L'\\';
+            for (wchar_t *at = b; at && *at; at++) if (*at == L'/') *at = L'\\';
+            _snwprintf(line, sizeof(line) / sizeof(line[0]), L"mklink /J \"%ls\" \"%ls\" >nul", a, b);
+            line[sizeof(line) / sizeof(line[0]) - 1] = 0;
+            made = a && b && !_wsystem(line);
+            free(a);
+            free(b);
+        }
+#else
+        made = !symlink(target, link);
+#endif
+        CHECK(made && Mods_ImportIsLink(link));
+#ifdef _WIN32
+        rmdir(link); /* the junction alone, not what it points at */
+#else
+        unlink(link);
+#endif
+    }
     Mods_ImportRemoveTree(root);
     if (failures)
         fprintf(stderr, "%d checks failed\n", failures);

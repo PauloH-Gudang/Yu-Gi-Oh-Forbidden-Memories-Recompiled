@@ -80,6 +80,9 @@ int Mods_ImportFolderId(const char *directory, char *id, size_t size);
  * the loader tell it), read as cheaply: 1, else 0 (not, or no mod.json).
  * The manifest's name, else its id, else the folder's name, in `name`. */
 int Mods_ImportFolderCode(const char *directory, char *name, size_t size);
+/* Whether `path` is a link that stat would follow: a symbolic link (lstat),
+ * or on Windows any reparse point, a junction too (Memories_IsLink). */
+int Mods_ImportIsLink(const char *path);
 /* Removes what an import cut short left in the mods folder (".import-*"
  * folders and ".incoming*.zip" files). An old mod it had moved aside for a
  * new one that never got in (the process ended between the two renames) goes

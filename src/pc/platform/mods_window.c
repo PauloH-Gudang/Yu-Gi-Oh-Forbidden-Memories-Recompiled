@@ -1520,7 +1520,7 @@ static long long export_size(const char *directory)
         char path[1200];
         struct stat info;
         if (export_skipped(e->d_name) || (size_t)snprintf(path, sizeof(path), "%s/%s", directory, e->d_name) >= sizeof(path) ||
-            stat(path, &info))
+            Mods_ImportIsLink(path) || stat(path, &info))
             continue;
         sum += S_ISDIR(info.st_mode) ? export_size(path) : (long long)info.st_size;
     }
@@ -1537,6 +1537,10 @@ static int export_tree(ModsZipOut *zip, Text *files, const char *directory, cons
         char path[1200], name[1200], hex[65];
         struct stat info;
         if (export_skipped(e->d_name))
+            continue;
+        /* A link or a junction is left out: followed, it could loop, or
+         * pack files from outside the mod's folder (export_size skips it too). */
+        if ((size_t)snprintf(path, sizeof(path), "%s/%s", directory, e->d_name) < sizeof(path) && Mods_ImportIsLink(path))
             continue;
         if (__atomic_load_n(&export_job.cancel, __ATOMIC_RELAXED)) {
             snprintf(why, size, "Export stopped.");

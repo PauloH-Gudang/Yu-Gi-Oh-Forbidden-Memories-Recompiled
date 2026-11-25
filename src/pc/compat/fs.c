@@ -65,6 +65,16 @@ int Memories_Open(const char *path, int flags, ...)
     return result;
 }
 
+int Memories_IsLink(const char *path)
+{
+    wchar_t *wide = Memories_Utf8ToWide(path);
+    DWORD attributes;
+    if (!wide) return 0;
+    attributes = GetFileAttributesW(wide);
+    free(wide);
+    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+}
+
 int Memories_Access(const char *path, int mode)
 {
     wchar_t *wide = Memories_Utf8ToWide(path);

@@ -796,6 +796,16 @@ int Mods_ImportFolderId(const char *directory, char *id, size_t size)
     return 1;
 }
 
+int Mods_ImportIsLink(const char *path)
+{
+#ifdef _WIN32
+    return Memories_IsLink(path);
+#else
+    struct stat info;
+    return !lstat(path, &info) && S_ISLNK(info.st_mode);
+#endif
+}
+
 int Mods_ImportFolderCode(const char *directory, char *name, size_t size)
 {
     char path[2048], error[128];

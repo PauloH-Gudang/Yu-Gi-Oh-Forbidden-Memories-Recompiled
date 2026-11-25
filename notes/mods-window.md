@@ -525,6 +525,10 @@ it was.
   It is not a signature: the list travels in the same `.zip` as the files,
   so it says nothing about who made the pack. A folder without
   `modpack.json` (made by hand) is read unchecked.
+- **Export** packs each ticked mod's folder as it is on disk, but leaves out
+  symbolic links and (Windows) junctions or any other reparse point
+  (`Mods_ImportIsLink`): followed, one could loop or pack files from
+  outside the mod's folder.
 - **Import** unpacks into a hidden `modpacks/.importing-*` folder, which
   takes the pack's name only once everything, `modpack.json` included, is
   in it; a failed or stopped import removes it, and the next import sweeps
