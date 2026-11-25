@@ -1187,11 +1187,12 @@ static struct {
     unsigned done;                /* atomic: bytes unpacked (Mods_ImportWatch) */
     unsigned long long total;     /* atomic: all of them */
     int shown, count;             /* the permille last drawn; the mods in it */
-    char zip[1100], name[128], why[400];
+    char zip[1100], why[400];     /* the window's thread writes zip before the thread starts */
+    char name[128];               /* the pack's folder: the thread's own copy, put here before `finished` */
 } import_job;
 static void *pack_import_step(void *unused)
 {
-    char dir[1024], dest[1200], temp[1200], path[1300], why[400] = "";
+    char dir[1024], dest[1200], temp[1200], path[1300], why[400] = "", name[128];
     const char *base = import_job.zip, *s;
     ModsImport *import = NULL;
     int ok = 0, made = 0;
@@ -1206,7 +1207,7 @@ static void *pack_import_step(void *unused)
         if (n >= sizeof(plain)) n = sizeof(plain) - 1;
         memcpy(plain, base, n);
         plain[n] = 0;
-        folder_name(import_job.name, sizeof(import_job.name), plain);
+        folder_name(name, sizeof(name), plain);
     }
     if (Mods_ModpackDirectory(dir, sizeof(dir))) {
         snprintf(why, sizeof(why), "Could not make the modpacks folder.");
@@ -1240,7 +1241,7 @@ static void *pack_import_step(void *unused)
         if ((got = Mods_ImportExtract(import, "modpack.json", path, why, sizeof(why))) < 0) goto done;
         if (got && (info = Json_ParseFile(path, error, sizeof(error)))) {
             const char *named = Json_String(Json_Member(Json_Root(info), "name"), "");
-            if (*named) folder_name(import_job.name, sizeof(import_job.name), named);
+            if (*named) folder_name(name, sizeof(name), named);
             Json_Free(info);
         }
     }
@@ -1254,11 +1255,11 @@ static void *pack_import_step(void *unused)
     {   /* a name not taken: "Name", "Name 2"...; then the folder is it */
         char base_name[128];
         struct stat info;
-        snprintf(base_name, sizeof(base_name), "%s", import_job.name);
+        snprintf(base_name, sizeof(base_name), "%s", name);
         for (int k = 2;; k++) {
-            snprintf(dest, sizeof(dest), "%s/%s", dir, import_job.name);
+            snprintf(dest, sizeof(dest), "%s/%s", dir, name);
             if (stat(dest, &info)) break;
-            snprintf(import_job.name, sizeof(import_job.name), "%.100s %d", base_name, k);
+            snprintf(name, sizeof(name), "%.100s %d", base_name, k);
         }
     }
     if (rename(temp, dest)) {
@@ -1271,6 +1272,7 @@ done:
     if (!ok && made) Mods_ImportRemoveTree(temp);
     if (!ok && __atomic_load_n(&import_job.cancel, __ATOMIC_RELAXED)) snprintf(why, sizeof(why), "Import stopped.");
     snprintf(import_job.why, sizeof(import_job.why), "%s", why);
+    snprintf(import_job.name, sizeof(import_job.name), "%s", name); /* read once `finished` is seen */
     __atomic_store_n(&import_job.ok, ok, __ATOMIC_RELAXED);
     __atomic_store_n(&import_job.finished, 1, __ATOMIC_RELEASE);
     return NULL;
@@ -1341,7 +1343,12 @@ static void import_bar(MenuCanvas *c, Rect r)
     fill(c, rect(r.x, r.y, (int)((long long)r.w * percent / 100), r.h), 0x2f6f4fu);
     put(line, sizeof(line), "%d%%", percent);
     text(c, r.x + r.w - pw, r.y + r.h / 2, pw, line, TEXT);
-    put(line, sizeof(line), "Importing %s...", import_job.name[0] ? import_job.name : "the modpack");
+    {   /* the .zip's name: import_job.name is the thread's until it ends */
+        const char *base = import_job.zip;
+        for (const char *s = import_job.zip; *s; s++)
+            if (*s == '/' || *s == '\\') base = s + 1;
+        put(line, sizeof(line), "Importing %s...", *base ? base : "the modpack");
+    }
     text(c, r.x + 10 * unit, r.y + r.h / 2, r.w - pw - 16 * unit, line, TEXT);
 }
 
