@@ -24,6 +24,8 @@
  *   locked-first a locked pack: its mods on; the player turns one off
  *   locked-again its mods on again, its values again; the player imports
  *                Late (its manifest says on), which comes in off
+ *   save-fails   Pack, with settings that cannot be saved: putting the
+ *                player's own back fails, and the file they are in is kept
  *   normal-late  no modpack: as normal, and Late is still off
  */
 #define main original_mods_test
@@ -294,6 +296,23 @@ static void locked_again(void)
     assert(Settings_Save());
 }
 
+/* Pack, after Locked's session, with a settings file that cannot be saved
+ * (its path is a folder): putting the player's own back fails, so the file
+ * they are in must stay as it is, Locked's, and not be replaced by one
+ * holding what is in the settings now. */
+static void save_fails(void)
+{
+    char path[1024], line[256];
+    FILE *file;
+    snprintf(path, sizeof(path), "%s/user/settings-folder", root);
+    assert(!setenv("MEMORIES_SETTINGS", path, 1));
+    launch();
+    snprintf(path, sizeof(path), "%s/user/modpacks/.normal-settings", root);
+    assert((file = fopen(path, "rb")));
+    assert(fgets(line, sizeof(line), file) && !strncmp(line, "modpack=Locked", 14));
+    fclose(file);
+}
+
 static void normal_late(void) { normal_launch(1); }
 
 static int run_step(const char *self, const char *step)
@@ -349,6 +368,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[1], "locked-first")) locked_first();
         else if (!strcmp(argv[1], "locked-again")) locked_again();
         else if (!strcmp(argv[1], "normal-late")) normal_late();
+        else if (!strcmp(argv[1], "save-fails")) save_fails();
         else {
             fprintf(stderr, "modpack_test: unknown step \"%s\"\n", argv[1]);
             return 2;
@@ -407,6 +427,9 @@ int main(int argc, char **argv)
     choose("Locked");
     step(argv[0], "locked-first");
     step(argv[0], "locked-again");
+    make_dir("user/settings-folder");
+    choose("Pack");
+    step(argv[0], "save-fails");
     choose(NULL);
     step(argv[0], "normal-late");
     puts("modpack: ok");

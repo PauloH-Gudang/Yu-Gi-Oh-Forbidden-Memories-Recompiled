@@ -557,7 +557,11 @@ it was.
   again), saved, and the file removed. One kind stays: a mod's on/off
   `mod.<id>` that is 0, since off is the safe choice; a mod imported during
   the pack's session (written off by the import) so stays off until the
-  player turns it on, instead of following its manifest's `"enabled"`. So what a pack wrote, and what the
+  player turns it on, instead of following its manifest's `"enabled"`.
+  The saved file is never replaced: one already there when a pack's launch
+  would save means putting it back failed (out of memory, or the settings
+  could not be saved), so it is kept, still the player's own, and the next
+  launch tries again. So what a pack wrote, and what the
   player changed while it ran, never reaches the normal mods. When the
   settings cannot be saved aside, the pack is not read (the normal mods are,
   and the window says why).

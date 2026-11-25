@@ -5198,15 +5198,20 @@ static void normal_settings_line(const char *key, int value, void *file)
     if (!strncmp(key, "mod.", 4)) fprintf(file, "%s=%d\n", key, value);
 }
 /* Saves the player's own `mod.` settings before the pack `pack` writes its
- * own: 0, or -1 when they could not be (the pack is then not read). */
+ * own: 0, or -1 when they could not be (the pack is then not read). A saved
+ * file already there is kept, never replaced: it is there only when putting
+ * it back failed (normal_settings_restore), so the settings now are another
+ * pack's, and the file is still the one place the player's own are. */
 static int normal_settings_save(const char *pack)
 {
     char dir[PATH_MAX_], path[PATH_MAX_], temporary[PATH_MAX_ + 8];
     FILE *file;
     int failed;
     if (Mods_ModpackDirectory(dir, sizeof(dir)) || Paths_MakeDirs(dir) ||
-        normal_settings_path(path, sizeof(path)) ||
-        (size_t)snprintf(temporary, sizeof(temporary), "%s.tmp", path) >= sizeof(temporary) ||
+        normal_settings_path(path, sizeof(path)))
+        return -1;
+    if (!access(path, 0)) return 0;
+    if ((size_t)snprintf(temporary, sizeof(temporary), "%s.tmp", path) >= sizeof(temporary) ||
         !(file = fopen(temporary, "wb")))
         return -1;
     fprintf(file, "modpack=%s\n", pack);
