@@ -112,6 +112,10 @@ void ModsWindow_SetModpackPicker(int (*pick)(int kind, char *why, size_t why_siz
  * the game exits; so do an export's and Activate's. For the tests: `stepped`
  * is called after each chunk an import unpacks (Mods_ImportStepped). */
 void ModsWindow_SetModpackStepped(void (*stepped)(void));
+/* The Modpack tab's jobs stopped now, as when the window closes: each is
+ * cancelled, its thread joined and its partial file removed. Platform_RestartGame
+ * calls it first: a restart replaces the process without running atexit. */
+void ModsWindow_StopJobs(void);
 /* Suggested export path, held in a static buffer until the next call. */
 const char *ModsWindow_ExportSuggestion(void);
 /* UTF-8 clipboard callbacks: 1 on success, 0 on failure/insufficient room.

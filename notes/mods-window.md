@@ -535,13 +535,15 @@ it was.
   any that a killed process left. So a cut-off import never looks like a
   folder made by hand.
 - **Its jobs** (Import..., Export..., Activate modpack's reading) run on
-  threads of their own with a bar and Stop. Restart is refused while one
-  runs (the status line says to wait or stop it). Closing the window, or
-  the game quitting (`exit`, through `atexit`), stops a running one and
-  joins its thread, which removes what it had made (the import's hidden
-  folder, the export's `.zip`). A restart from elsewhere (Language) ends the
-  process without that; an import's hidden folder is swept by the next
-  import.
+  threads of their own with a bar and Stop. Restart, and an Apply on the
+  Mods tab that restarts, are refused while one runs (the status line says
+  to wait or stop it). Closing the window, the game quitting (`exit`,
+  through `atexit`), or any restart (`Platform_RestartGame` calls
+  `ModsWindow_StopJobs` first, since the restart replaces the process
+  without `atexit`: Language and every other caller) stops a running
+  one and joins its thread, which removes what it had made (the import's
+  hidden folder, the export's `.zip`). A killed process leaves an import's
+  hidden folder, which the next import sweeps.
 - **Its settings are its own.** A pack's mods use the same `mod.<id>` and
   `mod.<id>.<key>` settings as the normal mods, so before a pack's launch
   writes any, every `mod.` setting the player has is saved in

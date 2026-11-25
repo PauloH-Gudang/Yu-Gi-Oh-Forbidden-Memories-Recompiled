@@ -2661,6 +2661,7 @@ static void pack_jobs_stop(void)
         prep.running = 0;
     }
 }
+void ModsWindow_StopJobs(void) { pack_jobs_stop(); }
 void ModsWindow_SetModpackStepped(void (*stepped)(void)) { pack_stepped = stepped; }
 /* Restart (the footer's, or Restart to activate): asked once, then done. */
 static void pack_restart_press(void)
@@ -2988,6 +2989,12 @@ static void apply(void)
     int restart = needs_restart(), old_ranks[MODS_MAX], *old_values[MODS_MAX] = {0};
     if (!changed() && !folder_restart()) {
         snprintf(status, sizeof(status), "No pending changes");
+        return;
+    }
+    if (restart && (import_job.running || export_job.running || prep.running)) {
+        pending = 0; /* the Modpack tab's job would be cut off (pack_restart_press) */
+        put(status, sizeof(status), "Wait for the modpack %s to finish, or stop it, before applying changes.",
+            import_job.running ? "import" : export_job.running ? "export" : "check");
         return;
     }
     if (restart && pending != 1) {

@@ -1715,18 +1715,12 @@ static int modpacks_left(void)
     closedir(directory);
     return n;
 }
-static void test_modpack_close(void)
+/* Import... on the Modpack tab, waited for until it has unpacked a chunk. */
+static void pack_import_start(void)
 {
-    static char big[4u << 20];
-    ZipItem items[3] = {{"cut/mod.json", "{\"id\":\"cut\",\"name\":\"Cut\"}", 0, 0, 0, 0, 0, 0},
-                        {"cut/big.bin", big, 0, 0, 0, 0, 0, 0},
-                        {"modpack.json", "{\"name\":\"Cut\",\"mods\":[],\"files\":{}}", 0, 0, 0, 0, 0, 0}};
     int x, y;
-    memset(big, 'B', sizeof(big) - 1);
-    snprintf(pack_zip, sizeof(pack_zip), "%s/cut.zip", root);
-    write_zip(pack_zip, items, 3);
-    ModsWindow_SetModpackPicker(pack_pick, pack_picked);
-    ModsWindow_SetModpackStepped(pack_nap);
+    pack_pick_called = 0;
+    __atomic_store_n(&pack_chunks, 0, __ATOMIC_RELEASE);
     ModsWindow_Init();
     click(50, 118); /* the Modpack tab */
     assert(ModsWindow_Locate(MODS_UI_CLOSE, &x, &y));
@@ -1737,7 +1731,34 @@ static void test_modpack_close(void)
         ModsWindow_Tick();
         nap();
     }
+}
+static void test_modpack_close(void)
+{
+    static char big[4u << 20];
+    ZipItem items[3] = {{"cut/mod.json", "{\"id\":\"cut\",\"name\":\"Cut\"}", 0, 0, 0, 0, 0, 0},
+                        {"cut/big.bin", big, 0, 0, 0, 0, 0, 0},
+                        {"modpack.json", "{\"name\":\"Cut\",\"mods\":[],\"files\":{}}", 0, 0, 0, 0, 0, 0}};
+    int before = restarts, row = find("mod00");
+    memset(big, 'B', sizeof(big) - 1);
+    snprintf(pack_zip, sizeof(pack_zip), "%s/cut.zip", root);
+    write_zip(pack_zip, items, 3);
+    ModsWindow_SetModpackPicker(pack_pick, pack_picked);
+    ModsWindow_SetModpackStepped(pack_nap);
+    pack_import_start();
+    /* Back on the Mods tab, an Apply that restarts (mod00 says "restart")
+     * waits for the import: a restart would cut it off. */
+    assert(row >= 0 && row < 5);
+    click(50, 118); /* the Mods tab again */
+    click(32, 178 + row * 58 + 18); /* mod00's [x]: staged */
+    tap_widget(MODS_UI_APPLY);
+    tap_widget(MODS_UI_APPLY);
+    assert(strstr(on_screen(920, 640), "Wait for the modpack import to finish") && restarts == before);
+    click(32, 178 + row * 58 + 18); /* unstaged again */
     assert(ModsWindow_RequestClose());
+    assert(modpacks_left() == 0 && pack_chunks < (int)(sizeof(big) >> 16));
+    /* A restart stops it too (Platform_RestartGame calls ModsWindow_StopJobs). */
+    pack_import_start();
+    ModsWindow_StopJobs();
     assert(modpacks_left() == 0 && pack_chunks < (int)(sizeof(big) >> 16));
     ModsWindow_SetModpackStepped(NULL);
     ModsWindow_SetModpackPicker(NULL, NULL);
