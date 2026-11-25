@@ -65,14 +65,23 @@ int Memories_Open(const char *path, int flags, ...)
     return result;
 }
 
+/* A symbolic link or a junction (mount point): not every reparse point. OneDrive's files-on-demand placeholders,
+ * deduplicated and WOF-compressed files carry the attribute too, and they are ordinary files to read. The tag
+ * comes from FindFirstFileW, which reports it in dwReserved0 for a reparse point. */
 int Memories_IsLink(const char *path)
 {
     wchar_t *wide = Memories_Utf8ToWide(path);
-    DWORD attributes;
+    WIN32_FIND_DATAW found;
+    HANDLE find;
+    int link = 0;
     if (!wide) return 0;
-    attributes = GetFileAttributesW(wide);
+    find = FindFirstFileW(wide, &found);
     free(wide);
-    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+    if (find == INVALID_HANDLE_VALUE) return 0;
+    FindClose(find);
+    if (found.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
+        link = found.dwReserved0 == IO_REPARSE_TAG_SYMLINK || found.dwReserved0 == IO_REPARSE_TAG_MOUNT_POINT;
+    return link;
 }
 
 int Memories_Access(const char *path, int mode)
