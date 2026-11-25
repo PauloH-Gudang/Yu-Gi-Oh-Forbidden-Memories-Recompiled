@@ -503,6 +503,25 @@ instead of every other mods folder; "No modpack" goes back to the normal mods.
 A folder put in `modpacks/` by hand, without a `modpack.json`, is a modpack
 too.
 
+- **The check.** A pack with a `modpack.json` is read only when it is as it
+  was made: every file its `"files"` list names is there with that SHA-256,
+  and no other file is in its folder, except `modpack.json` and `poster.png`
+  at its top, what the game writes there (`.verified`, `.settings-applied`)
+  and what file managers leave in any folder (`desktop.ini`, `Thumbs.db`,
+  `.DS_Store`). A `modpack.json` without a `"files"` list is refused. A
+  changed, missing or added file, from an edit or damage after it was made,
+  keeps the pack out at the start (the normal mods are read, and the window
+  says why) and fails Activate modpack, which reads every file once
+  (`Mods_ModpackPrepare`); the start reads only the files whose size and
+  time changed since (`.verified`), but looks for added files every time.
+  It is not a signature: the list travels in the same `.zip` as the files,
+  so it says nothing about who made the pack. A folder without
+  `modpack.json` (made by hand) is read unchecked.
+- **Import** unpacks into a hidden `modpacks/.importing-*` folder, which
+  takes the pack's name only once everything, `modpack.json` included, is
+  in it; a failed or stopped import removes it, and the next import sweeps
+  any that a killed process left. So a cut-off import never looks like a
+  folder made by hand.
 - **Its settings are its own.** A pack's mods use the same `mod.<id>` and
   `mod.<id>.<key>` settings as the normal mods, so before a pack's launch
   writes any, every `mod.` setting the player has is saved in

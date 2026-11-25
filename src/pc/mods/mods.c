@@ -4988,8 +4988,60 @@ static const Verified *verified_find(const Verified *list, int count, int i, con
         if (!strcmp(list[j].name, name)) return &list[j];
     return NULL;
 }
-/* Every file the export listed must be as it was: a pack changed after it was
- * made is not read (the normal mods are). 1 when it is whole. `all` reads
+/* Files in a pack's folder its list need not name: what the game writes there
+ * (.verified, .settings-applied) and what came beside the mods (modpack.json,
+ * poster.png), at its top only; what the system's file managers leave in any
+ * folder (desktop.ini, Thumbs.db, .DS_Store). */
+static int same_letters(const char *a, const char *b)
+{
+    for (; *a && *b; a++, b++)
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return 0;
+    return *a == *b;
+}
+static int unlisted_allowed(const char *relative, const char *name)
+{
+    if (relative == name &&
+        (!strcmp(name, "modpack.json") || !strcmp(name, "poster.png") || !strcmp(name, ".verified") ||
+         !strcmp(name, ".settings-applied")))
+        return 1;
+    return same_letters(name, "desktop.ini") || same_letters(name, "Thumbs.db") || !strcmp(name, ".DS_Store");
+}
+static int name_order(const void *a, const void *b) { return strcmp(*(const char *const *)a, *(const char *const *)b); }
+/* How many files under `folder` (`relative` from the pack's top, "" there)
+ * the sorted `listed` does not name; the first in `first`. */
+static int unlisted_files(const char *folder, const char *relative, const char **listed, int count, char *first,
+                          size_t first_size)
+{
+    DIR *d = opendir(folder);
+    struct dirent *e;
+    int found = 0;
+    if (!d) return 0;
+    while ((e = readdir(d))) {
+        char path[PATH_MAX_], name[PATH_MAX_];
+        const char *key = name;
+        struct stat info;
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        if ((size_t)snprintf(path, sizeof(path), "%s/%s", folder, e->d_name) >= sizeof(path) ||
+            (size_t)snprintf(name, sizeof(name), "%s%s%s", relative, *relative ? "/" : "", e->d_name) >= sizeof(name) ||
+            stat(path, &info)) {
+            if (!found++) snprintf(first, first_size, "%s", e->d_name);
+            continue;
+        }
+        if (S_ISDIR(info.st_mode)) {
+            found += unlisted_files(path, name, listed, count, first, found ? 0 : first_size);
+            continue;
+        }
+        if (unlisted_allowed(name, name + strlen(name) - strlen(e->d_name)) ||
+            bsearch(&key, listed, (size_t)count, sizeof(*listed), name_order))
+            continue;
+        if (!found++ && first_size) snprintf(first, first_size, "%s", name);
+    }
+    closedir(d);
+    return found;
+}
+/* Every file the export listed must be as it was, and no other file may be
+ * there: a pack changed after it was made (a file changed, missing or
+ * added) is not read (the normal mods are). 1 when it is whole. `all` reads
  * every file (Activate modpack), else one the record vouches for is skipped;
  * *done, *total and *cancel as in sha256_file (may be NULL). A whole pack's
  * record is written again when a file had to be read. */
@@ -4999,9 +5051,33 @@ static int modpack_check(const char *folder, const JsonValue *files, int all, lo
     char path[PATH_MAX_], hex[65];
     int bad = 0, n = 0, read = 0, known = 0;
     const char *first = NULL;
-    Verified *record = verified_read(folder, &known);
+    Verified *record;
     FILE *out = NULL;
     struct stat info;
+    if (Json_TypeOf(files) != JSON_OBJECT) {
+        snprintf(why, why_size, "Its modpack.json has no list of files, so it was not loaded.");
+        return 0;
+    }
+    {   /* a file the list does not name: refused before any is read */
+        int count = Json_Count(files), extra;
+        const char **listed = calloc((size_t)count + 1, sizeof(*listed));
+        char name[PATH_MAX_] = "";
+        if (!listed) {
+            snprintf(why, why_size, "Out of memory.");
+            return 0;
+        }
+        count = 0;
+        for (const JsonValue *f = Json_At(files, 0); f; f = Json_Next(f))
+            if (Json_Name(f)) listed[count++] = Json_Name(f);
+        qsort(listed, (size_t)count, sizeof(*listed), name_order);
+        extra = unlisted_files(folder, "", listed, count, name, sizeof(name));
+        free(listed);
+        if (extra) {
+            snprintf(why, why_size, "%d file(s) in it are not in its list (%s), so it was not loaded.", extra, name);
+            return 0;
+        }
+    }
+    record = verified_read(folder, &known);
     if (total) {
         long long sum = 0;
         for (const JsonValue *f = Json_At(files, 0); f; f = Json_Next(f)) {

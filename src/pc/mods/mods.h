@@ -332,7 +332,10 @@ int Mods_ModpackSelected(char *name, size_t size);
 int Mods_ModpackSelect(const char *name);
 const char *Mods_ModpackLaunched(void);
 /* Why the chosen modpack was not read this launch (gone, or changed since it
- * was exported: modpack.json's "files" are checked by SHA-256), "" if it was.
+ * was exported: modpack.json's "files" are checked by SHA-256, and a file
+ * they do not name is refused, but for modpack.json, poster.png, .verified
+ * and .settings-applied at its top and desktop.ini, Thumbs.db and .DS_Store
+ * anywhere; not a signature, the list comes in the same .zip), "" if it was.
  * Locked: its author locked its settings (modpack.json "locked"): they are
  * applied at every launch, and the window does not change them. Without
  * "locked" they are applied at its first launch only. Either way the
@@ -346,8 +349,9 @@ int Mods_ModpackLocked(void);
  * the reading also leaves them in the system's file cache for that start.
  * Blocking: a thread of the caller's runs it. *done grows by the bytes read
  * and *total is set to all of them (atomically, either may be NULL); a
- * nonzero *cancel stops it. 1 when the pack is whole, else 0 and why
- * ("Cancelled." when stopped). A folder with no modpack.json is 1 at once. */
+ * nonzero *cancel stops it. 1 when the pack is whole (no file changed or
+ * missing, none it does not list), else 0 and why ("Cancelled." when
+ * stopped). A folder with no modpack.json is 1 at once. */
 int Mods_ModpackPrepare(const char *name, long long *done, long long *total, const int *cancel, char *why,
                         size_t why_size);
 /* A file's SHA-256 in lowercase hex: 1, or 0 when it cannot be read.

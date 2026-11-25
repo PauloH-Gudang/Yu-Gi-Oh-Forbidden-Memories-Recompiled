@@ -9,6 +9,12 @@
  *                option and turns Extra off
  *   pack-again   its second launch: the session goes on, the changes kept
  *                (Extra stays off, Hard on)
+ *   pack-third   its third launch: still whole (its .verified, .settings-applied
+ *                and a desktop.ini do not count), Activate's check too
+ *   unlisted     a file its list does not name: not read, at the start and in
+ *                Activate's check, the normal mods instead
+ *   hand         a folder made by hand (no modpack.json): read, unchecked
+ *   nofiles      a modpack.json without "files": not read
  *   normal       no modpack: the player's own settings back, none of the pack's
  *   pack-return  the pack again: its first launch again
  *   locked-first a locked pack: its mods on; the player turns one off
@@ -101,6 +107,15 @@ static void setup(void)
              "\"settings\":{}}],\"files\":{\"mod-001/mod.json\":\"%s\"}}",
              extra);
     write_text("user/modpacks/Locked/modpack.json", json);
+    /* What Explorer leaves in a folder is not a file of the pack's. */
+    write_text("user/modpacks/Pack/mod-002/desktop.ini", "[.ShellClassInfo]\n");
+    make_dir("user/modpacks/Hand");
+    make_dir("user/modpacks/Hand/extra");
+    write_text("user/modpacks/Hand/extra/mod.json", EXTRA);
+    make_dir("user/modpacks/Nofiles");
+    make_dir("user/modpacks/Nofiles/extra");
+    write_text("user/modpacks/Nofiles/extra/mod.json", EXTRA);
+    write_text("user/modpacks/Nofiles/modpack.json", "{\"name\":\"Nofiles\",\"mods\":[]}");
 }
 
 static void choose(const char *name)
@@ -163,6 +178,38 @@ static void pack_return(void)
     assert(Mods_Enabled(find("hard")) && Mods_Enabled(find("extra")));
 }
 
+static void pack_third(void)
+{
+    char why[300] = "";
+    launch();
+    assert(!strcmp(Mods_ModpackLaunched(), "Pack") && !*Mods_ModpackProblem());
+    assert(exists("user/modpacks/Pack/.verified") && exists("user/modpacks/Pack/.settings-applied"));
+    assert(Mods_ModpackPrepare("Pack", NULL, NULL, NULL, why, sizeof(why)) == 1);
+}
+
+static void unlisted(void)
+{
+    char why[300] = "";
+    launch();
+    assert(!*Mods_ModpackLaunched() && strstr(Mods_ModpackProblem(), "not in its list (mod-001/evil.txt)"));
+    assert(Mods_Count() == 1 && find("hard") >= 0 && find("extra") < 0);
+    assert(!Mods_ModpackPrepare("Pack", NULL, NULL, NULL, why, sizeof(why)));
+    assert(strstr(why, "1 file(s) in it are not in its list (mod-001/evil.txt)"));
+}
+
+static void hand(void)
+{
+    launch();
+    assert(!strcmp(Mods_ModpackLaunched(), "Hand") && !*Mods_ModpackProblem());
+    assert(Mods_Count() == 1 && Mods_Enabled(find("extra")));
+}
+
+static void nofiles(void)
+{
+    launch();
+    assert(!*Mods_ModpackLaunched() && strstr(Mods_ModpackProblem(), "no list of files"));
+}
+
 static void locked_first(void)
 {
     launch();
@@ -223,6 +270,10 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[1], "pack-again")) pack_again();
         else if (!strcmp(argv[1], "normal")) normal();
         else if (!strcmp(argv[1], "pack-return")) pack_return();
+        else if (!strcmp(argv[1], "pack-third")) pack_third();
+        else if (!strcmp(argv[1], "unlisted")) unlisted();
+        else if (!strcmp(argv[1], "hand")) hand();
+        else if (!strcmp(argv[1], "nofiles")) nofiles();
         else if (!strcmp(argv[1], "locked-first")) locked_first();
         else if (!strcmp(argv[1], "locked-again")) locked_again();
         else {
@@ -240,6 +291,18 @@ int main(int argc, char **argv)
     choose("Pack");
     step(argv[0], "pack-first");
     step(argv[0], "pack-again");
+    step(argv[0], "pack-third");
+    write_text("user/modpacks/Pack/mod-001/evil.txt", "added after the export");
+    step(argv[0], "unlisted");
+    {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/user/modpacks/Pack/mod-001/evil.txt", root);
+        assert(!remove(path));
+    }
+    choose("Hand");
+    step(argv[0], "hand");
+    choose("Nofiles");
+    step(argv[0], "nofiles");
     choose(NULL);
     step(argv[0], "normal");
     choose("Pack");

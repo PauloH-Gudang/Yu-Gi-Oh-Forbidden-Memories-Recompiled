@@ -33,6 +33,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define BG 0x181b20u
 #define PANEL 0x22262du
@@ -1136,11 +1137,13 @@ static void folder_name(char *name, size_t size, const char *from)
     if (!name[0]) snprintf(name, size, "Modpack");
 }
 /* --- Import of a modpack .zip, off the window's thread ----------------- *
- * The .zip read, its mods unpacked into a new folder of modpacks/ and its
- * modpack.json and poster put beside them, on a thread of its own: the bar
+ * The .zip read, its mods unpacked into a new hidden folder of modpacks/ and
+ * its modpack.json and poster put beside them, the folder then renamed to
+ * the pack's name, on a thread of its own: the bar
  * in the footer shows the bytes unpacked of all (Mods_ImportWatch), and Stop
  * ends it (the new folder removed). import_poll ends it on the window's
  * thread, where the list is read again. */
+#define PACK_IMPORTING ".importing-"  /* + 6 characters: an import's folder until it is whole */
 static struct {
     pthread_t thread;
     int running;                  /* from pack_import until import_poll joins it */
@@ -1152,7 +1155,7 @@ static struct {
 } import_job;
 static void *pack_import_step(void *unused)
 {
-    char dir[1024], dest[1200], path[1300], why[400] = "";
+    char dir[1024], dest[1200], temp[1200], path[1300], why[400] = "";
     const char *base = import_job.zip, *s;
     ModsImport *import = NULL;
     int ok = 0, made = 0;
@@ -1179,20 +1182,39 @@ static void *pack_import_step(void *unused)
         goto done;
     }
     __atomic_store_n(&import_job.total, Mods_ImportBytes(import), __ATOMIC_RELAXED);
-    {   /* the modpack's own name, when an export wrote one */
-        char temporary[1100], error[160];
+    /* Everything goes into a hidden folder first (a dot: not a modpack, not
+     * listed), which takes the pack's name only once all of it is there,
+     * modpack.json too: a cut-off import never looks like a folder made by
+     * hand, which is read unchecked. */
+    for (unsigned k = 0;; k++) {
+        struct stat info;
+        snprintf(temp, sizeof(temp), "%s/" PACK_IMPORTING "%lx-%u", dir, (unsigned long)time(NULL), k);
+        if (stat(temp, &info)) break;
+    }
+    if (Paths_MakeDirs(temp)) {
+        snprintf(why, sizeof(why), "Could not make a folder in %.300s.", dir);
+        goto done;
+    }
+    made = 1;
+    {   /* modpack.json, and the modpack's own name when an export wrote one */
+        char error[160];
         JsonDocument *info;
-        snprintf(temporary, sizeof(temporary), "%s/.incoming-modpack.json", dir);
-        if (Mods_ImportExtract(import, "modpack.json", temporary, why, sizeof(why)) == 1 &&
-            (info = Json_ParseFile(temporary, error, sizeof(error)))) {
+        int got;
+        snprintf(path, sizeof(path), "%s/modpack.json", temp);
+        if ((got = Mods_ImportExtract(import, "modpack.json", path, why, sizeof(why))) < 0) goto done;
+        if (got && (info = Json_ParseFile(path, error, sizeof(error)))) {
             const char *named = Json_String(Json_Member(Json_Root(info), "name"), "");
             if (*named) folder_name(import_job.name, sizeof(import_job.name), named);
             Json_Free(info);
         }
-        remove(temporary);
-        why[0] = 0;
     }
-    {   /* a name not taken: "Name", "Name 2"... */
+    for (int i = 0; i < import_job.count; i++) Mods_ImportMod(import, i)->replace[0] = 0;
+    Mods_ImportWatch(import, &import_job.done, &import_job.cancel);
+    if (!Mods_ImportInstall(import, temp, why, sizeof(why))) goto done;
+    snprintf(path, sizeof(path), "%s/poster.png", temp);
+    if (Mods_ImportExtract(import, "poster.png", path, why, sizeof(why)) < 0) goto done;
+    if (__atomic_load_n(&import_job.cancel, __ATOMIC_RELAXED)) goto done;
+    {   /* a name not taken: "Name", "Name 2"...; then the folder is it */
         char base_name[128];
         struct stat info;
         snprintf(base_name, sizeof(base_name), "%s", import_job.name);
@@ -1202,31 +1224,37 @@ static void *pack_import_step(void *unused)
             snprintf(import_job.name, sizeof(import_job.name), "%.100s %d", base_name, k);
         }
     }
-    if (Paths_MakeDirs(dest)) {
-        snprintf(why, sizeof(why), "Could not make %.300s.", dest);
+    if (rename(temp, dest)) {
+        snprintf(why, sizeof(why), "Could not name the modpack's folder %.300s.", dest);
         goto done;
     }
-    made = 1;
-    for (int i = 0; i < import_job.count; i++) Mods_ImportMod(import, i)->replace[0] = 0;
-    Mods_ImportWatch(import, &import_job.done, &import_job.cancel);
-    if (!Mods_ImportInstall(import, dest, why, sizeof(why))) goto done;
-    snprintf(path, sizeof(path), "%s/modpack.json", dest);
-    if (Mods_ImportExtract(import, "modpack.json", path, why, sizeof(why)) < 0) goto done;
-    snprintf(path, sizeof(path), "%s/poster.png", dest);
-    if (Mods_ImportExtract(import, "poster.png", path, why, sizeof(why)) < 0) goto done;
     ok = 1;
 done:
     if (import) Mods_ImportClose(import);
-    if (!ok && made) Mods_ImportRemoveTree(dest);
+    if (!ok && made) Mods_ImportRemoveTree(temp);
     if (!ok && __atomic_load_n(&import_job.cancel, __ATOMIC_RELAXED)) snprintf(why, sizeof(why), "Import stopped.");
     snprintf(import_job.why, sizeof(import_job.why), "%s", why);
     __atomic_store_n(&import_job.ok, ok, __ATOMIC_RELAXED);
     __atomic_store_n(&import_job.finished, 1, __ATOMIC_RELEASE);
     return NULL;
 }
+/* What an import the process did not live to finish left: its hidden folders. */
+static void import_sweep(void)
+{
+    char dir[1024], path[1200];
+    DIR *d;
+    struct dirent *e;
+    if (Mods_ModpackDirectory(dir, sizeof(dir)) || !(d = opendir(dir))) return;
+    while ((e = readdir(d)))
+        if (!strncmp(e->d_name, PACK_IMPORTING, strlen(PACK_IMPORTING)) &&
+            (size_t)snprintf(path, sizeof(path), "%s/%s", dir, e->d_name) < sizeof(path))
+            Mods_ImportRemoveTree(path);
+    closedir(d);
+}
 static void pack_import(const char *zip)
 {
     if (import_job.running) return;
+    import_sweep();
     snprintf(import_job.zip, sizeof(import_job.zip), "%s", zip);
     import_job.name[0] = import_job.why[0] = 0;
     import_job.done = 0;
