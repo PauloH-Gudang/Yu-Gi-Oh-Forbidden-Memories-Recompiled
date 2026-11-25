@@ -578,6 +578,11 @@ it was.
   turned off stays off.
 - `pc_modpack` runs a pack's launches one process each (as `Mods_Load` scans
   once): first, again, normal, the pack again.
+- `pc_mods_window`'s round trip exports two mods (a data mod, a code mod
+  with a binary object) with the tab's own Export job, imports the .zip
+  with its Import job, and checks the result: Activate's check passes, and
+  two start-ups of the pack (a process each) read it with no problem. The
+  export's "files" list and the import's files must be the same names.
 
 Implementation: `src/pc/platform/mods_window.c`, `src/pc/mods/manager.c`
 (`src/pc/mods/overlap.c` for the overlaps, `src/pc/mods/import.c` for Import

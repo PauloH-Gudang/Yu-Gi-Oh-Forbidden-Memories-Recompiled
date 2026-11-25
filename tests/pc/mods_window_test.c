@@ -9,8 +9,11 @@
 #include "pc/mods/import_job.h"
 #include "zip_writer.h"
 #include <limits.h>
-#ifndef _WIN32
+#ifdef _WIN32
+#include <process.h>
+#else
 #include <dirent.h>
+#include <sys/wait.h>
 #endif
 static int restarts;
 static int test_scale = 1; /* Menu_Scale: the phone's density */
@@ -1765,12 +1768,226 @@ static void test_modpack_close(void)
     remove(pack_zip);
     ModsWindow_Init();
 }
+/* A pack the Export job really wrote, then the Import job really unpacked,
+ * passes Activate's check and the start-up check: the export's list and the
+ * import's files are the same names. Two mods in a mods folder of their own
+ * (MEMORIES_MODS_DIR, which Export lists): a data mod with files in
+ * subfolders, and a code mod whose object is binary and larger than an
+ * unpacking chunk. The start-up check runs once a process (Mods_Load), so
+ * each launch is this program again ("roundtrip-launch <root> <pack>"). */
+#define ROUND_PACK "Round trip"
+static int round_kind = -1;
+static int round_pick(int kind, char *why, size_t size)
+{
+    (void)why;
+    (void)size;
+    round_kind = kind;
+    return 0;
+}
+static int round_picked(char *path, size_t size, char *why, size_t why_size)
+{
+    (void)why;
+    (void)why_size;
+    assert(round_kind == 0 || round_kind == 2);
+    snprintf(path, size, "%s/roundtrip.zip", root);
+    return 1;
+}
+static void round_binary(const char *relative, size_t size)
+{
+    char path[1300];
+    FILE *file;
+    snprintf(path, sizeof(path), "%s/%s", root, relative);
+    assert((file = fopen(path, "wb")));
+    for (size_t i = 0; i < size; i++)
+        fputc(i % 7 == 0 ? 0 : i % 11 == 0 ? '\r' : i % 13 == 0 ? '\n' : (int)(i * 31 % 251), file);
+    assert(!fclose(file));
+}
+/* Ticks until the footer says `want` (cut to its room: a prefix of it). */
+static const char *round_wait(const char *want)
+{
+    const char *said = "";
+    for (int i = 0; i < 20000; i++) {
+        ModsWindow_Tick();
+        said = said_now();
+        if (strstr(said, want)) return said;
+        nap();
+    }
+    fprintf(stderr, "round trip: waited for \"%s\", the window says: %s\n", want, said);
+    assert(!"round trip: the job did not end as expected");
+    return said;
+}
+static int round_launch(const char *self)
+{
+    char quoted_self[1100], quoted_root[SCRATCH_MAX + 4], quoted_pack[64];
+    fflush(NULL);
+#ifdef _WIN32
+    {
+        const char *args[5];
+        snprintf(quoted_self, sizeof(quoted_self), "\"%s\"", self);
+        snprintf(quoted_root, sizeof(quoted_root), "\"%s\"", root);
+        snprintf(quoted_pack, sizeof(quoted_pack), "\"%s\"", ROUND_PACK);
+        args[0] = quoted_self;
+        args[1] = "roundtrip-launch";
+        args[2] = quoted_root;
+        args[3] = quoted_pack;
+        args[4] = NULL;
+        return (int)_spawnv(_P_WAIT, self, args);
+    }
+#else
+    {
+        int status;
+        pid_t child;
+        (void)quoted_self;
+        (void)quoted_root;
+        (void)quoted_pack;
+        child = fork();
+        assert(child >= 0);
+        if (!child) {
+            execl(self, self, "roundtrip-launch", root, ROUND_PACK, (char *)NULL);
+            _exit(127);
+        }
+        assert(waitpid(child, &status, 0) == child);
+        return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+#endif
+}
+/* One start of the game on the pack: read, whole, both its mods. */
+static int round_launch_main(const char *where, const char *pack)
+{
+    char path[SCRATCH_MAX + 64];
+    snprintf(root, sizeof(root), "%s", where);
+    assert(!setenv("MEMORIES_USER_DIR", root, 1));
+    snprintf(path, sizeof(path), "%s/roundtrip-settings.txt", root);
+    assert(!setenv("MEMORIES_SETTINGS", path, 1));
+    unsetenv("MEMORIES_MODS_DIR"); /* set, it is read instead of any pack */
+    unsetenv("MEMORIES_MODS_FOLDER");
+    unsetenv("MEMORIES_MODS");
+    Settings_Load();
+    Mods_Load();
+    if (strcmp(Mods_ModpackLaunched(), pack) || *Mods_ModpackProblem())
+        fprintf(stderr, "round trip: launched \"%s\", problem \"%s\"\n", Mods_ModpackLaunched(), Mods_ModpackProblem());
+    assert(!strcmp(Mods_ModpackLaunched(), pack) && !*Mods_ModpackProblem());
+    assert(Mods_Count() == 2 && find("rt-data") >= 0 && find("rt-code") >= 0);
+    assert(Mods_Enabled(find("rt-data")) && Mods_Enabled(find("rt-code")));
+    return 0;
+}
+static void test_modpack_round_trip(const char *self)
+{
+    char path[1300], pack[1200], why[400] = "", saved[1024] = "", error[160];
+    const char *said, *old = getenv("MEMORIES_MODS_DIR");
+    JsonDocument *info;
+    const JsonValue *mods, *files;
+    int x, cx, cy, listed = 0;
+    if (old) snprintf(saved, sizeof(saved), "%s", old);
+    make_dir("rt-mods");
+    make_dir("rt-mods/data");
+    write_text("rt-mods/data/mod.json", "{\"id\":\"rt-data\",\"name\":\"Round data\",\"author\":\"Tester\","
+                                        "\"settings\":[{\"key\":\"level\",\"type\":\"int\",\"default\":3,\"min\":0,\"max\":9}]}");
+    make_dir("rt-mods/data/art");
+    make_dir("rt-mods/data/art/portraits");
+    round_binary("rt-mods/data/art/portraits/one.png", 3000);
+    write_text("rt-mods/data/art/readme.txt", "art\r\nfor the round trip\n");
+    make_dir("rt-mods/data/text");
+    write_text("rt-mods/data/text/Names with spaces.txt", "names");
+    write_text("rt-mods/data/text/.keep", "");
+    make_dir("rt-mods/code");
+    write_text("rt-mods/code/mod.json", "{\"id\":\"rt-code\",\"name\":\"Round code\",\"library\":\"rt-code\"}");
+    round_binary("rt-mods/code/rt-code.o", 300000); /* not an object: its loading fails, the check does not care */
+    make_dir("rt-mods/code/src");
+    make_dir("rt-mods/code/src/inner");
+    write_text("rt-mods/code/src/rt_code.c", "int x;\n");
+    write_text("rt-mods/code/src/inner/rt_code.h", "extern int x;\n");
+    snprintf(path, sizeof(path), "%s/rt-mods", root);
+    assert(!setenv("MEMORIES_MODS_DIR", path, 1)); /* Export lists this folder alone */
+    ModsWindow_SetModpackPicker(round_pick, round_picked);
+    /* Export...: both mods ticked, Name, Version and Author typed. */
+    ModsWindow_Init();
+    click(50, 118); /* the Modpack tab */
+    assert(ModsWindow_Locate(MODS_UI_CLOSE, &cx, &cy));
+    click(cx - 2 * (130 + 8), cy); /* Export..., the second of the three buttons left of Close */
+    said = said_now();
+    assert(strstr(said, "Round code") && strstr(said, "Round data"));
+    click(100, 178 + 14);      /* Round code */
+    click(100, 178 + 44 + 14); /* Round data */
+    /* The form's Export... (left of its Cancel, which is left of Close):
+     * with no name yet, it puts the typing in Name. */
+    x = cx - 47 - 8 - 94 - 8 - 60;
+    click(x, cy);
+    assert(strstr(said_now(), "Name, Version and Author are required."));
+    input(MENU_EVENT_TEXT, 0, 0, MENU_KEY_OTHER, ROUND_PACK);
+    input(MENU_EVENT_KEY_DOWN, 0, 0, MENU_KEY_ENTER, NULL);
+    input(MENU_EVENT_TEXT, 0, 0, MENU_KEY_OTHER, "1.0");
+    input(MENU_EVENT_KEY_DOWN, 0, 0, MENU_KEY_ENTER, NULL);
+    input(MENU_EVENT_TEXT, 0, 0, MENU_KEY_OTHER, "Tester");
+    round_kind = -1;
+    click(x, cy);
+    assert(round_kind == 2);
+    round_wait("Exported 2 mod(s)");
+    snprintf(path, sizeof(path), "%s/roundtrip.zip", root);
+    assert(!access(path, 0));
+    /* Import... with that .zip: the pack takes modpack.json's name. */
+    round_kind = -1;
+    click(cx - 3 * (130 + 8), cy);
+    assert(round_kind == 0);
+    round_wait("imported: 2 mod(s)");
+    /* Not a folder made by hand, which Prepare passes unread: the list is
+     * there, as long as the files written. */
+    assert(Mods_ModpackDirectory(pack, sizeof(pack)) == 0);
+    snprintf(path, sizeof(path), "%s/" ROUND_PACK "/modpack.json", pack);
+    assert((info = Json_ParseFile(path, error, sizeof(error))));
+    mods = Json_Member(Json_Root(info), "mods");
+    files = Json_Member(Json_Root(info), "files");
+    assert(Json_Count(mods) == 2 && Json_TypeOf(files) == JSON_OBJECT);
+    for (const JsonValue *f = Json_At(files, 0); f; f = Json_Next(f)) listed++;
+    assert(listed == 9); /* 5 of data's, 4 of code's */
+    for (int i = 0; i < 2; i++) {
+        const char *folder = Json_String(Json_Member(Json_At(mods, i), "folder"), "");
+        const char *id = Json_String(Json_Member(Json_At(mods, i), "id"), "");
+        snprintf(path, sizeof(path), "%s/" ROUND_PACK "/%s/%s", pack, folder,
+                 !strcmp(id, "rt-code") ? "src/inner/rt_code.h" : "text/.keep");
+        assert(*folder && !access(path, 0));
+    }
+    assert(Json_String(Json_Member(Json_Root(info), "version"), NULL) &&
+           !strcmp(Json_String(Json_Member(Json_Root(info), "version"), ""), "1.0") &&
+           !strcmp(Json_String(Json_Member(Json_Root(info), "author"), ""), "Tester"));
+    Json_Free(info);
+    /* Activate's check: every file read, none changed or missing, none unlisted. */
+    if (!Mods_ModpackPrepare(ROUND_PACK, NULL, NULL, NULL, why, sizeof(why)))
+        fprintf(stderr, "round trip: Activate's check refused the pack: %s\n", why);
+    assert(Mods_ModpackPrepare(ROUND_PACK, NULL, NULL, NULL, why, sizeof(why)));
+    assert(!strstr(why, "not in its list") && !strstr(why, "changed or missing"));
+    snprintf(path, sizeof(path), "%s/" ROUND_PACK "/.verified", pack);
+    assert(!access(path, 0));
+    /* Chosen, and started twice: the first launch leaves .settings-applied,
+     * which the second's check must let be. */
+    assert(!Mods_ModpackSelect(ROUND_PACK));
+    assert(round_launch(self) == 0);
+    snprintf(path, sizeof(path), "%s/" ROUND_PACK "/.settings-applied", pack);
+    assert(!access(path, 0));
+    assert(round_launch(self) == 0);
+    why[0] = 0;
+    assert(Mods_ModpackPrepare(ROUND_PACK, NULL, NULL, NULL, why, sizeof(why)));
+    /* Put back as it was: no pack chosen, the normal settings' copy gone. */
+    assert(!Mods_ModpackSelect(NULL));
+    snprintf(path, sizeof(path), "%s/.normal-settings", pack);
+    remove(path);
+    snprintf(path, sizeof(path), "%s/roundtrip-settings.txt", root);
+    remove(path);
+    snprintf(path, sizeof(path), "%s/roundtrip.zip", root);
+    remove(path);
+    ModsWindow_SetModpackPicker(NULL, NULL);
+    if (saved[0]) assert(!setenv("MEMORIES_MODS_DIR", saved, 1));
+    else unsetenv("MEMORIES_MODS_DIR");
+    ModsWindow_Init();
+}
 int main(int argc, char **argv)
 {
     char path[1024];
     int w, h;
     if (argc > 1 && !strcmp(argv[1], "folder"))
         return folder_main();
+    if (argc > 3 && !strcmp(argv[1], "roundtrip-launch"))
+        return round_launch_main(argv[2], argv[3]);
     test_text_cuts();
     assert(scratch_dir(root, sizeof(root), "memories-mod-window"));
     make_dir("mods");
@@ -1970,6 +2187,7 @@ int main(int argc, char **argv)
     test_modpack_code();
     test_modpack_enter();
     test_modpack_close();
+    test_modpack_round_trip(argv[0]);
     ModsWindow_Init();
     ModsWindow_Resize(720, 480);
     ModsWindow_Size(&w, &h);
