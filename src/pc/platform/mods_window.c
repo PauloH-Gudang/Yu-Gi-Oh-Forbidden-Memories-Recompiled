@@ -2727,6 +2727,27 @@ static int pack_type(const MenuEvent *e)
     return 0;
 }
 /* A press on the Modpack tab's widgets: 1 when it was one of them. */
+/* Row i's ( ) clicked, or Enter on it: asked once, then read (Prepare) and
+ * chosen, as Activate modpack does. */
+static void pack_row_choose(int i)
+{
+    const char *name = i ? pack_names[i - 1] : "";
+    if (prep.running || !strcmp(name, pack_chosen))
+        pack_confirm = 0;
+    else if (pack_confirm == i + 1) {
+        pack_confirm = 0;
+        prep_start();
+    } else {
+        /* ( ) is small and near the names: a stray click asks first */
+        pack_confirm = i + 1;
+        if (i)
+            put(status, sizeof(status),
+                "Activate the modpack \"%s\"? Click its ( ) or press Enter again, or Activate modpack, to confirm.", name);
+        else
+            put(status, sizeof(status),
+                "Use the normal mods (no modpack)? Click its ( ) or press Enter again, or Use normal mods, to confirm.");
+    }
+}
 static int pack_press(const Layout *l, int x, int y)
 {
     PackLayout k;
@@ -2777,22 +2798,9 @@ static int pack_press(const Layout *l, int x, int y)
         }
         int i = pack_shown(pack_scroll + (y - k.list.y) / (44 * unit));
         if (i >= 0) {
-            const char *name = i ? pack_names[i - 1] : "";
             pack_sel = i;
-            if (x >= k.list.x + 40 * unit || prep.running || !strcmp(name, pack_chosen))
-                pack_confirm = 0;
-            else if (pack_confirm == i + 1) {
-                pack_confirm = 0;
-                prep_start();
-            } else {
-                /* ( ) is small and near the names: a stray click asks first */
-                pack_confirm = i + 1;
-                if (i)
-                    put(status, sizeof(status), "Activate the modpack \"%s\"? Click its ( ) again, or Activate modpack, to confirm.",
-                        name);
-                else
-                    put(status, sizeof(status), "Use the normal mods (no modpack)? Click its ( ) again, or Use normal mods, to confirm.");
-            }
+            if (x >= k.list.x + 40 * unit) pack_confirm = 0;
+            else pack_row_choose(i);
         }
         pack_ask = 0;
         return 1;
@@ -4387,9 +4395,10 @@ static int window_event(const MenuEvent *e)
             for (int row = 0, i; (i = pack_shown(row)) >= 0; row++)
                 if (i == sel) {
                     if (pack_form) export_mods[i].selected = !export_mods[i].selected;
-                    else pack_choose();
+                    else pack_row_choose(i); /* as a click on its ( ): asked, then checked */
                     break;
                 }
+            pack_ask = 0;
             return 0;
         }
         if (e->type == MENU_EVENT_KEY_DOWN && e->key == MENU_KEY_TAB) {

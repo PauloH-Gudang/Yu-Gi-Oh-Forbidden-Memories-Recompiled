@@ -1651,6 +1651,30 @@ static void test_modpack_code(void)
     assert(drawn_y(" Plain\n") >= 0 && drawn_y(" Plain\n") != drawn_y("Code mod\n"));
     ModsWindow_Init();
 }
+/* Enter on a pack's row does what a click on its ( ) does: it asks first,
+ * then reads the pack (Activate's check) before choosing it. "Set" has files
+ * its list does not name, so the check refuses it and it is not chosen. */
+static void test_modpack_enter(void)
+{
+    char path[1024];
+    struct stat info;
+    snprintf(path, sizeof(path), "%s/modpacks/selected.txt", root);
+    ModsWindow_Init();
+    click(50, 118);            /* the Modpack tab */
+    click(100, 178 + 44 + 14); /* Set's name: selected, not chosen */
+    input(MENU_EVENT_KEY_DOWN, 0, 0, MENU_KEY_ENTER, NULL);
+    draw(920, 640);
+    assert(strstr(drawn, "Activate the modpack \"Set\"?") && stat(path, &info));
+    input(MENU_EVENT_KEY_DOWN, 0, 0, MENU_KEY_ENTER, NULL);
+    for (int i = 0; i < 5000; i++) {
+        ModsWindow_Tick();
+        draw(920, 640);
+        if (strstr(drawn, "was not activated")) break;
+        nap();
+    }
+    assert(strstr(drawn, "Set was not activated: ") && strstr(drawn, "not in its list") && stat(path, &info));
+    ModsWindow_Init();
+}
 /* A modpack import cut off by closing the window: its thread is stopped and
  * joined before the close returns, and nothing it made is left (no pack, no
  * hidden folder). The unpacking naps after each chunk, so the close lands
@@ -1923,6 +1947,7 @@ int main(int argc, char **argv)
         assert(strstr(drawn, "Content mod") && !strstr(drawn, "Native code mod"));
     }
     test_modpack_code();
+    test_modpack_enter();
     test_modpack_close();
     ModsWindow_Init();
     ModsWindow_Resize(720, 480);
