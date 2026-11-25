@@ -501,7 +501,10 @@ such a `.zip` from mods of the normal folders). Activate modpack chooses one
 (`modpacks/selected.txt`) for the next launch, which reads only that folder,
 instead of every other mods folder; "No modpack" goes back to the normal mods.
 A folder put in `modpacks/` by hand, without a `modpack.json`, is a modpack
-too.
+too. `modpacks/` is made only when something is written in it (an import,
+an export's suggested place, Open folder, a choice of pack, the player's
+settings saved aside): a start without a pack leaves the user directory as
+it was.
 
 - **Code mods** in a pack are marked in its detail before Activate: a "Code
   mod" tag on its card and a line naming them, read from the pack's mod

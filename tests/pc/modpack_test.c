@@ -17,6 +17,7 @@
  *   nofiles      a modpack.json without "files": not read
  *   normal       no modpack: the player's own settings back, none of the pack's
  *   pack-return  the pack again: its first launch again
+ *   fresh        (another user directory) no modpacks/ there: none is made
  *   locked-first a locked pack: its mods on; the player turns one off
  *   locked-again its mods on again, its values again
  */
@@ -210,6 +211,16 @@ static void nofiles(void)
     assert(!*Mods_ModpackLaunched() && strstr(Mods_ModpackProblem(), "no list of files"));
 }
 
+/* A user directory that never had a modpack: a launch reads that there is
+ * none and leaves the directory as it was (no modpacks/ made). */
+static void fresh(void)
+{
+    char name[64];
+    launch();
+    assert(!*Mods_ModpackLaunched() && !*Mods_ModpackProblem() && !Mods_ModpackSelected(name, sizeof(name)));
+    assert(Mods_Count() == 0 && !exists("user/modpacks"));
+}
+
 static void locked_first(void)
 {
     launch();
@@ -274,6 +285,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[1], "unlisted")) unlisted();
         else if (!strcmp(argv[1], "hand")) hand();
         else if (!strcmp(argv[1], "nofiles")) nofiles();
+        else if (!strcmp(argv[1], "fresh")) fresh();
         else if (!strcmp(argv[1], "locked-first")) locked_first();
         else if (!strcmp(argv[1], "locked-again")) locked_again();
         else {
@@ -288,6 +300,18 @@ int main(int argc, char **argv)
         if (*c == '\\') *c = '/';
 #endif
     setup();
+    {   /* another user directory, without modpacks/ */
+        char saved[SCRATCH_MAX];
+        make_dir("fresh");
+        make_dir("fresh/prog");
+        make_dir("fresh/prog/mods");
+        make_dir("fresh/user");
+        make_dir("fresh/user/mods");
+        memcpy(saved, root, sizeof(saved));
+        snprintf(root, sizeof(root), "%s/fresh", saved);
+        step(argv[0], "fresh");
+        memcpy(root, saved, sizeof(saved));
+    }
     choose("Pack");
     step(argv[0], "pack-first");
     step(argv[0], "pack-again");

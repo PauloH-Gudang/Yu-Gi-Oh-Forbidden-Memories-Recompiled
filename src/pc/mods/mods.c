@@ -4897,8 +4897,9 @@ static int modpack_locked;         /* its author locked its settings */
 static JsonDocument *modpack_info; /* its modpack.json, NULL without */
 int Mods_ModpackDirectory(char *out, size_t size)
 {
-    if (Paths_User(out, size, "modpacks")) return -1;
-    return Paths_MakeDirs(out);
+    /* Not made here: a start that reads it (no pack chosen) leaves the user
+     * directory as it was; whoever writes in it makes it (Paths_MakeDirs). */
+    return Paths_User(out, size, "modpacks") ? -1 : 0;
 }
 static int modpack_file(char *out, size_t size)
 {
@@ -4933,11 +4934,13 @@ int Mods_ModpackSelected(char *name, size_t size)
 }
 int Mods_ModpackSelect(const char *name)
 {
-    char path[PATH_MAX_];
+    char path[PATH_MAX_], dir[PATH_MAX_];
     FILE *file;
     if (modpack_file(path, sizeof(path))) return -1;
     if (!name || !*name) return remove(path) && errno != ENOENT ? -1 : 0;
-    if (!Mods_ModpackNameValid(name) || !(file = fopen(path, "wb"))) return -1;
+    if (!Mods_ModpackNameValid(name) || Mods_ModpackDirectory(dir, sizeof(dir)) || Paths_MakeDirs(dir) ||
+        !(file = fopen(path, "wb")))
+        return -1;
     fprintf(file, "%s\n", name);
     return fclose(file) ? -1 : 0;
 }

@@ -323,7 +323,9 @@ int Mods_InstallDirectory(char *out, size_t size);
  * all on at its first launch and then as the player left them (`mod.<id>`,
  * on by default); with none chosen, or when its folder is gone,
  * the normal mods are. MEMORIES_MODS_DIR set wins over both.
- * Mods_ModpackDirectory: the modpacks folder, made if missing (0). Selected:
+ * Mods_ModpackDirectory: the modpacks folder's path (0), not made: it may
+ * not be there, and is made only to write in it (an import, an export's
+ * suggested place, Open folder, a choice, the settings saved aside). Selected:
  * 1 and the name when one is chosen. Select: chooses one (NULL or "" for
  * none), for the next launch (0, or -1). Launched: the one this launch read,
  * "" none. NameValid: a plain folder name (no separator, no leading dot). */

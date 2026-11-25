@@ -1209,7 +1209,7 @@ static void *pack_import_step(void *unused)
         plain[n] = 0;
         folder_name(name, sizeof(name), plain);
     }
-    if (Mods_ModpackDirectory(dir, sizeof(dir))) {
+    if (Mods_ModpackDirectory(dir, sizeof(dir)) || Paths_MakeDirs(dir)) {
         snprintf(why, sizeof(why), "Could not make the modpacks folder.");
         goto done;
     }
@@ -1750,7 +1750,9 @@ const char *ModsWindow_ExportSuggestion(void)
     char dir[1024], name[200], both[200];
     snprintf(both, sizeof(both), "%.90s_%.40s", pack_name, pack_version);
     folder_name(name, sizeof(name), both);
-    if (Mods_ModpackDirectory(dir, sizeof(dir))) snprintf(export_suggestion, sizeof(export_suggestion), "%s.zip", name);
+    /* asked as the export's dialog opens: the folder is made for it then */
+    if (Mods_ModpackDirectory(dir, sizeof(dir)) || Paths_MakeDirs(dir))
+        snprintf(export_suggestion, sizeof(export_suggestion), "%s.zip", name);
     else snprintf(export_suggestion, sizeof(export_suggestion), "%s/%s.zip", dir, name);
 #ifdef _WIN32
     for (char *c = export_suggestion; *c; c++) if (*c == '/') *c = '\\';
@@ -2855,7 +2857,7 @@ static int pack_press(const Layout *l, int x, int y)
     }
     if (inside(k.folder, x, y)) {
         char dir[1024];
-        if (Mods_ModpackDirectory(dir, sizeof(dir)) || Platform_OpenFolder(dir))
+        if (Mods_ModpackDirectory(dir, sizeof(dir)) || Paths_MakeDirs(dir) || Platform_OpenFolder(dir))
             put(status, sizeof(status), "Could not open the modpacks folder.");
         return 1;
     }
