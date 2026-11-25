@@ -5010,8 +5010,21 @@ static int unlisted_allowed(const char *relative, const char *name)
     return same_letters(name, "desktop.ini") || same_letters(name, "Thumbs.db") || !strcmp(name, ".DS_Store");
 }
 static int name_order(const void *a, const void *b) { return strcmp(*(const char *const *)a, *(const char *const *)b); }
+/* A symbolic link, or on Windows any reparse point (a junction too), as
+ * Mods_ImportIsLink tells them (import.c, which this file does not link). */
+static int path_is_link(const char *path)
+{
+#ifdef _WIN32
+    return Memories_IsLink(path);
+#else
+    struct stat info;
+    return !lstat(path, &info) && S_ISLNK(info.st_mode);
+#endif
+}
 /* How many files under `folder` (`relative` from the pack's top, "" there)
- * the sorted `listed` does not name; the first in `first`. */
+ * the sorted `listed` does not name; the first in `first`. A link is never
+ * followed: an export leaves links out, so one is a file the list does not
+ * name, and entering it could walk anywhere, or loop. */
 static int unlisted_files(const char *folder, const char *relative, const char **listed, int count, char *first,
                           size_t first_size)
 {
@@ -5028,6 +5041,10 @@ static int unlisted_files(const char *folder, const char *relative, const char *
             (size_t)snprintf(name, sizeof(name), "%s%s%s", relative, *relative ? "/" : "", e->d_name) >= sizeof(name) ||
             stat(path, &info)) {
             if (!found++) snprintf(first, first_size, "%s", e->d_name);
+            continue;
+        }
+        if (path_is_link(path)) {   /* counted, never entered */
+            if (!found++ && first_size) snprintf(first, first_size, "%s", name);
             continue;
         }
         if (S_ISDIR(info.st_mode)) {

@@ -13,6 +13,9 @@
  *                and a desktop.ini do not count), Activate's check too
  *   unlisted     a file its list does not name: not read, at the start and in
  *                Activate's check, the normal mods instead
+ *   linked       a link (a junction on Windows) in it to an empty folder
+ *                outside: counted as a file its list does not name, never
+ *                entered; not read
  *   hand         a folder made by hand (no modpack.json): read, unchecked
  *   nofiles      a modpack.json without "files": not read
  *   normal       no modpack: the player's own settings back, none of the pack's
@@ -207,6 +210,42 @@ static void unlisted(void)
     assert(strstr(why, "1 file(s) in it are not in its list (mod-001/evil.txt)"));
 }
 
+/* A link in the pack (a junction on Windows) to an empty folder outside it:
+ * entered, it would hold nothing unlisted; it is counted itself instead. */
+static void linked(void)
+{
+    char why[300] = "";
+    launch();
+    assert(!*Mods_ModpackLaunched() && strstr(Mods_ModpackProblem(), "not in its list (mod-001/link)"));
+    assert(!Mods_ModpackPrepare("Pack", NULL, NULL, NULL, why, sizeof(why)));
+    assert(strstr(why, "1 file(s) in it are not in its list (mod-001/link)"));
+}
+
+/* `link` made to point at the folder `target` (both under the root): 1 when
+ * it could be. */
+static int make_link(const char *link, const char *target)
+{
+    char from[1024], to[1024];
+    snprintf(from, sizeof(from), "%s/%s", root, link);
+    snprintf(to, sizeof(to), "%s/%s", root, target);
+#ifdef _WIN32
+    {
+        wchar_t line[5000], *a = Memories_Utf8ToWide(from), *b = Memories_Utf8ToWide(to);
+        int made;
+        for (wchar_t *at = a; at && *at; at++) if (*at == L'/') *at = L'\\';
+        for (wchar_t *at = b; at && *at; at++) if (*at == L'/') *at = L'\\';
+        _snwprintf(line, sizeof(line) / sizeof(line[0]), L"mklink /J \"%ls\" \"%ls\" >nul", a, b);
+        line[sizeof(line) / sizeof(line[0]) - 1] = 0;
+        made = a && b && !_wsystem(line);
+        free(a);
+        free(b);
+        return made;
+    }
+#else
+    return !symlink(to, from);
+#endif
+}
+
 static void hand(void)
 {
     launch();
@@ -303,6 +342,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[1], "pack-return")) pack_return();
         else if (!strcmp(argv[1], "pack-third")) pack_third();
         else if (!strcmp(argv[1], "unlisted")) unlisted();
+        else if (!strcmp(argv[1], "linked")) linked();
         else if (!strcmp(argv[1], "hand")) hand();
         else if (!strcmp(argv[1], "nofiles")) nofiles();
         else if (!strcmp(argv[1], "fresh")) fresh();
@@ -343,6 +383,18 @@ int main(int argc, char **argv)
         char path[1024];
         snprintf(path, sizeof(path), "%s/user/modpacks/Pack/mod-001/evil.txt", root);
         assert(!remove(path));
+    }
+    make_dir("outside");
+    assert(make_link("user/modpacks/Pack/mod-001/link", "outside"));
+    step(argv[0], "linked");
+    {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/user/modpacks/Pack/mod-001/link", root);
+#ifdef _WIN32
+        assert(!rmdir(path)); /* the junction alone, not what it points at */
+#else
+        assert(!unlink(path));
+#endif
     }
     choose("Hand");
     step(argv[0], "hand");

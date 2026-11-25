@@ -522,6 +522,9 @@ it was.
   says why) and fails Activate modpack, which reads every file once
   (`Mods_ModpackPrepare`); the start reads only the files whose size and
   time changed since (`.verified`), but looks for added files every time.
+  A link in it (a symbolic link, or on Windows a junction) counts as such a
+  file and is never entered: export leaves links out, so the list never
+  names one.
   It is not a signature: the list travels in the same `.zip` as the files,
   so it says nothing about who made the pack. A folder without
   `modpack.json` (made by hand) is read unchecked.
