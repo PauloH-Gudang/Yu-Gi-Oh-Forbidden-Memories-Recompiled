@@ -34,6 +34,41 @@ class ModelGate(unittest.TestCase):
     def test_sources_and_address_sections(self):
         self.assertEqual(model_gate.check_sources(self.rows), [])
 
+    def test_retail_list_matches_table(self):
+        """config/pc/model_retail.csv: code rows for each native shape, images
+        for the rest, and its table is what it gives."""
+        retail = model_gate.load_retail()
+        self.assertEqual(model_gate.retail_problems(self.rows, retail, model_gate.primary_rows()), [])
+        text = model_gate.RETAIL_HEADER.read_text(encoding="utf-8").replace("\r\n", "\n")
+        self.assertEqual(text, model_gate.retail_header_text(retail))
+        self.assertEqual(sum(entry["kind"] == "primary" for entry in retail), 2 * len(model_gate.primary_rows()))
+
+    def test_retail_problems_names_a_missing_or_wrong_row(self):
+        retail = model_gate.load_retail()
+        native = next(row for row in self.rows if row["backend"] == "native")
+        # A row the port still interprets (none on the disc now): its code row is its own hash.
+        other = model_gate.Row(dict(native, backend="interpret", data_start="", note=""))
+        without = [entry for entry in retail if not (entry["shape"] == str(native.shape) and entry["slot"] == "B")]
+        self.assertTrue(any(f"shape {native.shape} slot B has 0 code rows" in line
+                            for line in model_gate.retail_problems(self.rows, without)))
+        stale = [dict(entry, size="0x4") if entry["shape"] == str(native.shape) else entry for entry in retail]
+        self.assertTrue(any(f"shape {native.shape} slot A: its code row" in line
+                            for line in model_gate.retail_problems(self.rows, stale)))
+        own = [{"kind": "code", "slot": slot, "identifier": str(other.identifier(slot)), "shape": str(other.shape),
+                "size": f"0x{other.span:X}", "sha256": "0" * 64 if slot == "A" else other.sha256(slot), "records": ""}
+               for slot in "AB"]
+        self.assertTrue(any(f"shape {other.shape} slot A: its code row's hash" in line
+                            for line in model_gate.retail_problems([other], own)))
+
+    def test_the_disc_runs_no_module_on_the_interpreter(self):
+        """Every variant and primary shape of the disc is native: a shape left
+        on the interpreter (or kept) fails here, in CI, without the disc. The
+        oracle's sweep is the test with the disc (notes/pc-build.md). No row may
+        be `keep` or `interpret` any more: a new one needs this test changed."""
+        for table in (self.rows, model_gate.primary_rows()):
+            self.assertTrue(table)
+            self.assertEqual([row.shape for row in table if row["backend"] != "native"], [])
+
     def test_every_native_slot_is_a_gated_module(self):
         modules = {name: (pattern, bank) for name, pattern, _, bank in build_config.MODULES}
         for row in model_gate.native_rows():
@@ -84,6 +119,18 @@ class SpanRules(unittest.TestCase):
         model_gate.hashed(shape, "A", 0x400)
         with self.assertRaises(SystemExit):
             model_gate.hashed(shape, "A", 0x404)
+
+    def test_a_span_may_end_inside_a_word(self):
+        """A table whose last entry ends two bytes into a word that differs per
+        record past it: the span stops at its last byte."""
+        shape = self.shape(0x402)
+        self.assertEqual(shape.common("A"), 0x400)
+        self.assertEqual(shape.common("A", 1), 0x402)
+        model_gate.hashed(shape, "A", 0x402)
+        with self.assertRaises(SystemExit):
+            model_gate.hashed(shape, "A", 0x403)
+        self.assertEqual(model_gate.problems([self.row(span="0x3F62")]), [])
+        self.assertTrue(model_gate.problems([self.row(span="0x5001")]))
 
     def test_printf_format_strings_are_found(self):
         """A format string from the slot's data handed to printf, directly or
@@ -136,8 +183,8 @@ class SpanRules(unittest.TestCase):
         text = model_gate.header_text([self.row(), self.row(shape="500", command_table="none", sha256_a="c" * 64,
                                                             sha256_b="d" * 64, identifier_a="500",
                                                             identifier_b="650")])
-        self.assertIn("0x12u, 0x3A68u, 0x44u, 0x1B74u, 0u)", text)
-        self.assertIn("0xFFFFFFFFu, 0u, 0u, 0u, 0u)", text)
+        self.assertIn("0x12u, 0x3A68u, 0x44u, 0x1B74u, 0u, 0u)", text)
+        self.assertIn("0xFFFFFFFFu, 0u, 0u, 0u, 0u, 0u)", text)
 
     def test_a_command_table_may_bound_an_index_word(self):
         """`:indexN` says the work area keeps the command itself as a uN."""
@@ -148,6 +195,17 @@ class SpanRules(unittest.TestCase):
         self.assertTrue(model_gate.problems([self.row(command_table="0x3A68:0x44:18:0x20:index64")]))
         self.assertTrue(model_gate.problems([self.row(command_table="0x3A68:0x44:18:0x20:pointer")]))
         self.assertTrue(model_gate.problems([self.row(command_table="0x3A68:0x44:18:0x20:index8:x")]))
+
+    def test_a_command_table_may_take_the_command_modulo(self):
+        """`:modN` (last) says the C picks entry command % N: a pointer row's,
+        never with an index (its updates compare the stored command itself)."""
+        row = self.row(command_table="0x3A68:0x44:18:0x20:mod100")
+        self.assertEqual((row.command_table, row.command_modulus), ((0x3A68, 0x44, 18, 0x20, 0), 100))
+        self.assertEqual(model_gate.problems([row]), [])
+        self.assertIn(", 100u)", model_gate.header_text([row]))
+        self.assertTrue(model_gate.problems([self.row(command_table="0x3A68:0x44:18:0x20:index8:mod100")]))
+        self.assertTrue(model_gate.problems([self.row(command_table="0x3A68:0x44:18:0x20:mod0")]))
+        self.assertTrue(model_gate.problems([self.row(command_table="0x3A68:0x44:18:0x20:mod100:index8")]))
 
     def test_a_command_table_is_well_formed(self):
         """No negative number (it would not compile in the table), a field inside a
@@ -163,7 +221,7 @@ class SpanRules(unittest.TestCase):
 
     def test_the_header_carries_the_index_width(self):
         text = model_gate.header_text([self.row(command_table="0x3A68:0x44:18:0x20:index16")])
-        self.assertIn("0x12u, 0x3A68u, 0x44u, 0x20u, 2u)", text)
+        self.assertIn("0x12u, 0x3A68u, 0x44u, 0x20u, 2u, 0u)", text)
 
     def test_the_tables_the_command_indexes_are_found(self):
         """Each form the decomp's C picks a row with; a wrapper's #define puts
@@ -271,7 +329,7 @@ class PortRules(unittest.TestCase):
     def test_a_stale_local_takes_the_slot_storage(self):
         import model_gate_port as port
         path = "src/native_overlays/model_variant/variant169_entry.c"
-        declaration, replacement = port.STALE_LOCALS[path]
+        (declaration, replacement, _), = port.STALE_LOCALS[path]
         text = '#include "../../types.h"\n#include "variant169_entry.h"\n\ns32 f(void)\n{\n' + declaration + "}\n"
         self.assertEqual(port.stale_local_text(path, text),
                          '#include "../../types.h"\n' + port.STALE_INCLUDE + '#include "variant169_entry.h"\n\n'
@@ -282,11 +340,23 @@ class PortRules(unittest.TestCase):
         with self.assertRaises(SystemExit):
             port.stale_local_text(path, text.replace(declaration, ""))
 
+    def test_a_stale_struct_local_becomes_a_pointer(self):
+        import model_gate_port as port
+        path = "src/native_overlays/model_variant/variant163_entry.c"
+        (declaration, replacement, _), = port.STALE_LOCALS[path]
+        text = ('#include "../../types.h"\n\ns32 f(void)\n{\n' + declaration +
+                "    SetPolyFT4(&quad);\n    quad.r0 = 1;\n    g(&quad.x0, (u32 *)&quad);\n"
+                "    work->quad.r0 = quads.r0;\n}\n")
+        self.assertEqual(port.stale_local_text(path, text),
+                         '#include "../../types.h"\n' + port.STALE_INCLUDE + '\ns32 f(void)\n{\n' + replacement +
+                         "    SetPolyFT4(quad);\n    quad->r0 = 1;\n    g(&quad->x0, (u32 *)quad);\n"
+                         "    work->quad.r0 = quads.r0;\n}\n")
+
     def test_check_fails_a_native_copy_without_the_stale_local_rule(self):
         import tempfile
         import model_gate_port as port
         path = "src/native_overlays/model_variant/variant169_entry.c"
-        declaration, _ = port.STALE_LOCALS[path]
+        (declaration, *_), = port.STALE_LOCALS[path]
         text = '#include "../../types.h"\n\ns32 f(void)\n{\n' + declaration + "}\n"
         listed = {"model_variant_169": [path]}
         with tempfile.TemporaryDirectory() as temporary:
@@ -297,6 +367,60 @@ class PortRules(unittest.TestCase):
             self.assertEqual(port.stale_local_problems(listed, set(), root), [])   # not native: no rule needed
             (root / path).write_text(port.stale_local_text(path, text).replace("\n", "\r\n"), newline="")
             self.assertEqual(port.stale_local_problems(listed, {"model_variant_169"}, root), [])
+
+    def test_a_stale_local_reached_through_another_address(self):
+        """Shape 448's col: the declaration takes the storage, every (s32)&rot
+        becomes ((s32)col - 240), and check fails a copy that keeps one."""
+        import tempfile
+        import model_gate_port as port
+        path = "src/native_overlays/model_variant/variant448_fan.c"
+        (declaration, storage, pointer, (old, new)), = port.STALE_LOCALS[path]
+        text = ('#include "../../types.h"\n\ns32 f(void)\n{\n' + declaration +
+                "    SVECTOR rot;\n    RotMatrix(&rot, 0);\n    u = t * 6 + (s32)&rot + 240;\n}\n")
+        ported = port.stale_local_text(path, text)
+        self.assertIn(storage, ported)
+        self.assertIn("u = t * 6 + ((s32)col - 240) + 240;", ported)
+        self.assertIn("RotMatrix(&rot, 0);", ported)
+        self.assertNotIn(old, ported)
+        listed = {"model_variant_448": [path]}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / path).parent.mkdir(parents=True)
+            (root / path).write_text(ported)
+            self.assertEqual(port.stale_local_problems(listed, {"model_variant_448"}, root), [])
+            (root / path).write_text(ported + "    v = (s32)&rot + 256;\n")
+            self.assertEqual(len(port.stale_local_problems(listed, {"model_variant_448"}, root)), 1)
+
+    def test_a_file_takes_each_of_its_stale_locals(self):
+        import model_gate_port as port
+        path = "src/native_overlays/model_variant/variant769_entry.c"
+        (quad, quad_storage, _), (screen, screen_storage, _) = port.STALE_LOCALS[path]
+        text = ('#include "../../types.h"\n\ns32 f(void)\n{\n' + quad + screen +
+                "    setlen(&quad, 9);\n    quad.u0 = 0;\n    box.x = screen[0].vx;\n}\n")
+        self.assertEqual(port.stale_local_text(path, text),
+                         '#include "../../types.h"\n' + port.STALE_INCLUDE + '\ns32 f(void)\n{\n' +
+                         quad_storage + screen_storage +
+                         "    setlen(quad, 9);\n    quad->u0 = 0;\n    box.x = screen[0].vx;\n}\n")
+        with self.assertRaises(SystemExit):   # each declaration must be there
+            port.stale_local_text(path, text.replace(screen, ""))
+
+    def test_check_reads_the_files_a_native_unit_includes(self):
+        # Shape 772's unit is a wrapper; rule 6 is on the body it includes.
+        import tempfile
+        import model_gate_port as port
+        body = "src/native_overlays/french_model_variant/image31368_entry.c"
+        unit = "src/native_overlays/model_variant/variant772_entry.c"
+        text = "s32 f(void)\n{\n" + "".join(rule[0] for rule in port.STALE_LOCALS[body]) + "}\n"
+        listed = {"model_variant_772": [unit]}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for path in (unit, body):
+                (root / path).parent.mkdir(parents=True, exist_ok=True)
+            (root / unit).write_text('#include "../french_model_variant/image31368_entry.c"\n')
+            (root / body).write_text(text)
+            self.assertEqual(len(port.stale_local_problems(listed, {"model_variant_772"}, root)), 2)
+            (root / body).write_text(port.stale_local_text(body, text))
+            self.assertEqual(port.stale_local_problems(listed, {"model_variant_772"}, root), [])
 
     def test_every_native_module_lists_its_files(self):
         listed = model_gate.listed_sources()
@@ -316,6 +440,32 @@ class OracleBackends(unittest.TestCase):
     def test_native_where_the_table_says_is_a_match(self):
         verdict = self.verdict(side("subject", "native"), side("reference", "interpreter"))
         self.assertEqual(verdict["status"], "identical")
+
+    @staticmethod
+    def with_primary(run, ways):
+        """A run that also called slot A's primary module (record 116's effect, 39)."""
+        run["calls"] = run["calls"] + [(1, "primary", "A", 39, 0)]
+        run["paths"] = dict(run["paths"], **{"primary 39 in A": [ways]})
+        return run
+
+    def test_primary_backends_are_checked_as_the_variants(self):
+        subject = self.with_primary(side("subject", "native"), "native")
+        reference = self.with_primary(side("reference", "interpreter"), "interpreter")
+        holds = {"A": True, "B": False}
+        self.assertEqual(model_oracle.compare(subject, reference, holds, (True, False), holds)["status"], "identical")
+        subject = self.with_primary(side("subject", "native"), "interpreter")
+        verdict = model_oracle.compare(subject, reference, holds, (True, False), holds)
+        self.assertEqual(verdict["status"], "error")
+        self.assertIn("slot A holds a primary module the table runs as native C and ran interpreter", verdict["why"])
+        # The reference asked for the interpreter: native C there is an error.
+        reference = self.with_primary(side("reference", "interpreter"), "native")
+        verdict = model_oracle.compare(self.with_primary(side("subject", "native"), "native"), reference, holds,
+                                       (True, False), holds)
+        self.assertIn("ran native C for its primary module", verdict["why"])
+        # A slot whose primary holds native code but made no primary call (a
+        # record without one calls none) is no error.
+        self.assertEqual(model_oracle.compare(side("subject", "native"), side("reference", "interpreter"), holds,
+                                              (True, False), {"A": True, "B": True})["status"], "identical")
 
     def test_interpreter_where_native_is_expected_is_an_error(self):
         verdict = self.verdict(side("subject", "interpreter"), side("reference", "interpreter"))

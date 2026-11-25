@@ -81,6 +81,11 @@
  *      event change
  *  26  a card's "variant_permille" and "variant_label" (notes/more-cards.md)
  *      only; no host layout or event change
+ *  27  a frame style's richer parts (stars.image, game_frame, parts_over_art, color on the
+ *      labels and digit strips) and a card's art_transparent (notes/modding.md, card_layout);
+ *      a card_layout of frame_styles alone no longer replaces another mod's layout;
+ *      CardLayout_HandPlace, a hand card's placement for a code mod. No host layout or
+ *      event change, and CardLayoutFrameStyle keeps its size
  *  28  text_capture, text_key: the keys typed, for a mod that has the player type
  * A data mod declares its required version with min_api in mod.json. */
 #include "mod_types.h"

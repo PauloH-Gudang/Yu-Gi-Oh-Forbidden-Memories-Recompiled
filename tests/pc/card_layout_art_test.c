@@ -45,6 +45,8 @@ void Log_Printf(LogChannel channel, const char *format, ...) { (void)channel; (v
 static uint16_t bank[SOFT_GPU_WIDTH * SOFT_GPU_HEIGHT];
 uint16_t *SoftGpu_Bank(int which) { return which == 13 ? bank : NULL; }
 const uint16_t *SoftGpu_Vram(void) { return NULL; }
+const uint16_t *SoftGpu_VramRaw(void) { return NULL; }
+void SoftGpu_Settle(int x, int y, int w, int h) { (void)x; (void)y; (void)w; (void)h; }
 
 int CardArt_ImageSize(const char *path, int *width, int *height)
 {
@@ -79,6 +81,11 @@ int CardLayout_StyleOf(int card_id, CardLayoutStyle *style)
     return 1;
 }
 int CardLayout_Digits(char *path, size_t size, int *w, int *h, int *step)
+{
+    (void)path; (void)size; (void)w; (void)h; (void)step;
+    return 0;
+}
+int CardLayout_StarImage(char *path, size_t size, int *w, int *h, int *step)
 {
     (void)path; (void)size; (void)w; (void)h; (void)step;
     return 0;

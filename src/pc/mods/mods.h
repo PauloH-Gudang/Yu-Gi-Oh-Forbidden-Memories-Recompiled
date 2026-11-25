@@ -84,6 +84,15 @@ void Mods_Shutdown(void);
  * (libetc.c) so mods see the control client's bits and, while a recording
  * plays, the recording's (pc/debug/recorder.h). */
 extern unsigned short (*Mods_PadSource)(int port);
+/* What tells a mod's own MIPS in a model's control modules (notes/modding.md,
+ * "Attack code: C, not MIPS"): `mips`, how many of the six control modules in
+ * a MODEL.MRG record's module stages (44 sectors from its sector 180) are a
+ * mod's, with a line for each in `detail`; `read`, the disc's sectors as the
+ * game reads them, the mods' changes in. The game gives them before Mods_Load
+ * (pc/overlays/model_module_class.h, Menu_LoadMods); without them (the tests)
+ * the mods' models are not checked. */
+void Mods_SetModuleCheck(int (*mips)(const unsigned char *stages, char *detail, size_t size),
+                         int (*read)(int lba, int sectors, void *out));
 /* The mods' rand seed (mod_libc.c), its size in *size: save states carry it. */
 void *Mods_RandSeed(unsigned *size);
 
@@ -152,6 +161,14 @@ void Mods_DrawFrame(void);
 /* Whether a mod's frame callback, in the last Mods_DrawFrame, asked that
  * its frame be drawn only in the scaled picture (host->picture_only_frame). */
 int Mods_PictureOnlyFrame(void);
+/* How many times loaded mod code bound SoftGpu_Vram or SoftGpu_StateData
+ * (or code loaded by the system's loader, whose bindings are not seen): the
+ * software GPU keeps no drawing back while it is not 0 (libgpu.c). */
+int Mods_VramUsers(void);
+/* Called with the new count as each such binding is made (NULL: nobody is
+ * told): libgpu.c sets it to SoftGpu_SetModVramUsers, which rasters what is
+ * held before the mod can see VRAM. */
+extern void (*Mods_VramUsersChanged)(int users);
 /* The applied mods' overlays (MemoriesMod.overlay), drawn with the port's
  * menu text; the rectangle they covered, or zeros. Their signature changes
  * whenever one of them would draw something else (`frame` for a mod that

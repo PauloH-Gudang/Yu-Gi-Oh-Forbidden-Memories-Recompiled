@@ -254,7 +254,7 @@ void Spu_CdFlush(void)
 
 void Spu_Mix(int16_t *out, size_t frames)
 {
-    static int output_gain = GAIN_ONE; /* the audio thread's own; no other writer */
+    static int output_gain = GAIN_ONE; /* the mixer's own; no other writer */
     static int bus_gain[SPU_BUS_COUNT] = {GAIN_ONE, GAIN_ONE, GAIN_ONE};
     const int output_target = (output_muted ? 0 : output_volume) << 8;
     const int bus_target[SPU_BUS_COUNT] = {bus_volume[SPU_BUS_MUSIC] << 8,
@@ -390,8 +390,11 @@ void Spu_Mix(int16_t *out, size_t frames)
             right = (int)(((int64_t)music_r * bus_gain[SPU_BUS_MUSIC] +
                            (int64_t)sfx_r * bus_gain[SPU_BUS_SFX]) / GAIN_ONE);
         }
-        left = (left * volume(master_left)) >> 15;
-        right = (right * volume(master_right)) >> 15;
+        /* In 64 bits: the sum of a few full-scale voices times the master
+         * volume (up to 0x7ffe) is beyond an int, and wrapping flips the
+         * sign where the final clamp should clip. */
+        left = (int)(((int64_t)left * volume(master_left)) >> 15);
+        right = (int)(((int64_t)right * volume(master_right)) >> 15);
         if (cd_enabled) {
             cd_phase += cd_rate;
             while (cd_phase >= 44100) {
@@ -447,6 +450,11 @@ void Spu_Hold(int on)
     while (on && __atomic_load_n(&mixing, __ATOMIC_SEQ_CST)) {
         nanosleep(&nap, NULL);
     }
+}
+
+int Spu_Held(void)
+{
+    return __atomic_load_n(&hold, __ATOMIC_SEQ_CST);
 }
 
 void Spu_State(MemoriesState *state)
