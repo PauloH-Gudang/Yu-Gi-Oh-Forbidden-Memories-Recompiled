@@ -4,10 +4,15 @@
  * itself once per step ("<step> <root>"), in order, on that one directory.
  *
  *   pack-first   the pack's first launch: its settings applied, the player's
- *                own saved aside first; then the player changes one
- *   pack-again   its second launch: the session goes on, the change kept
+ *                own saved aside first, all its mods on (Hard too, which the
+ *                player's own settings have off); then the player changes an
+ *                option and turns Extra off
+ *   pack-again   its second launch: the session goes on, the changes kept
+ *                (Extra stays off, Hard on)
  *   normal       no modpack: the player's own settings back, none of the pack's
  *   pack-return  the pack again: its first launch again
+ *   locked-first a locked pack: its mods on; the player turns one off
+ *   locked-again its mods on again, its values again
  */
 #define main original_mods_test
 #include "pc/compat/fs.h"
@@ -73,8 +78,8 @@ static void setup(void)
     make_dir("user/mods");
     make_dir("user/mods/hard");
     write_text("user/mods/hard/mod.json", HARD);
-    /* The player's own: Hard on, level 3, 7th in the load order. */
-    write_text("user/settings.txt", "mod.hard=1\nmod.hard.level=3\nmod.hard.order=7\n");
+    /* The player's own: Hard off, level 3, 7th in the load order. */
+    write_text("user/settings.txt", "mod.hard=0\nmod.hard.level=3\nmod.hard.order=7\n");
     make_dir("user/modpacks");
     make_dir("user/modpacks/Pack");
     make_dir("user/modpacks/Pack/mod-001");
@@ -88,6 +93,14 @@ static void setup(void)
              "\"files\":{\"mod-001/mod.json\":\"%s\",\"mod-002/mod.json\":\"%s\"}}",
              hard, extra);
     write_text("user/modpacks/Pack/modpack.json", json);
+    make_dir("user/modpacks/Locked");
+    make_dir("user/modpacks/Locked/mod-001");
+    manifest("user/modpacks/Locked/mod-001", EXTRA, extra);
+    snprintf(json, sizeof(json),
+             "{\"name\":\"Locked\",\"locked\":true,\"mods\":[{\"id\":\"extra\",\"folder\":\"mod-001\",\"order\":1,"
+             "\"settings\":{}}],\"files\":{\"mod-001/mod.json\":\"%s\"}}",
+             extra);
+    write_text("user/modpacks/Locked/modpack.json", json);
 }
 
 static void choose(const char *name)
@@ -111,8 +124,9 @@ static void pack_first(void)
     /* Kept without a save of the player's: the next launch reads them. */
     Settings_Load();
     assert(named("mod.hard.level") == 9 && named("mod.extra.order") == 4);
-    /* The player's change in the pack's session (the Mods window's Apply). */
+    /* The player's changes in the pack's session (the Mods window's Apply). */
     Settings_SetNamed("mod.hard.level", 5);
+    Settings_SetNamed("mod.extra", 0);
     assert(Settings_Save());
 }
 
@@ -122,16 +136,18 @@ static void pack_again(void)
     assert(!strcmp(Mods_ModpackLaunched(), "Pack") && !*Mods_ModpackProblem());
     assert(named("mod.hard.level") == 5 && named("mod.hard.order") == -2);
     assert(exists("user/modpacks/.normal-settings"));
+    /* Turned off, it stays off; Hard, on since the first launch, stays on. */
+    assert(!Mods_Enabled(find("extra")) && Mods_Enabled(find("hard")));
 }
 
 static void normal(void)
 {
     launch();
     assert(!*Mods_ModpackLaunched());
-    assert(Mods_Count() == 1 && Mods_Enabled(find("hard")));
+    assert(Mods_Count() == 1 && !Mods_Enabled(find("hard")));
     /* The player's own values, none of the pack's, and saved so. */
     for (int pass = 0; pass < 2; pass++) {
-        assert(named("mod.hard") == 1 && named("mod.hard.level") == 3 && named("mod.hard.order") == 7);
+        assert(named("mod.hard") == 0 && named("mod.hard.level") == 3 && named("mod.hard.order") == 7);
         assert(named("mod.extra") == -1000 && named("mod.extra.order") == -1000);
         Settings_Load();
     }
@@ -145,6 +161,22 @@ static void pack_return(void)
     /* Its first launch again: the pack's values, not the last session's. */
     assert(named("mod.hard.level") == 9 && named("mod.hard.order") == -2);
     assert(Mods_Enabled(find("hard")) && Mods_Enabled(find("extra")));
+}
+
+static void locked_first(void)
+{
+    launch();
+    assert(!strcmp(Mods_ModpackLaunched(), "Locked") && Mods_ModpackLocked());
+    assert(Mods_Count() == 1 && Mods_Enabled(find("extra")) && named("mod.extra.order") == 1);
+    Settings_SetNamed("mod.extra", 0);
+    Settings_SetNamed("mod.extra.order", 3);
+    assert(Settings_Save());
+}
+
+static void locked_again(void)
+{
+    launch();
+    assert(Mods_ModpackLocked() && Mods_Enabled(find("extra")) && named("mod.extra.order") == 1);
 }
 
 static int run_step(const char *self, const char *step)
@@ -191,6 +223,8 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[1], "pack-again")) pack_again();
         else if (!strcmp(argv[1], "normal")) normal();
         else if (!strcmp(argv[1], "pack-return")) pack_return();
+        else if (!strcmp(argv[1], "locked-first")) locked_first();
+        else if (!strcmp(argv[1], "locked-again")) locked_again();
         else {
             fprintf(stderr, "modpack_test: unknown step \"%s\"\n", argv[1]);
             return 2;
@@ -210,6 +244,9 @@ int main(int argc, char **argv)
     step(argv[0], "normal");
     choose("Pack");
     step(argv[0], "pack-return");
+    choose("Locked");
+    step(argv[0], "locked-first");
+    step(argv[0], "locked-again");
     choose(NULL);
     step(argv[0], "normal");
     puts("modpack: ok");

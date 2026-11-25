@@ -5365,7 +5365,7 @@ void Mods_Load(void)
             scan(named, "installed");
             scan_folder(1);
         } else if (modpack_folder(path, sizeof(path))) {
-            /* A modpack: its mods alone, all on at its first launch (the Modpack tab). */
+            /* A modpack: its mods alone (the Modpack tab; which are on: below). */
             scan(path, "installed");
             say("modpack %s: %s", modpack_launched, path);
         } else {
@@ -5388,7 +5388,15 @@ void Mods_Load(void)
         int want;
         want = mods[i].enabled;
         if (modpack_launched[0]) {
-            if (first || modpack_locked) want = 1;
+            /* A locked pack's mods are all on, at every launch; an unlocked
+             * one's at its first launch, written down (a mod.<id> 0 from the
+             * normal settings would else turn it off at the second), and
+             * after that as the player left them, on by default. */
+            if (modpack_locked || (first && modpack_first)) {
+                want = 1;
+                if (setting_key(key, sizeof(key), mods[i].id, NULL)) Settings_SetNamed(key, 1);
+            } else if (setting_key(key, sizeof(key), mods[i].id, NULL))
+                want = Settings_GetNamed(key, 1);
         } else if (setting_key(key, sizeof(key), mods[i].id, NULL)) want = Settings_GetNamed(key, want);
         want = environment_choice(mods[i].id, want) != 0;
         if (all && (!strcmp(all, "0") || !strcmp(all, "off"))) want = 0;

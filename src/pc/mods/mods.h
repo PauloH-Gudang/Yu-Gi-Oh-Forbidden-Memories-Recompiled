@@ -319,7 +319,9 @@ int Mods_InstallDirectory(char *out, size_t size);
 /* Modpacks (the Mods window's Modpack tab): each is a folder of mods in the
  * user directory's modpacks/, made from a .zip. The one chosen (the first
  * line of modpacks/selected.txt) is read at the start instead of every other
- * mods folder, its mods all on; with none chosen, or when its folder is gone,
+ * mods folder: a locked one's mods all on at every launch, an unlocked one's
+ * all on at its first launch and then as the player left them (`mod.<id>`,
+ * on by default); with none chosen, or when its folder is gone,
  * the normal mods are. MEMORIES_MODS_DIR set wins over both.
  * Mods_ModpackDirectory: the modpacks folder, made if missing (0). Selected:
  * 1 and the name when one is chosen. Select: chooses one (NULL or "" for

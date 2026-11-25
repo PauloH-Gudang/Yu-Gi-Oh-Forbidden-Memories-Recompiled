@@ -520,6 +520,11 @@ too.
   also removes the packs' `.settings-applied`, so the next launch of a pack
   is its first again: a pack's session is kept while it is the one chosen,
   not after the normal mods ran.
+- **Which of its mods are on:** a locked pack's all, at every launch. An
+  unlocked pack's all at its first launch (written as `mod.<id>` 1, so an
+  old 0 of the player's does not turn one off later), then as the player
+  left them in the Mods window (`mod.<id>`, on when there is none): a mod
+  turned off stays off.
 - `pc_modpack` runs a pack's launches one process each (as `Mods_Load` scans
   once): first, again, normal, the pack again.
 
