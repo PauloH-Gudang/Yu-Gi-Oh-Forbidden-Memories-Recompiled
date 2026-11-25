@@ -1,0 +1,217 @@
+/* Modpacks (src/pc/mods/mods.c, notes/mods-window.md "Modpacks") across
+ * launches. Mods_Load scans once a process, so each launch is a process of
+ * its own: run without arguments, this makes the user directory and runs
+ * itself once per step ("<step> <root>"), in order, on that one directory.
+ *
+ *   pack-first   the pack's first launch: its settings applied, the player's
+ *                own saved aside first; then the player changes one
+ *   pack-again   its second launch: the session goes on, the change kept
+ *   normal       no modpack: the player's own settings back, none of the pack's
+ *   pack-return  the pack again: its first launch again
+ */
+#define main original_mods_test
+#include "pc/compat/fs.h"
+#include "mods_test.c"
+#undef main
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <sys/wait.h>
+#endif
+
+static void use_root(void)
+{
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/prog", root);
+    assert(!setenv("MEMORIES_PROGRAM_DIR", path, 1));
+    snprintf(path, sizeof(path), "%s/user", root);
+    assert(!setenv("MEMORIES_USER_DIR", path, 1));
+    snprintf(path, sizeof(path), "%s/user/settings.txt", root);
+    assert(!setenv("MEMORIES_SETTINGS", path, 1));
+    unsetenv("MEMORIES_MODS_DIR");
+    unsetenv("MEMORIES_MODS_FOLDER");
+    unsetenv("MEMORIES_MODS");
+    unsetenv("MEMORIES_MOD_HARD");
+    unsetenv("MEMORIES_MOD_EXTRA");
+}
+
+static int exists(const char *relative)
+{
+    char path[1024];
+    struct stat info;
+    snprintf(path, sizeof(path), "%s/%s", root, relative);
+    return !stat(path, &info);
+}
+
+static void launch(void)
+{
+    Settings_Load();
+    Mods_Load();
+}
+
+static int named(const char *key) { return Settings_GetNamed(key, -1000); }
+
+/* A mod.json in `place`, and its SHA-256 for modpack.json's "files". */
+static void manifest(const char *place, const char *text, char hex[65])
+{
+    char file[1024], path[1300];
+    snprintf(file, sizeof(file), "%s/mod.json", place);
+    write_text(file, text);
+    snprintf(path, sizeof(path), "%s/%s", root, file);
+    assert(Mods_Sha256File(path, hex));
+}
+
+#define HARD "{\"id\":\"hard\",\"name\":\"Hard\",\"settings\":[{\"key\":\"level\",\"type\":\"int\",\"default\":1,\"max\":10}]}"
+#define EXTRA "{\"id\":\"extra\",\"name\":\"Extra\"}"
+
+static void setup(void)
+{
+    char hard[65], extra[65], json[2048];
+    make_dir("prog");
+    make_dir("prog/mods");
+    make_dir("user");
+    make_dir("user/mods");
+    make_dir("user/mods/hard");
+    write_text("user/mods/hard/mod.json", HARD);
+    /* The player's own: Hard on, level 3, 7th in the load order. */
+    write_text("user/settings.txt", "mod.hard=1\nmod.hard.level=3\nmod.hard.order=7\n");
+    make_dir("user/modpacks");
+    make_dir("user/modpacks/Pack");
+    make_dir("user/modpacks/Pack/mod-001");
+    make_dir("user/modpacks/Pack/mod-002");
+    manifest("user/modpacks/Pack/mod-001", HARD, hard);
+    manifest("user/modpacks/Pack/mod-002", EXTRA, extra);
+    snprintf(json, sizeof(json),
+             "{\"name\":\"Pack\",\"locked\":false,\"mods\":["
+             "{\"id\":\"hard\",\"folder\":\"mod-001\",\"order\":-2,\"settings\":{\"level\":9}},"
+             "{\"id\":\"extra\",\"folder\":\"mod-002\",\"order\":4,\"settings\":{}}],"
+             "\"files\":{\"mod-001/mod.json\":\"%s\",\"mod-002/mod.json\":\"%s\"}}",
+             hard, extra);
+    write_text("user/modpacks/Pack/modpack.json", json);
+}
+
+static void choose(const char *name)
+{
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/user/modpacks/selected.txt", root);
+    if (name) write_text("user/modpacks/selected.txt", name);
+    else assert(!remove(path));
+}
+
+/* --- the launches ----------------------------------------------------- */
+
+static void pack_first(void)
+{
+    launch();
+    assert(!strcmp(Mods_ModpackLaunched(), "Pack") && !*Mods_ModpackProblem());
+    assert(Mods_Count() == 2 && Mods_Enabled(find("hard")) && Mods_Enabled(find("extra")));
+    /* The pack's values, and the player's own saved before they were written. */
+    assert(named("mod.hard.level") == 9 && named("mod.hard.order") == -2 && named("mod.extra.order") == 4);
+    assert(exists("user/modpacks/.normal-settings") && exists("user/modpacks/Pack/.settings-applied"));
+    /* Kept without a save of the player's: the next launch reads them. */
+    Settings_Load();
+    assert(named("mod.hard.level") == 9 && named("mod.extra.order") == 4);
+    /* The player's change in the pack's session (the Mods window's Apply). */
+    Settings_SetNamed("mod.hard.level", 5);
+    assert(Settings_Save());
+}
+
+static void pack_again(void)
+{
+    launch();
+    assert(!strcmp(Mods_ModpackLaunched(), "Pack") && !*Mods_ModpackProblem());
+    assert(named("mod.hard.level") == 5 && named("mod.hard.order") == -2);
+    assert(exists("user/modpacks/.normal-settings"));
+}
+
+static void normal(void)
+{
+    launch();
+    assert(!*Mods_ModpackLaunched());
+    assert(Mods_Count() == 1 && Mods_Enabled(find("hard")));
+    /* The player's own values, none of the pack's, and saved so. */
+    for (int pass = 0; pass < 2; pass++) {
+        assert(named("mod.hard") == 1 && named("mod.hard.level") == 3 && named("mod.hard.order") == 7);
+        assert(named("mod.extra") == -1000 && named("mod.extra.order") == -1000);
+        Settings_Load();
+    }
+    assert(!exists("user/modpacks/.normal-settings") && !exists("user/modpacks/Pack/.settings-applied"));
+}
+
+static void pack_return(void)
+{
+    launch();
+    assert(!strcmp(Mods_ModpackLaunched(), "Pack"));
+    /* Its first launch again: the pack's values, not the last session's. */
+    assert(named("mod.hard.level") == 9 && named("mod.hard.order") == -2);
+    assert(Mods_Enabled(find("hard")) && Mods_Enabled(find("extra")));
+}
+
+static int run_step(const char *self, const char *step)
+{
+#ifdef _WIN32
+    char quoted_self[1100], quoted_root[SCRATCH_MAX + 4];
+    const char *args[4];
+    snprintf(quoted_self, sizeof(quoted_self), "\"%s\"", self);
+    snprintf(quoted_root, sizeof(quoted_root), "\"%s\"", root);
+    args[0] = quoted_self;
+    args[1] = step;
+    args[2] = quoted_root;
+    args[3] = NULL;
+    fflush(NULL);
+    return (int)_spawnv(_P_WAIT, self, args);
+#else
+    int status;
+    pid_t child;
+    fflush(NULL);
+    child = fork();
+    assert(child >= 0);
+    if (!child) {
+        execl(self, self, step, root, (char *)NULL);
+        _exit(127);
+    }
+    assert(waitpid(child, &status, 0) == child);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+#endif
+}
+
+static void step(const char *self, const char *name)
+{
+    int result = run_step(self, name);
+    if (result) fprintf(stderr, "modpack_test: step %s failed (%d)\n", name, result);
+    assert(result == 0);
+}
+
+int main(int argc, char **argv)
+{
+    if (argc > 2) {   /* one launch */
+        snprintf(root, sizeof(root), "%s", argv[2]);
+        use_root();
+        if (!strcmp(argv[1], "pack-first")) pack_first();
+        else if (!strcmp(argv[1], "pack-again")) pack_again();
+        else if (!strcmp(argv[1], "normal")) normal();
+        else if (!strcmp(argv[1], "pack-return")) pack_return();
+        else {
+            fprintf(stderr, "modpack_test: unknown step \"%s\"\n", argv[1]);
+            return 2;
+        }
+        return 0;
+    }
+    assert(scratch_dir(root, sizeof(root), "memories-modpack"));
+#ifdef _WIN32
+    for (char *c = root; *c; c++)
+        if (*c == '\\') *c = '/';
+#endif
+    setup();
+    choose("Pack");
+    step(argv[0], "pack-first");
+    step(argv[0], "pack-again");
+    choose(NULL);
+    step(argv[0], "normal");
+    choose("Pack");
+    step(argv[0], "pack-return");
+    choose(NULL);
+    step(argv[0], "normal");
+    puts("modpack: ok");
+    return 0;
+}

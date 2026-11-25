@@ -5080,15 +5080,135 @@ int Mods_ModpackPrepare(const char *name, long long *done, long long *total, con
     Json_Free(info);
     return ok;
 }
+/* --- A modpack's settings, apart from the player's own ----------------- *
+ * A pack's mods read and write the same `mod.<id>` and `mod.<id>.<key>`
+ * settings as the normal mods. So before a pack's launch writes any, every
+ * `mod.` setting is saved in modpacks/.normal-settings (first line
+ * "modpack=<name>", then key=value lines), unless that pack's session already
+ * saved them. A launch without that pack (no modpack, or another) puts them
+ * back: each saved value again, every `mod.` key the file lacks gone (its
+ * default again), saved; then the packs' .settings-applied markers go, so
+ * the next launch of a pack is its first again, and the file goes. */
+#define NORMAL_SETTINGS ".normal-settings"
+static int normal_settings_path(char *out, size_t size)
+{
+    char dir[PATH_MAX_];
+    if (Mods_ModpackDirectory(dir, sizeof(dir))) return -1;
+    return (size_t)snprintf(out, size, "%s/" NORMAL_SETTINGS, dir) >= size ? -1 : 0;
+}
+static void normal_settings_line(const char *key, int value, void *file)
+{
+    if (!strncmp(key, "mod.", 4)) fprintf(file, "%s=%d\n", key, value);
+}
+/* Saves the player's own `mod.` settings before the pack `pack` writes its
+ * own: 0, or -1 when they could not be (the pack is then not read). */
+static int normal_settings_save(const char *pack)
+{
+    char dir[PATH_MAX_], path[PATH_MAX_], temporary[PATH_MAX_ + 8];
+    FILE *file;
+    int failed;
+    if (Mods_ModpackDirectory(dir, sizeof(dir)) || Paths_MakeDirs(dir) ||
+        normal_settings_path(path, sizeof(path)) ||
+        (size_t)snprintf(temporary, sizeof(temporary), "%s.tmp", path) >= sizeof(temporary) ||
+        !(file = fopen(temporary, "wb")))
+        return -1;
+    fprintf(file, "modpack=%s\n", pack);
+    Settings_VisitNamed(normal_settings_line, file);
+    failed = ferror(file);
+    if (fclose(file)) failed = 1;
+    if (failed || rename(temporary, path)) {
+        remove(temporary);
+        return -1;
+    }
+    return 0;
+}
+typedef struct { char **keys; int count, room, failed; } KeyList;
+static void key_collect(const char *key, int value, void *context)
+{
+    KeyList *list = context;
+    (void)value;
+    if (strncmp(key, "mod.", 4) || list->failed) return;
+    if (list->count == list->room) {
+        int room = list->room ? list->room * 2 : 256;
+        char **grown = realloc(list->keys, (size_t)room * sizeof(*grown));
+        if (!grown) { list->failed = 1; return; }
+        list->keys = grown;
+        list->room = room;
+    }
+    if (!(list->keys[list->count] = strdup(key))) list->failed = 1;
+    else list->count++;
+}
+/* The packs' .settings-applied markers removed: each one's next launch is its first. */
+static void modpack_markers_remove(void)
+{
+    char dir[PATH_MAX_], path[PATH_MAX_];
+    DIR *d;
+    struct dirent *e;
+    if (Mods_ModpackDirectory(dir, sizeof(dir)) || !(d = opendir(dir))) return;
+    while ((e = readdir(d)))
+        if (Mods_ModpackNameValid(e->d_name) &&
+            (size_t)snprintf(path, sizeof(path), "%s/%s/.settings-applied", dir, e->d_name) < sizeof(path))
+            remove(path);
+    closedir(d);
+}
+/* At the start, before the mods' settings are read: when a pack's session
+ * saved the player's own settings and this launch does not read that pack
+ * (`pack`, NULL for none), they are put back. 1 when the session of `pack`
+ * goes on (its saved settings stay saved), else 0. */
+static int normal_settings_restore(const char *pack)
+{
+    char path[PATH_MAX_], line[512], *equals;
+    KeyList current = {0};
+    FILE *file;
+    int value;
+    if (normal_settings_path(path, sizeof(path)) || !(file = fopen(path, "rb"))) return 0;
+    if (!fgets(line, sizeof(line), file) || strncmp(line, "modpack=", 8)) line[0] = '\0';
+    line[strcspn(line, "\r\n")] = '\0';
+    if (pack && line[0] && !strcmp(line + 8, pack)) {
+        fclose(file);
+        return 1;
+    }
+    Settings_VisitNamed(key_collect, &current);
+    if (current.failed) {   /* out of memory: try again at the next launch */
+        fclose(file);
+        for (int i = 0; i < current.count; i++) free(current.keys[i]);
+        free(current.keys);
+        return 0;
+    }
+    for (int i = 0; i < current.count; i++) {
+        Settings_RemoveNamed(current.keys[i]);
+        free(current.keys[i]);
+    }
+    free(current.keys);
+    while (fgets(line, sizeof(line), file)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (!strncmp(line, "mod.", 4) && (equals = strchr(line, '=')) && sscanf(equals + 1, "%d", &value) == 1) {
+            *equals = '\0';
+            Settings_SetNamed(line, value);
+        }
+    }
+    fclose(file);
+    if (!Settings_Save()) {
+        fprintf(stderr, "memories-pc: %s\n", Settings_LastError());
+        return 0;   /* the file stays: the next launch puts them back again */
+    }
+    modpack_markers_remove();
+    remove(path);
+    say("the mod settings a modpack's launch had saved aside are back");
+    return 0;
+}
 /* Its mods' settings and load order, as exported: at every launch when it
- * is locked, else at its first. */
+ * is locked, else at its first (no .settings-applied yet: Mods_Load turns
+ * all its mods on then, saves, and writes the marker). */
+static int modpack_first;            /* this launch is the unlocked pack's first */
+static char modpack_marker[PATH_MAX_];
 static void modpack_settings(const char *folder)
 {
-    char path[PATH_MAX_], key[256];
+    char key[256];
     const JsonValue *list = Json_Member(Json_Root(modpack_info), "mods");
-    FILE *marker;
-    snprintf(path, sizeof(path), "%s/.settings-applied", folder);
-    if (!modpack_locked && !access(path, 0)) return;
+    snprintf(modpack_marker, sizeof(modpack_marker), "%s/.settings-applied", folder);
+    modpack_first = !modpack_locked && access(modpack_marker, 0) != 0;
+    if (!modpack_locked && !modpack_first) return;
     for (int i = 0; i < Json_Count(list); i++) {
         const JsonValue *mod = Json_At(list, i), *settings = Json_Member(mod, "settings");
         const char *id = Json_String(Json_Member(mod, "id"), "");
@@ -5099,7 +5219,6 @@ static void modpack_settings(const char *folder)
             if (Json_Name(v) && setting_key(key, sizeof(key), id, Json_Name(v)))
                 Settings_SetNamed(key, (int)Json_Number(v, 0));
     }
-    if (!modpack_locked && (marker = fopen(path, "wb"))) fclose(marker);
 }
 /* The selected modpack's folder, when there is one that exists: the scan
  * then reads it alone (the normal mods folders wait for a launch without). */
@@ -5132,9 +5251,20 @@ static int modpack_folder(char *out, size_t size)
                 return 0;
             }
             modpack_locked = Json_Bool(Json_Member(Json_Root(modpack_info), "locked"), 0);
-            modpack_settings(out);
         }
     }
+    /* The player's own mod settings aside before the pack writes any. */
+    if (!normal_settings_restore(name) && normal_settings_save(name)) {
+        snprintf(modpack_problem, sizeof(modpack_problem),
+                 "The modpack %s: your own mod settings could not be saved aside, so the normal mods were loaded.",
+                 name);
+        fprintf(stderr, "memories-pc: %s\n", modpack_problem);
+        Json_Free(modpack_info);
+        modpack_info = NULL;
+        modpack_locked = 0;
+        return 0;
+    }
+    modpack_settings(out);
     snprintf(modpack_launched, sizeof(modpack_launched), "%s", name);
     return 1;
 }
@@ -5231,13 +5361,15 @@ void Mods_Load(void)
         const char *named = getenv("MEMORIES_MODS_DIR");
         scanned = 1;
         if (named && *named) {
+            normal_settings_restore(NULL);
             scan(named, "installed");
             scan_folder(1);
         } else if (modpack_folder(path, sizeof(path))) {
-            /* A modpack: its mods alone, all on at the start (the Modpack tab). */
+            /* A modpack: its mods alone, all on at its first launch (the Modpack tab). */
             scan(path, "installed");
             say("modpack %s: %s", modpack_launched, path);
         } else {
+            normal_settings_restore(NULL);   /* before a mod's setting is read */
             if (!Paths_Program(path, sizeof(path), "mods")) scan(path, "shipped");
             scan_folder(0);
             if (!Paths_User(path, sizeof(path), "mods")) scan(path, "installed");
@@ -5262,6 +5394,12 @@ void Mods_Load(void)
         if (all && (!strcmp(all, "0") || !strcmp(all, "off"))) want = 0;
         mods[i].enabled = want;
         enabled[i] = want;
+    }
+    if (first && modpack_first) {
+        /* What the pack's first launch wrote is kept before the marker says
+         * it was: a launch that never saves would else lose it. */
+        FILE *marker;
+        if (Settings_Save() && (marker = fopen(modpack_marker, "wb"))) fclose(marker);
     }
     for (i = 0; i < mod_count; i++) if (enabled[i] && !Mods_Compatible(i, enabled, error, sizeof(error))) {
         note(&mods[i], "%s", error); enabled[i] = 0;

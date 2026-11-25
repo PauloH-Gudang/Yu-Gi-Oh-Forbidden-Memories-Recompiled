@@ -333,7 +333,9 @@ const char *Mods_ModpackLaunched(void);
  * was exported: modpack.json's "files" are checked by SHA-256), "" if it was.
  * Locked: its author locked its settings (modpack.json "locked"): they are
  * applied at every launch, and the window does not change them. Without
- * "locked" they are applied at its first launch only. */
+ * "locked" they are applied at its first launch only. Either way the
+ * player's own `mod.` settings are saved aside first (modpacks/.normal-settings)
+ * and put back at the next launch without that pack (notes/mods-window.md). */
 const char *Mods_ModpackProblem(void);
 int Mods_ModpackLocked(void);
 /* Activate modpack: reads every file of the modpack `name` once, checking

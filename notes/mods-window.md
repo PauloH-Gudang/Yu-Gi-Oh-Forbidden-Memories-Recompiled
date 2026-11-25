@@ -492,6 +492,37 @@ installs a `.zip`. Nothing is contacted until it is tapped.
   Update, in use, the clean-up at panel open); `pc_mod_import` checks the
   importer's progress and cancel (`Mods_ImportWatch`).
 
+**Modpack** (the tab beside the mods list; `Mods_Modpack*` in
+`src/pc/mods/mods.h`): a modpack is a folder of mods in the user directory's
+`modpacks/`, made from a `.zip` by Import... (its `modpack.json` names it,
+lists its mods with their load order and option values, says whether it is
+`"locked"`, and gives every file's SHA-256 under `"files"`; Export... writes
+such a `.zip` from mods of the normal folders). Activate modpack chooses one
+(`modpacks/selected.txt`) for the next launch, which reads only that folder,
+instead of every other mods folder; "No modpack" goes back to the normal mods.
+A folder put in `modpacks/` by hand, without a `modpack.json`, is a modpack
+too.
+
+- **Its settings are its own.** A pack's mods use the same `mod.<id>` and
+  `mod.<id>.<key>` settings as the normal mods, so before a pack's launch
+  writes any, every `mod.` setting the player has is saved in
+  `modpacks/.normal-settings` (written whole or not at all; first line
+  `modpack=<name>`). A launch without that pack (no modpack, another one, or
+  `MEMORIES_MODS_DIR`) puts them back before any mod's setting is read: each
+  saved value again, every `mod.` key the file lacks gone (its default
+  again), saved, and the file removed. So what a pack wrote, and what the
+  player changed while it ran, never reaches the normal mods. When the
+  settings cannot be saved aside, the pack is not read (the normal mods are,
+  and the window says why).
+- **When its values are applied:** a locked pack's at every launch; an
+  unlocked pack's at its first launch, which saves them and then writes
+  `.settings-applied` in its folder. Putting the player's own settings back
+  also removes the packs' `.settings-applied`, so the next launch of a pack
+  is its first again: a pack's session is kept while it is the one chosen,
+  not after the normal mods ran.
+- `pc_modpack` runs a pack's launches one process each (as `Mods_Load` scans
+  once): first, again, normal, the pack again.
+
 Implementation: `src/pc/platform/mods_window.c`, `src/pc/mods/manager.c`
 (`src/pc/mods/overlap.c` for the overlaps, `src/pc/mods/import.c` for Import
 mod..., `src/pc/mods/hd_pack.c` for HD pack...), and

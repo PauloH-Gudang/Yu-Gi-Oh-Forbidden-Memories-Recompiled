@@ -578,6 +578,11 @@ if(BUILD_TESTING)
     foreach(mods_folder_case file precedence missing notfolder owned owned-up owned-user env envempty exclusive code)
         add_test(NAME pc_mods_folder_${mods_folder_case} COMMAND memories_mods_folder_test ${mods_folder_case})
     endforeach()
+    # Modpacks across launches: the test runs itself once per launch, on one user directory.
+    add_executable(memories_modpack_test tests/pc/modpack_test.c ${MOD_TEST_SOURCES})
+    target_include_directories(memories_modpack_test PRIVATE src)
+    target_link_libraries(memories_modpack_test PRIVATE m Threads::Threads PNG::PNG)
+    add_test(NAME pc_modpack COMMAND memories_modpack_test)
     # envempty has nothing to test on Windows, which removes a variable set to nothing: it exits 77 there.
     set_tests_properties(pc_mods_folder_envempty PROPERTIES SKIP_RETURN_CODE 77)
     # What enabled mods change in common (src/pc/mods/overlap.c): the mods in
