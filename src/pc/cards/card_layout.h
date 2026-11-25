@@ -187,7 +187,6 @@ typedef struct {
     char field_back_image[1024];
     char back_image[1024];
     char library_icon[1024];
-    int mod;   /* the mod whose layout declared the style (its pictures, parts and "full_bleed"), -1 for none */
 } CardLayoutFrameStyle;
 
 /* The style the layout gives `card_id`, into `style` (its `image` empty); 1,

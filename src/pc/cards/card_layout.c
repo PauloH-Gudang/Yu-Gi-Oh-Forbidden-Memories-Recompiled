@@ -41,7 +41,10 @@ static int last_set[CARD_LAYOUT_ELEMENT_COUNT];
  * layout with no styles, the legacy "frame" of its kind) -- its color, picture path and
  * size, and whether it is laid out as a spell. A monster with no frame until
  * a call site sets a real card, as every call site that never draws one. */
-static CardLayoutFrameStyle current = {.mod = -1};
+static CardLayoutFrameStyle current;
+/* The mod whose layout declared `current`'s style, -1 for none. It is kept beside `current`, not in it:
+ * CardLayoutFrameStyle is lent to code mods (CardLayout_FrameStyleOf), so its size is theirs. */
+static int current_mod = -1;
 
 typedef struct {
     int mod;                   /* -1: no applied mod declares "card_layout" */
@@ -193,18 +196,18 @@ static int any_layout_on(void)
 static LayoutSource current_source(void)
 {
     LayoutSource source;
-    if (current.name[0] && current.mod >= 0) {
-        source.mod = current.mod;
-        source.layout = layout_of(current.mod);
+    if (current.name[0] && current_mod >= 0) {
+        source.mod = current_mod;
+        source.layout = layout_of(current_mod);
         if (source.layout) return source;
     }
     return find_source();
 }
 
-/* The "frame_styles" entry `style` was resolved from. */
-static const JsonValue *style_node_of(const CardLayoutFrameStyle *style)
+/* The "frame_styles" entry `style` was resolved from, in the layout of `mod`, the mod that declared it. */
+static const JsonValue *style_node_of(const CardLayoutFrameStyle *style, int mod)
 {
-    const JsonValue *styles = Json_Member(layout_of(style->mod), "frame_styles");
+    const JsonValue *styles = Json_Member(layout_of(mod), "frame_styles");
     return styles && style->name[0] ? Json_Member(styles, style->name) : NULL;
 }
 
@@ -597,8 +600,8 @@ static int newest_layout_mod(void)
  * on (off, the card is laid out as any other). Otherwise the shared layout
  * (find_source) picks by the card's type, kind, color and its rules, while its
  * own "full_bleed" is on. Each style is drawn by its owner's own parts and
- * pictures, whichever mod the card's style came from. */
-static int resolve_style(int card, CardLayoutFrameStyle *out, int want_image)
+ * pictures, whichever mod the card's style came from: `owner_mod` is set to that mod (-1 for none). */
+static int resolve_style(int card, CardLayoutFrameStyle *out, int want_image, int *owner_mod)
 {
     LayoutSource shared = find_source(), owner;
     int cls = Cards_Class(card);
@@ -610,7 +613,7 @@ static int resolve_style(int card, CardLayoutFrameStyle *out, int want_image)
     const char *card_style = Cards_FrameStyle(card);
 
     memset(out, 0, sizeof(*out));
-    out->mod = -1;
+    *owner_mod = -1;
     owner.mod = -1;
     owner.layout = NULL;
     /* The retail viewer's card plate occupies at most 140x196 units. */
@@ -661,7 +664,7 @@ static int resolve_style(int card, CardLayoutFrameStyle *out, int want_image)
             magic = Json_String(Json_Member(frame_for_kind(shared.layout, CARD_FRAME_MAGIC), "image"), NULL);
             if (kind == CARD_FRAME_RITUAL && (!own || !*own || (magic && !strcmp(own, magic)))) kind = CARD_FRAME_MAGIC;
             frame = frame_for_kind(shared.layout, kind);
-            out->mod = shared.mod;
+            *owner_mod = shared.mod;
             out->color = kind;
             out->full_bleed = 1;
             snprintf(out->name, sizeof(out->name), "%s", frame_kind_names[kind]);
@@ -715,7 +718,7 @@ static int resolve_style(int card, CardLayoutFrameStyle *out, int want_image)
         return 0;
     }
     snprintf(out->name, sizeof(out->name), "%s", name);
-    out->mod = owner.mod;
+    *owner_mod = owner.mod;
     image = Json_String(Json_Member(style, "image"), NULL);
     /* A style with a picture is full-bleed by default.  Fallback styles may
      * deliberately omit it: they still select a hand palette, but preserve
@@ -743,7 +746,9 @@ static int resolve_style(int card, CardLayoutFrameStyle *out, int want_image)
 
 int CardLayout_FrameStyleOf(int card_id, CardLayoutFrameStyle *style)
 {
-    return resolve_style(card_id, style, 0);
+    int owner_mod;
+
+    return resolve_style(card_id, style, 0, &owner_mod);
 }
 
 int CardLayout_StyleOf(int card_id, CardLayoutStyle *style)
@@ -767,18 +772,20 @@ int CardLayout_StyleOf(int card_id, CardLayoutStyle *style)
 static const JsonValue *hand_part_for(int card_id, const char *name)
 {
     CardLayoutFrameStyle style;
+    int owner_mod;
     const JsonValue *hand;
 
-    if (!resolve_style(card_id, &style, 0)) return NULL;
-    hand = Json_Member(style_node_of(&style), "hand");
+    if (!resolve_style(card_id, &style, 0, &owner_mod)) return NULL;
+    hand = Json_Member(style_node_of(&style, owner_mod), "hand");
     return Json_Member(hand, name);
 }
 
 int CardLayout_HandStyled(int card_id)
 {
     CardLayoutFrameStyle style;
+    int owner_mod;
 
-    return resolve_style(card_id, &style, 0) && Json_Member(style_node_of(&style), "hand") != NULL;
+    return resolve_style(card_id, &style, 0, &owner_mod) && Json_Member(style_node_of(&style, owner_mod), "hand") != NULL;
 }
 
 CardLayoutPlacement CardLayout_HandGet(int card_id, CardLayoutHandElement element)
@@ -817,9 +824,10 @@ const char *CardLayout_HandFramePath(int card_id)
 {
     static char path[1024];
     CardLayoutFrameStyle style;
+    int owner_mod;
 
     path[0] = 0;
-    if (resolve_style(card_id, &style, 1)) snprintf(path, sizeof(path), "%s", style.hand_image);
+    if (resolve_style(card_id, &style, 1, &owner_mod)) snprintf(path, sizeof(path), "%s", style.hand_image);
     return path;
 }
 
@@ -827,9 +835,10 @@ const char *CardLayout_FieldFramePath(int card_id)
 {
     static char path[1024];
     CardLayoutFrameStyle style;
+    int owner_mod;
 
     path[0] = 0;
-    if (resolve_style(card_id, &style, 1)) snprintf(path, sizeof(path), "%s", style.field_image);
+    if (resolve_style(card_id, &style, 1, &owner_mod)) snprintf(path, sizeof(path), "%s", style.field_image);
     return path;
 }
 
@@ -837,9 +846,10 @@ const char *CardLayout_FieldBackPath(int card_id)
 {
     static char path[1024];
     CardLayoutFrameStyle style;
+    int owner_mod;
 
     path[0] = 0;
-    if (resolve_style(card_id, &style, 1)) snprintf(path, sizeof(path), "%s", style.field_back_image);
+    if (resolve_style(card_id, &style, 1, &owner_mod)) snprintf(path, sizeof(path), "%s", style.field_back_image);
     return path;
 }
 
@@ -847,9 +857,10 @@ const char *CardLayout_BackImagePath(int card_id)
 {
     static char path[1024];
     CardLayoutFrameStyle style;
+    int owner_mod;
 
     path[0] = 0;
-    if (resolve_style(card_id, &style, 1)) snprintf(path, sizeof(path), "%s", style.back_image);
+    if (resolve_style(card_id, &style, 1, &owner_mod)) snprintf(path, sizeof(path), "%s", style.back_image);
     return path;
 }
 
@@ -857,30 +868,35 @@ const char *CardLayout_LibraryIconPath(int card_id)
 {
     static char path[1024];
     CardLayoutFrameStyle style;
+    int owner_mod;
 
     path[0] = 0;
-    if (resolve_style(card_id, &style, 1)) snprintf(path, sizeof(path), "%s", style.library_icon);
+    if (resolve_style(card_id, &style, 1, &owner_mod)) snprintf(path, sizeof(path), "%s", style.library_icon);
     return path;
 }
 
 void CardLayout_SetCard(int card_id)
 {
     CardLayoutFrameStyle style;
+    int owner_mod;
     int cls = Cards_Class(card_id);
 
     memset(&current, 0, sizeof(current));
-    current.mod = -1;
+    current_mod = -1;
     current.spell_layout = cls == CARD_CLASS_SPELL || cls == CARD_CLASS_EQUIP || cls == CARD_CLASS_RITUAL_SPELL ||
                            cls == CARD_CLASS_TRAP;
     current.width = CARD_LAYOUT_FRAME_MAX_W;
     current.height = CARD_LAYOUT_FRAME_MAX_H;
-    if (resolve_style(card_id, &style, 1)) current = style;
+    if (resolve_style(card_id, &style, 1, &owner_mod)) {
+        current = style;
+        current_mod = owner_mod;
+    }
     LOG(LOG_CARD_LAYOUT, "SetCard id=%d class=%d image=%s", card_id, cls, current.image);
 }
 
 int CardLayout_FullBleed(void)
 {
-    return current.mod >= 0 && mod_full_bleed(current.mod) && current.full_bleed;
+    return current_mod >= 0 && mod_full_bleed(current_mod) && current.full_bleed;
 }
 
 int CardLayout_Active(void)
@@ -894,16 +910,17 @@ int CardLayout_Styled(void)
     /* SetCard leaves the name empty when no style resolved. A style belongs to the mod that declared it,
      * which is not the shared layout's owner when it is a mod of styles alone: that mod's switch decides. */
     if (!current.name[0]) return 0;
-    return (current.mod >= 0 && mod_full_bleed(current.mod)) || full_bleed_of(&source);
+    return (current_mod >= 0 && mod_full_bleed(current_mod)) || full_bleed_of(&source);
 }
 
 int CardLayout_TitleStyled(int card_id)
 {
     CardLayoutFrameStyle style;
+    int owner_mod;
 
     /* Only a full-bleed style, as the low-resolution title mask (func_80028B08.c) */
-    if (!resolve_style(card_id, &style, 0) || !style.full_bleed) return 0;
-    return layout_part(style_node_of(&style), layout_of(style.mod), "title") != NULL;
+    if (!resolve_style(card_id, &style, 0, &owner_mod) || !style.full_bleed) return 0;
+    return layout_part(style_node_of(&style, owner_mod), layout_of(owner_mod), "title") != NULL;
 }
 
 int CardLayout_StarsCentered(void)

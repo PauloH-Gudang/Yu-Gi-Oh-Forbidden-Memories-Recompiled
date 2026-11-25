@@ -7,6 +7,7 @@
  * joined with its mod's own directory (or refused outside it). */
 #include "../../src/pc/cards/card_layout.c"
 #include <stdarg.h>
+#include <stddef.h>
 #include <stdlib.h>
 
 #define CHECK(condition)                                                        \
@@ -426,6 +427,11 @@ static void frame_color_override_wins_over_type(void)
     CHECK(!CardLayout_IsSpell());   /* laid out by what the card is: a monster still has its ATK/DFD and stars */
     CHECK(!strcmp(CardLayout_FramePath(), "/mods/x/frame_trap.png"));
 }
+
+/* CardLayoutFrameStyle is lent to code mods (CardLayout_FrameStyleOf fills the caller's own) and shipped in
+ * v0.3.1-preview: nothing may follow library_icon, or a mod built against it has its stack written past. */
+_Static_assert(sizeof(CardLayoutFrameStyle) == offsetof(CardLayoutFrameStyle, library_icon) + 1024,
+               "CardLayoutFrameStyle keeps its shipped size");
 
 /* "frame_styles", "frame_for" and "default_style" (card_layout.h's
  * CardLayoutFrameStyle): the names the whole feature is built on. */
@@ -1341,6 +1347,7 @@ static const char *path_of(int id)
 static void styles_only_does_not_shadow(void)
 {
     CardLayoutFrameStyle style;
+    int owner;   /* the mod that declared the style (kept out of the struct mods are lent) */
     reset();
     CHECK(!styles_only(NULL));
     add_hd_and_foil(1, 1);
@@ -1348,11 +1355,11 @@ static void styles_only_does_not_shadow(void)
     CHECK(!strcmp(path_of(1), "/mods/hd/g.png"));       /* a plain card: hd's default */
     CHECK(CardLayout_FullBleed());
     CHECK(CardLayout_Part(CARD_LAYOUT_ATK).x == 38);    /* hd's shared part */
-    CHECK(CardLayout_FrameStyleOf(1, &style) && style.mod == 0);
+    CHECK(resolve_style(1, &style, 0, &owner) && owner == 0);
     CHECK(!strcmp(path_of(2), "/mods/foil/rainbow.png"));   /* a card of foil's: its style */
     CHECK(CardLayout_FullBleed());
     CHECK(CardLayout_Part(CARD_LAYOUT_ATK).x == 11);    /* foil's own part */
-    CHECK(CardLayout_FrameStyleOf(2, &style) && style.mod == 1 && style.color == CARD_FRAME_PURPLE);
+    CHECK(resolve_style(2, &style, 0, &owner) && owner == 1 && style.color == CARD_FRAME_PURPLE);
     CHECK(!strcmp(path_of(1), "/mods/hd/g.png"));       /* and back: nothing carried over */
     CHECK(CardLayout_Part(CARD_LAYOUT_ATK).x == 38);
     CHECK(notes == 0);
@@ -1365,10 +1372,11 @@ static void styles_only_does_not_shadow(void)
 static void style_owner_gate(void)
 {
     CardLayoutFrameStyle style;
+    int owner;
     /* foil off: its card is drawn as every other of hd's. */
     add_hd_and_foil(1, 0);
     CHECK(!strcmp(path_of(2), "/mods/hd/g.png"));
-    CHECK(CardLayout_FrameStyleOf(2, &style) && style.mod == 0);
+    CHECK(resolve_style(2, &style, 0, &owner) && owner == 0);
     CHECK(!strcmp(path_of(1), "/mods/hd/g.png"));
     /* hd off, foil on (the player's own case: retail frames, and a few cards
      * in a frame of their own): plain cards stay retail, with retail's parts. */
