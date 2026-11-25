@@ -68,8 +68,13 @@ ROOT = Path(__file__).resolve().parents[2]
 REPLAYS = ROOT / "tests/pc/replays"
 OUTPUT = ROOT / "tmp/pc/replays"
 GUEST_RAM, RAM_SIZE, SCRATCHPAD = 0x80000000, 0x200000, 0x1F800000
-# RAM a deterministic run does not hold the same from run to run: the sound
-# driver's work area (g_SDValue), which the mixer thread updates in real time.
+# RAM a deterministic run did not hold the same from run to run: the sound
+# driver's work area (g_SDValue). It reads the voices' levels, which a mixer
+# thread paced by the host's clock had moved a different amount at the same
+# game instant in each run. Under MEMORIES_DETERMINISTIC with no audio device,
+# what a replay runs, the mixer is now stepped by virtual time on the game
+# thread and the area is the same; the mask stays until the dead game stack's
+# residue, which still reaches a few bytes of RAM elsewhere, is cleared too.
 MASKS = [(0x801E0384, 0x801E1B44)]
 
 

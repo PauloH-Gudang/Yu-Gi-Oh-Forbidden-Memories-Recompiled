@@ -5,6 +5,7 @@
 #include "state_subsystems.h"
 #include "state_remap.h"
 #include "pc/platform/settings.h"
+#include "pc/platform/platform.h"
 #include "pc/platform/paths.h"
 #include "pc/mods/mods.h"
 #include "pc/mods/events.h"
@@ -579,6 +580,11 @@ static void apply(void)
     memcpy(&entry, chunk, sizeof(entry));
     chunk = Memories_StateFindChunk(&state, "stack", &size);
     memcpy((void *)(uintptr_t)MEMORIES_STATE_ENTRY_SP(entry), chunk, size);
+    /* The state resumes in the VSync's caller, past the wrapper that clears what the host code left below
+     * the game's frame (platform.h, PLATFORM_SCRUB_DEAD_STACK). Below the restored frames is still the
+     * session before the load's (its VSync, the load's own frames and what they read) until the game's next
+     * VSync(0) clears it, so it is cleared here: 256 KiB, the span of the VSync that presents (libetc.c). */
+    Platform_ScrubGameStackBelow(MEMORIES_STATE_ENTRY_SP(entry), 256u * 1024u);
     free(pending_image);
     pending_image = NULL;
     Spu_Hold(0);

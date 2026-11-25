@@ -81,6 +81,16 @@
  *      event change
  *  26  a card's "variant_permille" and "variant_label" (notes/more-cards.md)
  *      only; no host layout or event change
+ *  27  a frame style's richer parts (stars.image, game_frame, parts_over_art, color on the
+ *      labels and digit strips) and a card's art_transparent (notes/modding.md, card_layout);
+ *      a card_layout of frame_styles alone no longer replaces another mod's layout;
+ *      CardLayout_HandPlace, a hand card's placement for a code mod. No host layout or
+ *      event change, and CardLayoutFrameStyle keeps its size
+ *  28  text_capture, text_key: the keys typed, for a mod that has the player type
+ *  29  model_module, model_module_remove, model_module_base: native C a code
+ *      mod gives for a battle model's control modules (MemoriesModelModule),
+ *      run instead of those modules' MIPS where the module's bytes hash to
+ *      it (notes/modding.md, "Your own C for a module (API 29)")
  *  30  draw_text_px, text_width_px: overlay text at any size in pixels; and, for text and pictures a mod makes
  *      itself inside the game's picture, the exported Menu_TextBitmap and TexturePack_BankImageFromRgba
  *      (notes/modding.md)
@@ -98,6 +108,49 @@ typedef struct MemoriesModHost MemoriesModHost;
 #define MEMORIES_HUD_FUSION_HELPER 1u
 #define MEMORIES_HUD_RANK 2u
 #define MEMORIES_HUD_FREE_DUEL_PROGRESS 4u
+
+/* API 29: a battle model's control module run as the mod's own C
+ * (host->model_module). The game calls a module through the word at +4 of its
+ * slot (the primary at 0x8013A000 / 0x8017A000, 0x1000 bytes; the variant at
+ * 0x8013B000 / 0x8017B000, 0x5000 bytes). Where the slot holds a module whose
+ * first `span` bytes hash to `sha256`, `entry` runs instead of those bytes:
+ * the same call, with `context` the work area the game hands the module and
+ * `command` its command (>= 0 a setup, < 0 an update), returning what the
+ * module returns. A call this C does not take runs the port's own handling
+ * of the module. */
+typedef int32_t (*MemoriesModelEntry)(uint8_t *context, int32_t command);
+
+#define MEMORIES_MODEL_VARIANT 0u
+#define MEMORIES_MODEL_PRIMARY 1u
+#define MEMORIES_MODEL_SLOT_A 0u     /* 0x8013A000 / 0x8013B000 */
+#define MEMORIES_MODEL_SLOT_B 1u     /* 0x8017A000 / 0x8017B000 */
+#define MEMORIES_MODEL_SLOT_BOTH 2u  /* one entry for both: it finds its data with model_module_base */
+/* flags */
+#define MEMORIES_MODEL_BOUND 1u      /* entries..modulus below hold; without it the C takes every command */
+#define MEMORIES_MODEL_OVER_DISC 2u  /* consulted before the disc's own C (by default after it) */
+/* The slot B address of a slot A one: the slots are 0x40000 apart, primary and variant alike. */
+#define MEMORIES_MODEL_SLOT_DISTANCE 0x40000u
+
+typedef struct {
+    uint32_t size;          /* sizeof(MemoriesModelModule): the fields this mod knows */
+    uint32_t kind;          /* MEMORIES_MODEL_VARIANT or MEMORIES_MODEL_PRIMARY */
+    uint32_t slot;          /* MEMORIES_MODEL_SLOT_A, _B or _BOTH */
+    uint32_t flags;         /* MEMORIES_MODEL_BOUND, MEMORIES_MODEL_OVER_DISC */
+    uint32_t identifier;    /* the image's first word */
+    uint32_t span;          /* the bytes from the slot base the hash covers: 8 to 0x1000 (primary) or 0x5000 (variant) */
+    char sha256[65];        /* SHA-256 of those bytes, 64 hex digits (either case) and a '\0' */
+    MemoriesModelEntry entry;
+    /* With MEMORIES_MODEL_BOUND, which calls the C may take
+     * (src/pc/overlays/model_gate_command.h): a setup's command, % modulus when
+     * modulus is not 0, must be below `entries`; an update's entry, read at
+     * `field` of the work area, must be one of them: index_width 0 a pointer to
+     * one of the `entries` entries of `stride` bytes at `table` (an offset from
+     * the slot base), 1, 2 or 4 the command itself stored in that many bytes.
+     * `field` lies in the module's work area (below 0x1000 for a primary,
+     * 0x5000 for a variant), aligned to what is stored there (4 for a
+     * pointer). Any other call does not run this C. */
+    uint32_t entries, table, stride, field, index_width, modulus;
+} MemoriesModelModule;
 
 
 typedef struct {
@@ -411,6 +464,42 @@ struct MemoriesModHost {
     int (*wheel)(const MemoriesModHost *);
     void (*take_wheel)(const MemoriesModHost *, int on);
 
+    /* --- API 28 ---
+     * Typed text, for a mod with a text field of its own (a password, a
+     * name). text_capture(1) makes the keyboard the mod's, until
+     * text_capture(0), the mod being turned off, or another mod taking it:
+     * the text the player types (the number pad's and the number row's
+     * digits, letters, a space, whatever the keyboard layout and an input
+     * method make of the keys; Ctrl+V, Command+V or Shift+Insert gives the
+     * clipboard's printable ASCII as if typed) and Backspace, Enter and Escape are kept for
+     * text_key, and no key does anything in the game meanwhile (Enter is
+     * not Start, Escape asks nothing). The game's controls given by the
+     * pad are not touched. Keys held when it starts end as they were
+     * pressed. While a menu, a notice or one of the port's windows has the
+     * keyboard, nothing is kept.
+     * text_key: the next key kept, in the order it was typed: 32 to 126 a
+     * printable ASCII character, MEMORIES_KEY_BACKSPACE, MEMORIES_KEY_ENTER
+     * or MEMORIES_KEY_ESCAPE; 0 when none is waiting. Characters past ASCII
+     * (an accent, a kana) are left out. */
+    void (*text_capture)(const MemoriesModHost *, int on);
+    int (*text_key)(const MemoriesModHost *);
+
+    /* --- API 29 ---
+     * Native C for a model's control module (MemoriesModelModule): a token,
+     * or 0 when the row is refused (the mod's status says why: a sha256 that
+     * is not 64 hex digits, a span past the module, a bound outside the span,
+     * no entry). Register in MemoriesModInit. A row runs only while its mod is
+     * applied; removing the mod leaves it registered but unused, and a failed
+     * init discards it, as with hooks. An attack the C set up finishes on it
+     * even if the mod is turned off before its last update. With SLOT_BOTH a
+     * row is two, one for each slot, sharing one entry and one token. */
+    int (*model_module)(const MemoriesModHost *, const MemoriesModelModule *row);
+    void (*model_module_remove)(const MemoriesModHost *, int token);
+    /* Inside an entry: the slot base of the module it runs for (0x8013A000,
+     * 0x8013B000, 0x8017A000 or 0x8017B000), so C registered for both slots
+     * finds its data: (T *)(uintptr_t)(base + offset). 0 outside an entry. */
+    uint32_t (*model_module_base)(const MemoriesModHost *);
+
     /* --- API 30 ---
      * Overlay text at any size. draw_text and text_width take a whole-number
      * `scale` (13 canvas pixels times it, so only 13, 26, 39...); these take
@@ -426,6 +515,10 @@ struct MemoriesModHost {
                          unsigned alpha);
     int (*text_width_px)(const MemoriesModHost *, const char *text, int px);
 };
+
+#define MEMORIES_KEY_BACKSPACE 8
+#define MEMORIES_KEY_ENTER 13
+#define MEMORIES_KEY_ESCAPE 27
 
 /* The symbol a mod's object defines, and its type. */
 typedef int (*MemoriesModEntry)(const MemoriesModHost *host, MemoriesMod *mod);

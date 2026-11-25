@@ -62,4 +62,20 @@ static inline int ModelGate_CommandCovered(uint32_t entries, uint32_t table, uin
     return entry_word >= first && entry_word - first < entries * stride && (entry_word - first) % stride == 0;
 }
 
+/* A row may pick its entry with command % modulus (`modN` in the tables:
+ * variant shapes 72, 104, 118 to 121, 156 and 164 and the primary `effect`
+ * take entry command % 100, and give the hundreds another use, `effect` the
+ * animation it waits for), so a setup is covered when that entry is; modulus
+ * 0 is ModelGate_CommandCovered. The updates read the work area as for any
+ * row: a pointer row's (model_gate.py refuses a modulus on an index row). */
+static inline int ModelGate_CommandCoveredModulo(uint32_t entries, uint32_t table, uint32_t stride, uint32_t base,
+                                                 int command, uint32_t entry_word, uint32_t index_width,
+                                                 int stand_in, uint32_t modulus)
+{
+    if (modulus != 0 && command >= 0) {
+        command = (int)((uint32_t)command % modulus);
+    }
+    return ModelGate_CommandCovered(entries, table, stride, base, command, entry_word, index_width, stand_in);
+}
+
 #endif
