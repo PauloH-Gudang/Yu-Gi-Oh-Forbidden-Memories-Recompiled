@@ -633,6 +633,35 @@ int main(void)
             Mods_ImportClose(imp);
         }
     }
+    /* A modpack's modpack.json (Mods_ImportExtract): over the size it is
+     * given it is refused before a byte is written; a set cancel (Stop)
+     * refuses it too; a name the .zip lacks is 0. */
+    reset();
+    {
+        ZipItem items[] = {{"alpha/mod.json", MANIFEST_A, 1, 0, 0, 0, 0, 0},
+                           {"modpack.json", "{\"name\": \"A pack\", \"files\": {}}", 1, 0, 0, 0, 0, 0}};
+        char out[1200];
+        unsigned done = 0;
+        int cancel = 0;
+        ModsImport *imp;
+        FILE *f;
+        write_zip(zip, items, 2);
+        snprintf(out, sizeof(out), "%s/extracted.json", root);
+        imp = Mods_ImportOpen(zip, why, sizeof(why));
+        CHECK(imp != NULL);
+        if (imp) {
+            CHECK(Mods_ImportExtract(imp, "modpack.json", out, 16, why, sizeof(why)) == -1);
+            CHECK(strstr(why, "too large") != NULL && !(f = fopen(out, "rb")));
+            CHECK(Mods_ImportExtract(imp, "nothing.json", out, 0, why, sizeof(why)) == 0);
+            CHECK(Mods_ImportExtract(imp, "modpack.json", out, MODS_MODPACK_JSON_MAX, why, sizeof(why)) == 1);
+            remove(out);
+            cancel = 1;
+            Mods_ImportWatch(imp, &done, &cancel);
+            CHECK(Mods_ImportExtract(imp, "modpack.json", out, MODS_MODPACK_JSON_MAX, why, sizeof(why)) == -1);
+            CHECK(!strcmp(why, "Cancelled.") && !(f = fopen(out, "rb")) && done == 0);
+            Mods_ImportClose(imp);
+        }
+    }
     /* The process ended between a Replace's two renames: the old mod is in
      * the hidden folder's old/ and nothing is in its place, so it goes back
      * (and the unfinished new one goes). Where something is already there

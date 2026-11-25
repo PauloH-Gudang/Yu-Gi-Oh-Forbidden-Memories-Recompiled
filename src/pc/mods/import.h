@@ -103,8 +103,12 @@ int Mods_ImportRemoveTree(const char *path);
 int Mods_ImportRemoveInstalled(const char *mods, const char *directory, char *why, size_t why_size);
 /* --- Modpacks (the Mods window's Modpack tab) --- */
 /* Unpacks the entry `name` of the .zip to the file `path`: 1, 0 when the
- * .zip has no such file, -1 with why. */
-int Mods_ImportExtract(ModsImport *import, const char *name, const char *path, char *why, size_t why_size);
+ * .zip has no such file, -1 with why (larger than `max` bytes when `max` is
+ * not 0; "Cancelled." when Mods_ImportWatch's *cancel is set, checked before
+ * and in every chunk). Progress goes to Mods_ImportWatch's *done. */
+#define MODS_MODPACK_JSON_MAX (64ul << 20) /* modpack.json: a list of every file and its SHA-256 */
+int Mods_ImportExtract(ModsImport *import, const char *name, const char *path, unsigned long max, char *why,
+                       size_t why_size);
 /* A .zip written entry by entry (deflated, UTF-8 names): Create, Add..., then
  * Finish (1; 0 with why, and the file removed), which frees it either way.
  * Abandon makes the Finish to come remove it. Progress: *done grows by the

@@ -1183,13 +1183,22 @@ outside:
 
 /* --- Modpacks (import.h): one file out of the .zip, a .zip written, SHA-256 */
 
-int Mods_ImportExtract(ModsImport *import, const char *name, const char *path, char *why, size_t why_size)
+int Mods_ImportExtract(ModsImport *import, const char *name, const char *path, unsigned long max, char *why,
+                       size_t why_size)
 {
     const Entry *e = import ? find(import, name) : NULL;
     FILE *out;
     int ok;
     if (!e || e->folder)
         return 0;
+    if (max && e->size > max) {
+        snprintf(why, why_size, "Its %s is too large (over %lu KB).", name, max >> 10);
+        return -1;
+    }
+    if (stop_asked(import)) {
+        snprintf(why, why_size, "Cancelled.");
+        return -1;
+    }
     if (!(out = fopen(path, "wb"))) {
         snprintf(why, why_size, "Could not write %s: %s.", path, strerror(errno));
         return -1;

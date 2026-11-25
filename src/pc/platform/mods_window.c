@@ -1238,7 +1238,9 @@ static void *pack_import_step(void *unused)
         JsonDocument *info;
         int got;
         snprintf(path, sizeof(path), "%s/modpack.json", temp);
-        if ((got = Mods_ImportExtract(import, "modpack.json", path, why, sizeof(why))) < 0) goto done;
+        Mods_ImportWatch(import, &import_job.done, &import_job.cancel); /* Stop stops this too */
+        if ((got = Mods_ImportExtract(import, "modpack.json", path, MODS_MODPACK_JSON_MAX, why, sizeof(why))) < 0)
+            goto done;
         if (got && (info = Json_ParseFile(path, error, sizeof(error)))) {
             const char *named = Json_String(Json_Member(Json_Root(info), "name"), "");
             if (*named) folder_name(name, sizeof(name), named);
@@ -1246,11 +1248,10 @@ static void *pack_import_step(void *unused)
         }
     }
     for (int i = 0; i < import_job.count; i++) Mods_ImportMod(import, i)->replace[0] = 0;
-    Mods_ImportWatch(import, &import_job.done, &import_job.cancel);
     if (pack_stepped) Mods_ImportStepped(import, pack_stepped);
     if (!Mods_ImportInstall(import, temp, why, sizeof(why))) goto done;
     snprintf(path, sizeof(path), "%s/poster.png", temp);
-    if (Mods_ImportExtract(import, "poster.png", path, why, sizeof(why)) < 0) goto done;
+    if (Mods_ImportExtract(import, "poster.png", path, 0, why, sizeof(why)) < 0) goto done;
     if (__atomic_load_n(&import_job.cancel, __ATOMIC_RELAXED)) goto done;
     {   /* a name not taken: "Name", "Name 2"...; then the folder is it */
         char base_name[128];
