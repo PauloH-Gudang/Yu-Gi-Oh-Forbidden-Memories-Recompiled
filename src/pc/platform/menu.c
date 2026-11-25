@@ -757,11 +757,16 @@ int Menu_TextWidthScaled(const char *text, int scale)
 /* Characters bigger than the menu's own (Menu_DrawTextScaled at a scale
  * above it: the title's text lines, the side windows), rendered at their
  * size rather than magnified, kept by character and scale until the table
- * fills, when it starts again. */
+ * fills, or its coverage reaches BIG_GLYPH_BYTES, when it starts again. The
+ * byte bound is for a mod's text at large pixel sizes (draw_text_px goes to
+ * 512, about 256 KB a glyph): at the title's sizes the table holds well under
+ * a megabyte and only the count clears it. */
 typedef struct { uint32_t code; int px, missing; Glyph glyph; } BigGlyph;
 #define BIG_GLYPHS 1024
+#define BIG_GLYPH_BYTES (8u << 20)
 static BigGlyph big_glyphs[BIG_GLYPHS];
 static int big_count;
+static size_t big_bytes;
 
 static void forget_big_glyphs(void)
 {
@@ -769,6 +774,7 @@ static void forget_big_glyphs(void)
     for (i = 0; i < BIG_GLYPHS; i++) free(big_glyphs[i].glyph.coverage);
     memset(big_glyphs, 0, sizeof(big_glyphs));
     big_count = 0;
+    big_bytes = 0;
 }
 
 static const Glyph *big_glyph_at(uint32_t character, int px)
@@ -778,7 +784,7 @@ static const Glyph *big_glyph_at(uint32_t character, int px)
     for (b = &big_glyphs[slot]; b->code; slot = (slot + 1) & (BIG_GLYPHS - 1), b = &big_glyphs[slot]) {
         if (b->code == character && b->px == px) return b->missing ? NULL : &b->glyph;
     }
-    if (big_count * 2 >= BIG_GLYPHS) {
+    if (big_count * 2 >= BIG_GLYPHS || big_bytes >= BIG_GLYPH_BYTES) {
         forget_big_glyphs();
         slot = (character * 2654435761u + (unsigned)px * 40503u) & (BIG_GLYPHS - 1);
         b = &big_glyphs[slot];
@@ -792,6 +798,7 @@ static const Glyph *big_glyph_at(uint32_t character, int px)
                  !FT_Get_Char_Index(font_face, (FT_ULong)character) ||
                  !render_glyph(font_face, (FT_ULong)character, &b->glyph);
     FT_Set_Pixel_Sizes(font_face, 0, FONT_PX);
+    if (!b->missing) big_bytes += (size_t)b->glyph.w * (size_t)b->glyph.h + 1;
     return b->missing ? NULL : &b->glyph;
 }
 
