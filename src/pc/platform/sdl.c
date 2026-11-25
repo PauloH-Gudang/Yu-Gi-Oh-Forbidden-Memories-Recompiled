@@ -607,7 +607,10 @@ static void panel_after(int tapped)
 {
     int typing = Panel_TextFocus();
     if (typing && (!panel_typing || tapped)) SDL_StartTextInput(window); /* a tap on the field shows it again */
-    else if (!typing && panel_typing) SDL_StopTextInput(window);
+    else if (!typing && panel_typing) {
+        if (text_taken) SDL_StartTextInput(window);   /* a mod's field still has the keyboard: back to it */
+        else SDL_StopTextInput(window);
+    }
     panel_typing = typing;
     if (Panel_Shown()) return;
     if (panel_paused) {

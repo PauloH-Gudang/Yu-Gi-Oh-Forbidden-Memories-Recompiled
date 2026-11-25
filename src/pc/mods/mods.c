@@ -632,6 +632,11 @@ static void host_text_capture(const MemoriesModHost *host, int on)
     int index = mod ? (int)(mod - mods) : -1;
     if (!mod || (on && !mod->active)) return;
     if (on) {
+        /* A new owner starts with nothing waiting: keys typed for the mod that had the keyboard (or sent with the
+         * control channel's `key` while none had it) are not this one's. */
+        if (text_owner != index && text_next_fn)
+            while (text_next_fn()) {
+            }
         text_owner = index;
     } else if (text_owner == index) {
         text_owner = -1;
