@@ -5166,7 +5166,8 @@ int Mods_ModpackPrepare(const char *name, long long *done, long long *total, con
  * "modpack=<name>", then key=value lines), unless that pack's session already
  * saved them. A launch without that pack (no modpack, or another) puts them
  * back: each saved value again, every `mod.` key the file lacks gone (its
- * default again), saved; then the packs' .settings-applied markers go, so
+ * default again) but for a `mod.<id>=0` (key_collect), saved; then the
+ * packs' .settings-applied markers go, so
  * the next launch of a pack is its first again, and the file goes. */
 #define NORMAL_SETTINGS ".normal-settings"
 static int normal_settings_path(char *out, size_t size)
@@ -5202,11 +5203,15 @@ static int normal_settings_save(const char *pack)
     return 0;
 }
 typedef struct { char **keys; int count, room, failed; } KeyList;
+/* The `mod.` keys the restore removes before it puts the saved ones back. An
+ * enable flag `mod.<id>` that is 0 stays: off is the safe choice, and it is
+ * how a mod imported during the pack's session (Mods_Discover) stays off
+ * until the player turns it on, instead of following its manifest. */
 static void key_collect(const char *key, int value, void *context)
 {
     KeyList *list = context;
-    (void)value;
     if (strncmp(key, "mod.", 4) || list->failed) return;
+    if (!value && !strchr(key + 4, '.')) return;
     if (list->count == list->room) {
         int room = list->room ? list->room * 2 : 256;
         char **grown = realloc(list->keys, (size_t)room * sizeof(*grown));

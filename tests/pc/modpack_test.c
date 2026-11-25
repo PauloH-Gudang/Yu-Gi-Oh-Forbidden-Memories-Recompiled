@@ -19,7 +19,9 @@
  *   pack-return  the pack again: its first launch again
  *   fresh        (another user directory) no modpacks/ there: none is made
  *   locked-first a locked pack: its mods on; the player turns one off
- *   locked-again its mods on again, its values again
+ *   locked-again its mods on again, its values again; the player imports
+ *                Late (its manifest says on), which comes in off
+ *   normal-late  no modpack: as normal, and Late is still off
  */
 #define main original_mods_test
 #include "pc/compat/fs.h"
@@ -156,19 +158,26 @@ static void pack_again(void)
     assert(!Mods_Enabled(find("extra")) && Mods_Enabled(find("hard")));
 }
 
-static void normal(void)
+/* `late`: Late was imported during the pack's session before this launch. */
+static void normal_launch(int late)
 {
     launch();
     assert(!*Mods_ModpackLaunched());
-    assert(Mods_Count() == 1 && !Mods_Enabled(find("hard")));
-    /* The player's own values, none of the pack's, and saved so. */
+    assert(Mods_Count() == 1 + late && !Mods_Enabled(find("hard")));
+    /* Its manifest says on, but it came in off and nobody turned it on. */
+    if (late) assert(find("late") >= 0 && !Mods_Enabled(find("late")));
+    /* The player's own values, none of the pack's, and saved so. Extra,
+     * turned off in a pack's session, stays off: an off the player's own
+     * settings lack is kept, the rest of what the session added goes. */
     for (int pass = 0; pass < 2; pass++) {
         assert(named("mod.hard") == 0 && named("mod.hard.level") == 3 && named("mod.hard.order") == 7);
-        assert(named("mod.extra") == -1000 && named("mod.extra.order") == -1000);
+        assert(named("mod.extra") == 0 && named("mod.extra.order") == -1000);
+        if (late) assert(named("mod.late") == 0);
         Settings_Load();
     }
     assert(!exists("user/modpacks/.normal-settings") && !exists("user/modpacks/Pack/.settings-applied"));
 }
+static void normal(void) { normal_launch(0); }
 
 static void pack_return(void)
 {
@@ -233,9 +242,20 @@ static void locked_first(void)
 
 static void locked_again(void)
 {
+    char path[1024];
+    int later;
     launch();
     assert(Mods_ModpackLocked() && Mods_Enabled(find("extra")) && named("mod.extra.order") == 1);
+    /* Import mod... during the session: a mod whose manifest says on comes
+     * in off (Mods_Discover writes mod.late=0), into the normal mods folder. */
+    make_dir("user/mods/late");
+    write_text("user/mods/late/mod.json", "{\"id\":\"late\",\"name\":\"Late\",\"enabled\":true}");
+    snprintf(path, sizeof(path), "%s/user/mods/late", root);
+    assert(Mods_Discover(path, &later) >= 0 && named("mod.late") == 0);
+    assert(Settings_Save());
 }
+
+static void normal_late(void) { normal_launch(1); }
 
 static int run_step(const char *self, const char *step)
 {
@@ -288,6 +308,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[1], "fresh")) fresh();
         else if (!strcmp(argv[1], "locked-first")) locked_first();
         else if (!strcmp(argv[1], "locked-again")) locked_again();
+        else if (!strcmp(argv[1], "normal-late")) normal_late();
         else {
             fprintf(stderr, "modpack_test: unknown step \"%s\"\n", argv[1]);
             return 2;
@@ -335,7 +356,7 @@ int main(int argc, char **argv)
     step(argv[0], "locked-first");
     step(argv[0], "locked-again");
     choose(NULL);
-    step(argv[0], "normal");
+    step(argv[0], "normal-late");
     puts("modpack: ok");
     return 0;
 }

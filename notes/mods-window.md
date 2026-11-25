@@ -551,7 +551,10 @@ it was.
   `modpack=<name>`). A launch without that pack (no modpack, another one, or
   `MEMORIES_MODS_DIR`) puts them back before any mod's setting is read: each
   saved value again, every `mod.` key the file lacks gone (its default
-  again), saved, and the file removed. So what a pack wrote, and what the
+  again), saved, and the file removed. One kind stays: a mod's on/off
+  `mod.<id>` that is 0, since off is the safe choice; a mod imported during
+  the pack's session (written off by the import) so stays off until the
+  player turns it on, instead of following its manifest's `"enabled"`. So what a pack wrote, and what the
   player changed while it ran, never reaches the normal mods. When the
   settings cannot be saved aside, the pack is not read (the normal mods are,
   and the window says why).
