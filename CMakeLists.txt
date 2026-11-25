@@ -206,12 +206,16 @@ if(BUILD_TESTING)
     add_executable(memories_control_protocol_test tests/pc/control_protocol_test.c src/pc/debug/control_protocol.c)
     add_executable(memories_control_net_test tests/pc/control_net_test.c src/pc/debug/control_net.c)
     add_executable(memories_symbols_test tests/pc/symbols_test.c src/pc/debug/symbols.c src/pc/compat/fs.c)
+    add_executable(memories_dead_stack_test tests/pc/dead_stack_test.c)
     if(WIN32)
         target_link_libraries(memories_control_net_test PRIVATE ws2_32)
+    else()
+        # Symbols_Module's dladdr: in libc since glibc 2.34, in libdl before.
+        target_link_libraries(memories_symbols_test PRIVATE ${CMAKE_DL_LIBS})
     endif()
     foreach(target memories_deck_shop_test memories_entry_layout_test memories_state_remap_test
             memories_state_io_test memories_control_protocol_test memories_control_net_test memories_symbols_test
-            memories_translated_state_symbols_test)
+            memories_translated_state_symbols_test memories_dead_stack_test)
         target_include_directories(${target} PRIVATE src)
         if(NOT MSVC)
             target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Werror)
@@ -230,6 +234,8 @@ if(BUILD_TESTING)
     add_test(NAME pc_control_protocol COMMAND memories_control_protocol_test)
     add_test(NAME pc_control_net COMMAND memories_control_net_test)
     add_test(NAME pc_symbols COMMAND memories_symbols_test)
+    # What a host call leaves below a game call's frame is cleared (platform.h).
+    add_test(NAME pc_dead_stack COMMAND memories_dead_stack_test)
     set_tests_properties(pc_control_net PROPERTIES TIMEOUT 15)
     add_executable(memories_fusion_test tests/pc/fusion_test.c src/pc/cards/fusion.c)
     target_include_directories(memories_fusion_test PRIVATE src)
@@ -369,6 +375,26 @@ if(BUILD_TESTING)
     add_executable(memories_soft_gpu_test tests/pc/soft_gpu_test.c)
     target_link_libraries(memories_soft_gpu_test PRIVATE memories_pc_core)
     add_test(NAME pc_soft_gpu COMMAND memories_soft_gpu_test)
+    # Each reader inside the software GPU settles what it reads
+    # (notes/pc-build.md, "Settling VRAM before it is read").
+    add_executable(memories_soft_gpu_settle_test tests/pc/soft_gpu_settle_test.c)
+    target_link_libraries(memories_soft_gpu_settle_test PRIVATE memories_pc_core)
+    if(WIN32)
+        target_link_libraries(memories_soft_gpu_settle_test PRIVATE memories_pc_fs) # setenv, for the texture dump
+    endif()
+    add_test(NAME pc_soft_gpu_settle COMMAND memories_soft_gpu_settle_test)
+    # Kept back or rastered as it comes, the same VRAM, stores, states, tags
+    # (notes/pc-build.md, "The deferred raster").
+    add_executable(memories_soft_gpu_deferred_test tests/pc/soft_gpu_deferred_test.c)
+    target_link_libraries(memories_soft_gpu_deferred_test PRIVATE memories_pc_core)
+    if(NOT MSVC AND NOT APPLE)
+        # The test counts what is allocated from its stand-in for the clock's
+        # tick, where nothing may be (a patch is made without allocating).
+        target_link_options(memories_soft_gpu_deferred_test PRIVATE
+            -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc)
+        target_compile_definitions(memories_soft_gpu_deferred_test PRIVATE SOFT_GPU_TEST_WRAP_ALLOC=1)
+    endif()
+    add_test(NAME pc_soft_gpu_deferred COMMAND memories_soft_gpu_deferred_test)
     add_executable(memories_settings_test tests/pc/settings_test.c src/pc/platform/settings.c
         src/pc/platform/paths.c)
     target_include_directories(memories_settings_test PRIVATE src)
@@ -954,6 +980,40 @@ if(BUILD_TESTING)
         target_compile_options(memories_audio_replace_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
     endif()
     add_test(NAME pc_audio_replace COMMAND memories_audio_replace_test)
+    # The mixer against a golden stream, with a save state's round trip
+    # (tests/pc/spu_mix_test.c). The digests are the same on every compiler
+    # and width, so Linux also runs it as an i386 program (the 32-bit game's).
+    # spu.c naps in Spu_Hold (nanosleep: POSIX, and winpthreads on Windows).
+    # -fwrapv as every game build compiles it (build_game32.py, guest_build.py):
+    # the master volume's product wraps there when two dozen loud voices
+    # overflow it, and the digests hold that.
+    set(memories_spu_mix_tests memories_spu_mix_test)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        list(APPEND memories_spu_mix_tests memories_spu_mix_m32_test)
+    endif()
+    foreach(target IN LISTS memories_spu_mix_tests)
+        add_executable(${target} tests/pc/spu_mix_test.c src/pc/audio/spu.c)
+        target_include_directories(${target} PRIVATE src)
+        target_compile_definitions(${target} PRIVATE _POSIX_C_SOURCE=200809L)
+        if(NOT MSVC)
+            target_compile_options(${target} PRIVATE -O2 -fwrapv -Wall -Wextra -Wpedantic -Werror)
+        endif()
+        if(target STREQUAL "memories_spu_mix_m32_test")
+            target_compile_options(${target} PRIVATE -m32)
+            target_link_options(${target} PRIVATE -m32)
+        else()
+            find_package(Threads REQUIRED)
+            target_link_libraries(${target} PRIVATE Threads::Threads)
+        endif()
+        if(MEMORIES_SANITIZERS)
+            target_compile_options(${target} PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+            target_link_options(${target} PRIVATE -fsanitize=address,undefined)
+        endif()
+    endforeach()
+    add_test(NAME pc_spu_mix COMMAND memories_spu_mix_test)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_test(NAME pc_spu_mix_m32 COMMAND memories_spu_mix_m32_test)
+    endif()
     add_executable(memories_controls_test tests/pc/controls_test.c src/pc/platform/controls.c)
     target_include_directories(memories_controls_test PRIVATE src)
     if(NOT MSVC)
@@ -974,6 +1034,38 @@ if(BUILD_TESTING)
     target_sources(memories_audio_replace_test PRIVATE ${memories_platform_support})
     target_sources(memories_disc_test PRIVATE ${memories_platform_support})
     target_link_libraries(memories_audio_replace_test PRIVATE Threads::Threads)
+    # The software SPU's master volume with two dozen loud voices
+    # (tests/pc/spu_master_test.c). -fwrapv as every game build compiles it
+    # (build_game32.py, guest_build.py), so the old 32-bit product wraps the
+    # same way everywhere and the test fails on it. Linux also runs it as an
+    # i386 program, the 32-bit game's width. spu.c naps in Spu_Hold
+    # (nanosleep: POSIX, and winpthreads on Windows).
+    set(memories_spu_master_tests memories_spu_master_test)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        list(APPEND memories_spu_master_tests memories_spu_master_m32_test)
+    endif()
+    foreach(target IN LISTS memories_spu_master_tests)
+        add_executable(${target} tests/pc/spu_master_test.c src/pc/audio/spu.c)
+        target_include_directories(${target} PRIVATE src)
+        target_compile_definitions(${target} PRIVATE _POSIX_C_SOURCE=200809L)
+        if(NOT MSVC)
+            target_compile_options(${target} PRIVATE -O2 -fwrapv -Wall -Wextra -Wpedantic -Werror)
+        endif()
+        if(target STREQUAL "memories_spu_master_m32_test")
+            target_compile_options(${target} PRIVATE -m32)
+            target_link_options(${target} PRIVATE -m32)
+        else()
+            target_link_libraries(${target} PRIVATE Threads::Threads)
+        endif()
+        if(MEMORIES_SANITIZERS)
+            target_compile_options(${target} PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+            target_link_options(${target} PRIVATE -fsanitize=address,undefined)
+        endif()
+    endforeach()
+    add_test(NAME pc_spu_master COMMAND memories_spu_master_test)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_test(NAME pc_spu_master_m32 COMMAND memories_spu_master_m32_test)
+    endif()
     # controls_evdev_test.c drives the /dev/input reader, which is Linux only.
     set(memories_controls_parts config runtime window)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -1309,6 +1401,12 @@ if(Python3_Interpreter_FOUND)
         add_test(NAME pc_replay_check
             COMMAND "${Python3_EXECUTABLE}" tests/pc/replay_check_test.py
             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        # yfm_control.py's replies against a made-up game: slow, closed, hung
+        # (notes/agent-control.md).
+        add_test(NAME pc_control_client
+            COMMAND "${Python3_EXECUTABLE}" tests/pc/control_client_test.py
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        set_tests_properties(pc_control_client PROPERTIES TIMEOUT 60)
         # model_oracle.py's comparison and coverage on made-up games
         # (notes/pc-build.md, "MIPS-only effects").
         add_test(NAME pc_model_oracle_check
@@ -1317,6 +1415,10 @@ if(Python3_Interpreter_FOUND)
         # Native units that name files reach compat/fs.h (notes/pc-build.md).
         add_test(NAME pc_utf8_paths
             COMMAND "${Python3_EXECUTABLE}" tools/pc/check_utf8_paths.py
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        # And so do the readers outside it (the same notes, "Settling").
+        add_test(NAME pc_vram_readers
+            COMMAND "${Python3_EXECUTABLE}" tools/pc/check_vram_readers.py
             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     endif()
 endif()

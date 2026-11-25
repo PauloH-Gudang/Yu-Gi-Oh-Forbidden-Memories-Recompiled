@@ -16,7 +16,8 @@
  *    the Music/Xa/Sfx calls below. They read the tables, post requests into
  *    fixed channel slots and log with Log_Signal; nothing allocates, locks
  *    or prints;
- *  - the mixer (audio thread, inside Spu_Mix): MixBegin/MixFrame/MixEnd.
+ *  - the mixer (the audio thread, or the game thread under the virtual
+ *    clock with no device; inside Spu_Mix): MixBegin/MixFrame/MixEnd.
  *    It takes posted requests through a sequence word per slot and mixes.
  *
  * The game's own sound keeps running underneath: a replaced song's

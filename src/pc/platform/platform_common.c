@@ -16,6 +16,7 @@
 #include "pc/debug/profile.h"
 #include "pc/compat/signal.h"
 #include "pc/audio/spu.h"
+#include "pc/render/soft_gpu.h"
 #include "controls_runtime.h"
 #include "settings.h"
 #include <pthread.h>
@@ -75,11 +76,73 @@ static int virtual_clock(void)
 #define DETERMINISTIC_STEP 1000
 #define DETERMINISTIC_SPIN 1000000 /* real us outside a wait before the timer steps a spinning game */
 
+static int deterministic_env(void)
+{
+    const char *asked = getenv("MEMORIES_DETERMINISTIC");
+    return asked && *asked && strcmp(asked, "0") != 0;
+}
+
 static uint64_t now_us(void)
 {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
     return (uint64_t)now.tv_sec * 1000000u + (uint64_t)now.tv_nsec / 1000u;
+}
+
+/* The silent sink under MEMORIES_DETERMINISTIC=1 (Platform_StartSilentAudio):
+ * no mixer thread. A thread paced by the host's clock mixed as much as real
+ * time allowed, while the game ran flat out on virtual time, so the voice
+ * levels the sound driver reads (SpuGetKeyStatus, SpuGetVoiceEnvelope) had
+ * moved a different amount at the same game instant in each run: a voice
+ * finished its release a tick earlier in one, the driver freed and reused
+ * its note records in another order, and two lockstep runs parted in the
+ * driver's memory (0x801E0380.., 0x801E15D8..0x801E1B0F). Here the SPU is
+ * mixed on the game thread as virtual time passes, 44.1 frames for each
+ * 1 ms step, before the step's tick runs the sound driver (a step the
+ * interrupt clock's handler takes only owes its frames, which the next step
+ * on the game thread mixes before its own tick). The fraction of
+ * a frame still owed goes in the save state ("platform-mixer"), since
+ * virtual time itself is the process's. */
+static void (*stepped_mixer)(int16_t *, size_t);
+static FILE *stepped_dump;    /* MEMORIES_DUMP_AUDIO, written as it is mixed */
+static uint32_t mix_fraction; /* ten-thousandths of a frame owed, below one frame */
+static uint32_t mix_owed;     /* whole frames owed: held (a save state), or stepped from the timer */
+
+static void mix_owe(unsigned us)
+{
+    uint32_t total = mix_fraction + 441u * us; /* 44100 frames a second */
+    mix_owed += total / 10000u;
+    mix_fraction = total % 10000u;
+}
+
+static void mix_owed_frames(void)
+{
+    static int16_t buffer[256 * 2];
+    static unsigned unflushed;
+    if (Spu_Held()) return; /* a save state is being taken or applied: the frames stay owed */
+    while (mix_owed) {
+        size_t count = mix_owed < 256 ? mix_owed : 256;
+        stepped_mixer(buffer, count);
+        mix_owed -= (uint32_t)count;
+        if (stepped_dump) {
+            fwrite(buffer, sizeof(int16_t) * 2, count, stepped_dump);
+            unflushed += (unsigned)count;
+            if (unflushed >= 256) { /* as often as the thread flushed, so a killed run loses as little */
+                fflush(stepped_dump);
+                unflushed = 0;
+            }
+        }
+    }
+}
+
+/* One virtual step's mix. `here` is zero where the step runs in the
+ * interrupt clock's handler (MEMORIES_CLOCK=interrupt), which only owes the
+ * frames; the next step on the game thread mixes them. */
+static void mix_step(int here)
+{
+    if (!stepped_mixer) return;
+    mix_owe(DETERMINISTIC_STEP);
+    if (here) mix_owed_frames();
 }
 
 static void deliver_vblank(void)
@@ -121,6 +184,7 @@ static void advance(uint64_t real_now, uintptr_t eip)
             static unsigned reported_count, steps;
             unsigned i;
             virtual_now += DETERMINISTIC_STEP;
+            mix_step(cooperative);
             if (tick_handler) tick_handler(virtual_now, virtual_now);
             steps++;
             for (i = 0; i < reported_count && reported[i] != eip; i++) {}
@@ -177,6 +241,26 @@ static void advance(uint64_t real_now, uintptr_t eip)
     }
 }
 
+/* A clock pass is a few hundred bytes deep (about 300 measured over a duel),
+ * and the game's VBlank handler may go deeper. */
+#define SERVICE_SCRUB_BYTES 8192u
+
+int Platform_DeadStackScrubbable(const void *frame, size_t bytes)
+{
+    uintptr_t here = (uintptr_t)frame;
+    /* Well clear of the stack's guard pages, and inside it. */
+    return cooperative && here >= MEMORIES_GAME_STACK_BASE + 0x20000u + bytes &&
+           here < MEMORIES_GAME_STACK_BASE + MEMORIES_GAME_STACK_SIZE;
+}
+
+void Platform_ScrubGameStackBelow(uintptr_t sp, size_t bytes)
+{
+    uintptr_t floor_ = MEMORIES_GAME_STACK_BASE + 0x20000u, low;
+    if (!cooperative || sp <= floor_ || sp > MEMORIES_GAME_STACK_BASE + MEMORIES_GAME_STACK_SIZE) return;
+    low = sp - floor_ > bytes ? sp - bytes : floor_;
+    memset((void *)low, 0, sp - low);
+}
+
 /* The cooperative clock's service point: the time now, and whatever it owes. */
 static int servicing; /* inside advance(): the handlers it runs are the game's interrupt code */
 static void service(void)
@@ -191,6 +275,10 @@ static void service(void)
     servicing--;
     sigprocmask(SIG_SETMASK, &previous, NULL);
 }
+
+/* The interrupt clock's tick is running (on_tick): the software GPU makes
+ * no frozen copy there (soft_gpu.h, SoftGpu_InTick). */
+static volatile int ticking;
 
 static void on_tick(uintptr_t eip, void *context)
 {
@@ -218,7 +306,9 @@ static void on_tick(uintptr_t eip, void *context)
 #else
     (void)context;
 #endif
+    ticking++;
     advance(real_now, eip);
+    ticking--;
 }
 
 #ifndef _WIN32
@@ -237,6 +327,27 @@ static void on_alarm(int number, siginfo_t *info, void *context)
  * backend has finished creating its own with the signal masked. With the
  * game's interrupt code running on a driver thread the main thread stalls
  * on that driver's locks. The process-wide timer is only a fallback. */
+/* The software GPU's deferred raster holds the tick off while it works on
+ * what it keeps back (soft_gpu.h, SoftGpu_HoldClock); it nests the calls
+ * itself, so the mask it found is put back as it was. */
+static sigset_t gpu_mask;
+
+static unsigned long long gpu_clock(void) { return now_us(); }
+
+static int gpu_in_tick(void) { return ticking != 0; }
+
+static void hold_clock_for_gpu(int hold)
+{
+    sigset_t set;
+    if (hold) {
+        sigemptyset(&set);
+        sigaddset(&set, SIGALRM);
+        sigprocmask(SIG_BLOCK, &set, &gpu_mask);
+    } else {
+        sigprocmask(SIG_SETMASK, &gpu_mask, NULL);
+    }
+}
+
 int Platform_StartTimers(void (*tick)(uint64_t, uint64_t), void (*vblank)(void))
 {
 #ifndef _WIN32
@@ -249,15 +360,13 @@ int Platform_StartTimers(void (*tick)(uint64_t, uint64_t), void (*vblank)(void))
 #endif
     tick_handler = tick;
     vblank_handler = vblank;
+    SoftGpu_Clock = gpu_clock; /* the deferred raster's settles, timed (SoftGpuDeferredStats) */
     /* The virtual clock (above). The frame-dump combination is kept as it
      * was; MEMORIES_DETERMINISTIC=1 alone needs neither a dump nor speed -1. */
     deterministic_dump = (getenv("MEMORIES_HEADLESS") != NULL || getenv("MEMORIES_DETERMINISTIC") != NULL) &&
                          (getenv("MEMORIES_DUMP_FRAME") != NULL || getenv("MEMORIES_DUMP_FRAMES") != NULL);
-    {
-        const char *asked = getenv("MEMORIES_DETERMINISTIC");
-        deterministic_asked = asked && *asked && strcmp(asked, "0") != 0;
-        deterministic_paced = deterministic_asked && getenv("MEMORIES_HEADLESS") == NULL;
-    }
+    deterministic_asked = deterministic_env();
+    deterministic_paced = deterministic_asked && getenv("MEMORIES_HEADLESS") == NULL;
     last_vsync_real = now_us();
     {
         const char *watchdog = getenv("MEMORIES_WATCHDOG");
@@ -277,6 +386,8 @@ int Platform_StartTimers(void (*tick)(uint64_t, uint64_t), void (*vblank)(void))
         if (!cooperative) {
             fprintf(stderr, "memories-pc: interrupt clock%s\n",
                     clock && *clock ? " (MEMORIES_CLOCK=interrupt)" : ", which MEMORIES_PROFILE samples from");
+            SoftGpu_HoldClock = hold_clock_for_gpu;
+            SoftGpu_InTick = gpu_in_tick;
         }
     }
 #ifdef _WIN32
@@ -641,6 +752,7 @@ void Platform_PollTime(void)
     sigprocmask(SIG_BLOCK, &set, &previous);
     if (!next_vblank) next_vblank = virtual_now + vblank_period;
     virtual_now += DETERMINISTIC_STEP;
+    mix_step(1);
     if (tick_handler) tick_handler(virtual_now, virtual_now);
     if (virtual_now >= next_vblank) {
         next_vblank += vblank_period;
@@ -664,10 +776,18 @@ void Platform_PollTime(void)
  * calls DrawSync(0) just before its read, after the frame's drawing is
  * rasterized, so the VBlanks the frame overran are delivered here, where the
  * console would have delivered them. */
+__attribute__((noinline)) static int service_clock(void)
+{
+    if (servicing) return 0; /* DrawSync from the game's own interrupt code */
+    service();
+    return 1;
+}
+
 void Platform_ServiceClock(void)
 {
-    if (servicing) return; /* DrawSync from the game's own interrupt code */
-    service();
+    if (service_clock()) {
+        PLATFORM_SCRUB_DEAD_STACK(SERVICE_SCRUB_BYTES);
+    }
 }
 
 /* VSync(0) on the console returns at the first VBlank after its entry, with
@@ -689,7 +809,7 @@ void Platform_SetTickDue(uint64_t real_us)
     tick_due = real_us;
 }
 
-void Platform_WaitVBlank(unsigned count_at_entry)
+__attribute__((noinline)) static void wait_vblank(unsigned count_at_entry)
 {
     struct timespec nap = {0, 500000};
     /* Spent, and still no VBlank since the caller's count: a wait nested in
@@ -706,6 +826,7 @@ void Platform_WaitVBlank(unsigned count_at_entry)
             if (!next_vblank) next_vblank = virtual_now + vblank_period;
             while (virtual_now < next_vblank) {
                 virtual_now += DETERMINISTIC_STEP;
+                mix_step(1);
                 if (tick_handler) tick_handler(virtual_now, virtual_now);
             }
             next_vblank += vblank_period;
@@ -749,6 +870,14 @@ void Platform_WaitVBlank(unsigned count_at_entry)
     }
 }
 
+/* The game's wait for a VBlank: the clock's passes and the VBlank handlers it
+ * runs are all below this frame. */
+void Platform_WaitVBlank(unsigned count_at_entry)
+{
+    wait_vblank(count_at_entry);
+    PLATFORM_SCRUB_DEAD_STACK(SERVICE_SCRUB_BYTES);
+}
+
 /* The VBlank count is what the game sees through VSync(-1). The clock's
  * phase goes in a chunk of its own ("platform-clock", so that states
  * without it keep loading "platform"): how far off the next VBlank is, in
@@ -767,6 +896,22 @@ void Platform_State(MemoriesState *state)
     if (Memories_StateChunk(state, "platform-clock", &clock, 1) && phase > 0 &&
         phase <= 4 * (int64_t)vblank_period) {
         next_vblank = virtual_now + (uint64_t)phase;
+    }
+    if (stepped_mixer) {
+        /* The stepped mixer's phase (above): the steps after a load mix as
+         * many frames as they did in the game that saved. A state without
+         * it starts from a whole frame, whatever the loading game owed
+         * (unlike the loader's "keeps its current state" for a missing
+         * chunk: what this game owed has nothing to do with the state's
+         * game). Values no game saves (more than a second owed) are a
+         * damaged state: clamped, so a step never mixes for seconds. */
+        const MemoriesStateField mixer[] = {{&mix_fraction, sizeof(mix_fraction)}, {&mix_owed, sizeof(mix_owed)}};
+        if (Memories_StateChunk(state, "platform-mixer", mixer, 2)) {
+            if (mix_fraction >= 10000u) mix_fraction = 0;
+            if (mix_owed > 44100u) mix_owed = 44100u;
+        } else if (Memories_StateLoading(state)) {
+            mix_fraction = mix_owed = 0;
+        }
     }
 }
 
@@ -813,8 +958,11 @@ int Platform_ScriptedPad2(void)
 
 /* MEMORIES_DUMP_AUDIO=path: no device; mix in real time into raw s16le
  * stereo 44.1 kHz so output can be inspected without speakers. With no path
- * this is the silent sink: the SPU still has to run, because the game polls
- * envelopes and the disc service waits for CD input room. */
+ * this is the silent sink: the SPU still has to run, because the sound
+ * driver reads voice status and envelopes, and the CD/XA input is only
+ * drained by the mixer. Under MEMORIES_DETERMINISTIC=1 neither has a thread:
+ * the game thread mixes as virtual time passes (mix_step, above), and the
+ * dump is written from there, as long as the game's virtual time. */
 static void (*silent_mixer)(int16_t *, size_t);
 
 static void *run_silent(void *path)
@@ -838,6 +986,13 @@ int Platform_StartSilentAudio(void (*mix)(int16_t *, size_t), const char *dump_p
     pthread_t thread;
     sigset_t all, previous;
     int error;
+#ifndef __ANDROID__ /* the phone keeps its mixer thread: Spu_Mix on its game thread is untried */
+    if (deterministic_env()) {
+        stepped_dump = dump_path ? fopen(dump_path, "wb") : NULL;
+        stepped_mixer = mix;
+        return 0;
+    }
+#endif
     silent_mixer = mix;
     /* The timer signal is the game's interrupt and must stay on the main thread. */
     sigfillset(&all);

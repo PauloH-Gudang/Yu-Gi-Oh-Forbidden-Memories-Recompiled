@@ -630,6 +630,47 @@ void Mods_SetPointer(int (*pointer)(int *x, int *y, unsigned *buttons), int (*wh
     wheel_read = wheel;
     wheel_take = take;
 }
+/* Typed text (API 28): the window's own (Mods_SetText), and the mod that took
+ * the keyboard, which is given back when it is turned off. */
+static void (*text_capture_fn)(int);
+static int (*text_next_fn)(void);
+static int text_owner = -1;
+static void host_text_capture(const MemoriesModHost *host, int on)
+{
+    Mod *mod = owner(host);
+    int index = mod ? (int)(mod - mods) : -1;
+    if (!mod || (on && !mod->active)) return;
+    if (on) {
+        /* A new owner starts with nothing waiting: keys typed for the mod that had the keyboard (or sent with the
+         * control channel's `key` while none had it) are not this one's. */
+        if (text_owner != index && text_next_fn)
+            while (text_next_fn()) {
+            }
+        text_owner = index;
+    } else if (text_owner == index) {
+        text_owner = -1;
+    } else {
+        return; /* another mod has it */
+    }
+    if (text_capture_fn) text_capture_fn(on != 0);
+}
+static int host_text_key(const MemoriesModHost *host)
+{
+    Mod *mod = owner(host);
+    return mod && mod->active && (int)(mod - mods) == text_owner && text_next_fn ? text_next_fn() : 0;
+}
+static void release_text(int index)
+{
+    if (text_owner == index) {
+        text_owner = -1;
+        if (text_capture_fn) text_capture_fn(0);
+    }
+}
+void Mods_SetText(void (*capture)(int on), int (*next)(void))
+{
+    text_capture_fn = capture;
+    text_next_fn = next;
+}
 /* The parts of the port's HUD the applied mods hide (host->hide_hud). */
 static void host_hide_hud(const MemoriesModHost *host, unsigned mask)
 {
@@ -2379,6 +2420,8 @@ static void fill_host(Mod *mod)
     mod->host.pointer = host_pointer;
     mod->host.wheel = host_wheel;
     mod->host.take_wheel = host_take_wheel;
+    mod->host.text_capture = host_text_capture;
+    mod->host.text_key = host_text_key;
     mod->host.api = MEMORIES_MOD_API;
     mod->host.id = mod->id;
     mod->host.directory = mod->directory;
@@ -3559,11 +3602,31 @@ static int by_name(const void *key, const void *entry)
     return strcmp(key, ((const MemoriesModExport *)entry)->name);
 }
 
+/* Code that has bound SoftGpu_Vram or SoftGpu_StateData, at load
+ * (`resolve`) or later (host->symbol): it may keep VRAM's pointer and use it
+ * whenever, or call SoftGpu_Gp0 itself, which the software GPU's deferred
+ * raster cannot see, so it keeps nothing back while there is any. It is told
+ * as the binding is made (Mods_VramUsersChanged, which libgpu.c sets to
+ * SoftGpu_SetModVramUsers; NULL in the tests that link no software GPU), so
+ * nothing held is left for the pointer to see. A loaded object stays
+ * linked, so this never goes down. */
+static int vram_binders;
+void (*Mods_VramUsersChanged)(int users);
+
+int Mods_VramUsers(void) { return vram_binders; }
+
+static void vram_bound(void)
+{
+    vram_binders++;
+    if (Mods_VramUsersChanged) Mods_VramUsersChanged(vram_binders);
+}
+
 void *Mods_Lookup(const char *name)
 {
     const MemoriesModExport *found;
     union { void (*function)(void); void *pointer; } libc;
     if (!name) return NULL;
+    if (!strcmp(name, "SoftGpu_Vram") || !strcmp(name, "SoftGpu_StateData")) vram_bound();
     libc.function = Mods_LibcLookup(name);
     if (libc.function) return libc.pointer;
     found = bsearch(name, Memories_ModExports, Memories_ModExportCount, sizeof(*Memories_ModExports), by_name);
@@ -3645,6 +3708,7 @@ static void *load_object(Mod *mod, const char *path)
         note(mod, "%s %s", mod->library, error);
         return NULL;
     }
+    vram_bound(); /* the system's own loader binds it: what it binds is not seen (Mods_VramUsers) */
     mod->code_hash = mod->object.hash;
     return ObjectLoader_Symbol(&mod->object, "MemoriesModInit");
 #else
@@ -4706,6 +4770,7 @@ static void activate_once(int index, int on)
         mod->hud_hidden = 0;
         release_mouse(index);
         release_wheel(index);
+        release_text(index);
         ahead_drop(mod);
         if (mod->hooks.applied) mod->hooks.applied(0);
     }

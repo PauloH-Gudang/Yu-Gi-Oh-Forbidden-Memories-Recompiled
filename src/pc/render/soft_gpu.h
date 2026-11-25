@@ -18,7 +18,143 @@ void SoftGpu_Load(int x, int y, int w, int h, const uint16_t *pixels);
 void SoftGpu_Store(int x, int y, int w, int h, uint16_t *pixels);
 void SoftGpu_Move(int sx, int sy, int dx, int dy, int w, int h);
 void SoftGpu_Fill(int x, int y, int w, int h, uint32_t rgb24);
+
+/* Settling (notes/pc-build.md, "Settling VRAM before it is read"): every
+ * reader of the words primitives raster into goes through one of these,
+ * so that a raster which keeps a frame's primitives back (a later change)
+ * draws them before anything reads what they would have drawn. The raster
+ * is immediate today: settling only tells SoftGpu_SettleObserver.
+ *
+ * SoftGpu_Settle: whatever has been drawn within x,y,w,h (VRAM words,
+ * wrapping as transfers do) is in VRAM when it returns. */
+void SoftGpu_Settle(int x, int y, int w, int h);
+/* The words a primitive's texture can read: its page (4-bit, depth 0, is
+ * 64 words wide, 8-bit 128, 16-bit 256; 256 rows) and, below 16 bits, its
+ * palette row (16 or 256 entries). For a host lookup keyed by a primitive's
+ * texture (hd_text.c, menu_letters.c, ...). */
+void SoftGpu_SettleTexture(int depth, int page_x, int page_y, int clut_x, int clut_y);
+/* VRAM, settled whole first. For any reader that does not say which words
+ * it reads, a code mod's included (SoftGpu_Vram is lent to mods). */
 const uint16_t *SoftGpu_Vram(void);
+#ifndef MEMORIES_MOD /* the port's own: not lent to code mods (build_config.py, NOT_LENT_TO_MODS) */
+/* VRAM without settling: only for a reader that settled the words it reads
+ * itself, or reads none that are drawn. tools/pc/check_vram_readers.py
+ * lists every caller and why. */
+const uint16_t *SoftGpu_VramRaw(void);
+/* Tests: told every rectangle settled (SoftGpu_Vram's whole VRAM too). */
+extern void (*SoftGpu_SettleObserver)(int x, int y, int w, int h);
+
+/* The deferred raster (notes/pc-build.md, "The deferred raster"): while on,
+ * a primitive drawn into a full-screen drawing area is kept back with the
+ * state it came with and rastered at the first settle that crosses the
+ * area, in the order it came, or dropped when a fill covers the whole area
+ * (the game's clear). What it cannot keep back is rastered as it comes, as
+ * ever. `on`: 0 off, 1 on, SOFT_GPU_DEFERRED_AUTO on only while a recorder
+ * draws the picture at 2x and above and keeps its copy of VRAM
+ * (SoftGpu_CopyTaken), which is the default (MEMORIES_DEFERRED_RASTER,
+ * libgpu.c). Changing it settles everything. `poison`: a held area reads as
+ * a loud colour to anyone who reads it without settling (a debug aid). */
+#define SOFT_GPU_DEFERRED_AUTO 2
+void SoftGpu_SetDeferred(int on, int poison);
+int SoftGpu_Deferred(void);
+/* The recorder's copy of VRAM (gl_picture.c's texture, which its primitives
+ * sample and its moves copy from): taken whole and raw (SoftGpu_VramRaw)
+ * after each replay, so it misses what is held there then. Right after it
+ * takes it, the recorder calls SoftGpu_CopyTaken with itself (`taker`: only
+ * the recorder set now that names itself keeps a copy, so a mod's recorder,
+ * whose struct may end before `patch`, never does). A held area that the copy
+ * missed is, when it is settled, rastered up to what it held then and its
+ * words kept as a patch (the area as the copy would have had it), before
+ * the rest is rastered. At the start of its next replay, before anything
+ * in the record, and again at each flush of what it gathered, before it
+ * draws and before the transfer that flushes it, whether anything is drawn
+ * or not (its own host lookups settle too, during the replay), the
+ * recorder calls SoftGpu_CopyPatches, which
+ * hands each patch to its `patch` and forgets it; patches it has not taken
+ * when it takes the copy again are forgotten by SoftGpu_CopyTaken (the copy
+ * then has those words already). It returns how many it handed. Only a
+ * recorder with `patch` that has taken its copy lets work be held at 2x and
+ * above; a patch is made without allocating (it can be made from the
+ * clock's tick): their buffer is made at the recorder's first take, and
+ * without it no copy is kept. */
+struct SoftGpuRecorder;
+void SoftGpu_CopyTaken(const struct SoftGpuRecorder *taker);
+int SoftGpu_CopyPatches(void);
+/* How many texels past the last u and v a primitive's coordinates span the
+ * recorder may read its copy at (texture xBR: gl_picture.c tells it at each
+ * replay, before its patches), SOFT_GPU_REACH_PAGE for anywhere in the page
+ * (wrapping as the texels do). What it reads there is settled as the rest
+ * is (texture_rects), so the copy gets it as a patch. A change settles
+ * everything (what is held was let hold under the old reach). */
+#define SOFT_GPU_REACH_PAGE 256
+void SoftGpu_SetCopyReach(int texels);
+/* How many applied code mods bind SoftGpu_Vram or SoftGpu_StateData (mods.c):
+ * such a mod may keep VRAM's pointer and write or read through it at any
+ * time, so nothing is kept back while there is one. Told as each binding is
+ * made (Mods_VramUsersChanged, set in libgpu.c) and at every flush. */
+void SoftGpu_SetModVramUsers(int users);
+/* Holds off the game clock's tick (SIGALRM, MEMORIES_CLOCK=interrupt) while
+ * held work is queued, rastered or looked up: set by the platform when the
+ * interrupt clock runs (platform_common.c), NULL otherwise. hold 1, 0. */
+extern void (*SoftGpu_HoldClock)(int hold);
+/* Whether the game clock's tick is running now (MEMORIES_CLOCK=interrupt:
+ * there, between two instructions of the main thread, nothing may be
+ * allocated, and an interrupt-level LoadImage can flush a batch): set by the
+ * platform with SoftGpu_HoldClock (platform_common.c), NULL otherwise. A
+ * primitive that would need a frozen copy made there is rastered at once. */
+extern int (*SoftGpu_InTick)(void);
+/* Microseconds from any fixed point, to time the deferred raster's settles
+ * (SoftGpuDeferredStats.settle_us): set by the platform (platform_common.c);
+ * NULL, not timed. */
+extern unsigned long long (*SoftGpu_Clock)(void);
+/* What the deferred raster did since SoftGpu_SetDeferred turned it on. */
+enum {
+    SOFT_GPU_WHY_READ,      /* a reader settled it (a store, a move's source, a host lookup, a hash...) */
+    SOFT_GPU_WHY_WRITE,     /* a load, move or fill wrote into it, or into a texture it samples with no room
+                             * in its undo log, or a primitive held after such a write samples what it
+                             * changed (soft_gpu.c, undo_save), or a bank or the pack's shadow it samples
+                             * changed (frozen_sync) */
+    SOFT_GPU_WHY_DRAW,      /* a primitive rastered at once drew into it, or samples it */
+    SOFT_GPU_WHY_AREA,      /* another drawing area took its place */
+    SOFT_GPU_WHY_ALL,       /* all of VRAM: a state, a scale, the switch, a mod */
+    SOFT_GPU_WHY_COUNT
+};
+enum {
+    SOFT_GPU_NOW_BANK,      /* samples a texture bank, and its frozen copy could not be made (no memory,
+                             * or the clock's tick: SoftGpu_InTick) */
+    SOFT_GPU_NOW_SHADOW,    /* samples the texture pack's shadow, and its frozen copy could not be made */
+    SOFT_GPU_NOW_TAGS,      /* would clear provenance tags or shadow cells */
+    SOFT_GPU_NOW_TEXTURE,   /* its texture or palette lies in held work */
+    SOFT_GPU_NOW_PANEL,     /* the life-point panel the opponent's name goes over */
+    SOFT_GPU_NOW_OTHER,     /* widescreen's second pass, too much held, no memory (not a mod's VRAM or a
+                             * scale: then nothing is looked at, or counted) */
+    SOFT_GPU_NOW_AFTER,     /* one of the above drew into its area since the area's last clear, or the
+                             * panel (a bank, the shadow) in the cycle before (soft_gpu.c, `again`) */
+    SOFT_GPU_NOW_COUNT
+};
+#define SOFT_GPU_QUEUES 2
+typedef struct SoftGpuDeferredStats {
+    unsigned long long held, dropped, rastered; /* primitives kept back; of them, dropped and rastered */
+    unsigned long long immediate;               /* into a full-screen area, rastered at once */
+    unsigned long long cleared, settled;        /* areas' held work dropped whole / rastered */
+    unsigned long long settle_us;               /* time spent rastering held work */
+    unsigned long long settle_outside_us;       /* of it, outside SoftGpu_Gp0 (a reader's) */
+    unsigned long long why[SOFT_GPU_WHY_COUNT];  /* settles, by cause */
+    unsigned long long now[SOFT_GPU_NOW_COUNT];  /* immediate primitives, by cause */
+    unsigned long long patches;                 /* patches made for the recorder's copy (SoftGpu_CopyTaken) */
+    unsigned long long copy_missed;             /* areas held when the copy was taken (counted at each take) */
+    /* Held now, queue by queue (two drawing areas can hold at once): the
+     * area's corner (-1, -1 for none) and how many primitives it holds. */
+    int queue_x[SOFT_GPU_QUEUES], queue_y[SOFT_GPU_QUEUES];
+    unsigned long long queued[SOFT_GPU_QUEUES];
+} SoftGpuDeferredStats;
+void SoftGpu_DeferredStats(SoftGpuDeferredStats *out);
+/* Loads, moves and fills since SoftGpu_SetDeferred turned it on that changed
+ * texels an area's held work samples and kept the words they overwrote in its
+ * undo log instead of rastering it (soft_gpu.c, undo_save): one an area a
+ * write. Apart from SoftGpuDeferredStats, which does not grow. */
+unsigned long long SoftGpu_UndoSaves(void);
+#endif
 
 /* Texture banks: alternate VRAM that a primitive can sample instead, chosen
  * by bits 11-14 of its texture-page word, which the hardware leaves unused
@@ -146,6 +282,13 @@ typedef struct SoftGpuRecorder {
     /* SoftGpu_Capture: dx,dy was just loaded with what sx,sy shows. May be
      * NULL. */
     void (*capture)(int sx, int sy, int dx, int dy, int w, int h);
+    /* SoftGpu_CopyPatches: words x,y,w,h of the recorder's copy of VRAM
+     * (w x h, row by row) as the copy should have had them when it was last
+     * taken. Only the copy: not the picture. May be NULL (then nothing is
+     * held at 2x and above). Read only once the recorder has named itself to
+     * SoftGpu_CopyTaken: a recorder made with an older header (a mod's) ends
+     * before it, and is never read this far. */
+    void (*patch)(int x, int y, int w, int h, const uint16_t *words);
 } SoftGpuRecorder;
 /* The game read w x h of the picture at sx,sy (StoreImage) and loaded it,
  * as good as unchanged, at dx,dy to draw with (LoadImage): the recorder

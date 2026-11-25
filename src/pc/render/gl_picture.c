@@ -20,7 +20,9 @@
  * says so: SoftGpu_Capture, below). Blending: a fragment's color comes out pre-multiplied and its alpha
  * is the destination's factor, so opaque pixels and modes 0, 1 and 3 share
  * one draw; mode 2 (subtractive) draws its opaque texels first and then
- * its semi-transparent ones with a subtracting equation. No dithering, and
+ * its semi-transparent ones with a subtracting equation, or, on a phone's
+ * GPU that lets a shader read the picture, in the same draws as the rest
+ * (see "framebuffer fetch" below). No dithering, and
  * no mask checks: the game only ever sets the mask bit. The rules are the
  * software picture pass's (soft_gpu.c), which is this pass's oracle
  * (MEMORIES_GL_PICTURE=0 selects it on the same build). */
@@ -218,8 +220,9 @@ static void record_resync(int scale, const uint32_t state[6])
     memcpy(at + 2, state, 6 * sizeof(uint32_t));
 }
 
+static void apply_patch(int x, int y, int w, int h, const uint16_t *words); /* replay: GL (below) */
 static const SoftGpuRecorder recorder = {record_gp0, record_load, record_move, record_fill, record_resync,
-                                          record_precise, record_capture};
+                                          record_precise, record_capture, apply_patch};
 
 /* --- GL objects ---------------------------------------------------------- */
 /* What the replays cost the GPU beyond the primitives, summed over 120 of
@@ -229,7 +232,7 @@ static const SoftGpuRecorder recorder = {record_gp0, record_load, record_move, r
  * replay (upload_vram) and the texture pack's two maps whenever they
  * changed (sync_pack), as counts: the log turns them into bytes. */
 static struct {
-    unsigned resolves, blits, copies, quads, draws, vram_uploads, map_uploads;
+    unsigned resolves, blits, copies, quads, draws, vram_uploads, map_uploads, patches;
     double resolve_px, blit_px, copy_px, quad_px;
 } stats;
 static int scale;                 /* of the picture in the framebuffer, 0 before the first resync */
@@ -246,6 +249,10 @@ static GLuint picture_texture, picture_scratch, picture_fbo, picture_scratch_fbo
  * copied in is drawn, as a quad. 0: the textures are drawn into straight,
  * as before. */
 static int samples, samples_scale;
+/* The samples the driver allows for the setting (set_samples), whatever the
+ * picture could make at the scale it has: `samples` drops to 0 when the
+ * multisampled buffer did not fit, and a new scale tries again with these. */
+static int samples_given;
 static GLuint picture_ms_fbo, picture_ms_buffer;
 /* A replay drew into the multisampled picture since it was last resolved
  * whole: its texture is current only where a resolve has reached since. */
@@ -643,6 +650,16 @@ static const char *fragment_source =
     "        c *= 1.0 - f;\n"
     "        alpha = 1.0 - (1.0 - alpha) * (1.0 - f);\n"
     "    }\n"
+    /* Framebuffer fetch (fetch_program): a semi-transparent texel of mode 2
+     * subtracted here from the pixel under it, as the subtracting pass's
+     * equation does (its source alpha is 1, so the alpha comes out 0); its
+     * alpha 0 makes the blend (one, source alpha) take that as it is. */
+    "#ifdef FRAMEBUFFER_FETCH\n"
+    "    if (semi && mode.y == 2) {\n"
+    "        fragment = vec4(max(FRAMEBUFFER_FETCH.rgb - c / 255.0, 0.0), 0.0);\n"
+    "        return;\n"
+    "    }\n"
+    "#endif\n"
     "    fragment = vec4(c / 255.0, alpha);\n"
     "}\n";
 
@@ -687,8 +704,11 @@ static char *es_source(const char *source)
     return out;
 }
 
-/* `define`, when given, is a line put right after the #version line. */
-static GLuint compile(GLenum kind, const char *source, const char *define)
+/* `define`, when given, is a line put right after the #version line;
+ * `extension` (an #extension line, ES only) goes right after the version
+ * line of the shader ES gets, before its precisions, where GLSL ES wants
+ * it. */
+static GLuint compile(GLenum kind, const char *source, const char *define, const char *extension)
 {
     GLuint shader = gl_CreateShader(kind);
     GLint ok = 0;
@@ -713,6 +733,19 @@ static GLuint compile(GLenum kind, const char *source, const char *define)
             gl_DeleteShader(shader);
             return 0;
         }
+        if (extension) {
+            size_t first = strcspn(converted, "\n") + 1, length = strlen(converted);
+            char *more = realloc(converted, length + strlen(extension) + 1);
+            if (!more) {
+                free(converted);
+                free(defined);
+                gl_DeleteShader(shader);
+                return 0;
+            }
+            converted = more;
+            memmove(converted + first + strlen(extension), converted + first, length - first + 1);
+            memcpy(converted + first, extension, strlen(extension));
+        }
         source = converted;
     }
     gl_ShaderSource(shader, 1, &source, NULL);
@@ -735,12 +768,15 @@ static GLuint compile(GLenum kind, const char *source, const char *define)
  * made `program` when it links; the one it replaces is the caller's. */
 static int program_xbr;
 
-static int make_program(int xbr)
+/* The vertex shader and the fragment shader (`defines` and `extension` as
+ * compile puts them) linked; 0 when one does not compile or they do not
+ * link. */
+static GLuint link_program(const char *defines, const char *extension)
 {
-    GLuint vs = compile(GL_VERTEX_SHADER, vertex_source, NULL), fs, made;
+    GLuint vs = compile(GL_VERTEX_SHADER, vertex_source, NULL, NULL), fs, made;
     GLint ok = 0;
     if (!vs) return 0;
-    fs = compile(GL_FRAGMENT_SHADER, fragment_source, xbr ? "#define TEXTURE_XBR 1\n" : NULL);
+    fs = compile(GL_FRAGMENT_SHADER, fragment_source, defines, extension);
     if (!fs) {
         gl_DeleteShader(vs);
         return 0;
@@ -766,6 +802,15 @@ static int make_program(int xbr)
         gl_DeleteProgram(made);
         return 0;
     }
+    return made;
+}
+
+static void make_fetch_program(int xbr); /* framebuffer fetch's (below) */
+
+static int make_program(int xbr)
+{
+    GLuint made = link_program(xbr ? "#define TEXTURE_XBR 1\n" : NULL, NULL);
+    if (!made) return 0;
     program = made;
     program_xbr = xbr;
     u_picture_size = gl_GetUniformLocation(program, "picture_size");
@@ -789,7 +834,84 @@ static int make_program(int xbr)
     u_bank_level = gl_GetUniformLocation(program, "bank_level");
     u_captured = gl_GetUniformLocation(program, "captured");
     u_capture = gl_GetUniformLocation(program, "capture");
+    make_fetch_program(xbr);
     return 1;
+}
+
+/* --- framebuffer fetch ----------------------------------------------------
+ * A subtractive primitive is a run of its own, drawn twice (flush_runs), and
+ * the normal stretch after it is another run. In a 3D battle's attack effect
+ * (about 31 frames) the game draws about 400 subtractive triangles a frame,
+ * one at a time between normal ones: about 890 runs and 1,360 draw calls in
+ * one flush, against 35 runs before the effect. Measured on a Samsung A22
+ * (Mali-G52, OpenGL ES 3.2) at 2x: that flush took 42 ms of CPU a frame, and
+ * about 180 ms on the effect's first frame, 27 to 44 VBlanks missed around it
+ * over the runs measured; the same state and uniform calls without the draws took 1.6 ms,
+ * so the time is in glDrawArrays (likely the driver's cost per draw: the
+ * PC's driver makes the same calls in 0.2 ms).
+ *
+ * Where the driver has GL_ARM_shader_framebuffer_fetch (Mali), fetch_program
+ * is the program with FRAMEBUFFER_FETCH: a semi-transparent texel of mode 2
+ * reads the pixel under it (gl_LastFragColorARM) and subtracts itself there,
+ * with the blend as before for everything else, so a subtractive primitive
+ * needs no run of its own. In a flush with many subtractive runs
+ * (FETCH_MIN_RUNS), fetch_join joins each stretch of them, from its first
+ * subtractive run to its last, into one run drawn with fetch_program; the
+ * rest of the flush, and every other flush, is drawn as before. Reading the
+ * picture costs the GPU (on the A22 at 4x the map lost frames when every
+ * flush with a subtractive primitive used it), hence both limits.
+ * Not with anti-aliasing (the color read is then not the pixel's), nor
+ * without the extension (desktop GL, GPUs without it: as before), nor when
+ * the program does not build, nor with MEMORIES_GL_FETCH=0.
+ * GL_EXT_shader_framebuffer_fetch (Adreno, PowerVR) is not used: it has not
+ * been tried on a device. */
+static GLuint fetch_program;
+static int fetch_allowed; /* the driver has the extension and MEMORIES_GL_FETCH is not 0 */
+static int flush_fetching; /* the flush being drawn has runs for fetch_program (fetch_join) */
+static int fetch_in_use;   /* fetch_program is the program in use, its uniforms swapped in (fetch_use) */
+static unsigned fetch_flushes; /* such flushes in the last 120 replays, for MEMORIES_TRACE=frames */
+static int tex_xbr_now;    /* tex_xbr as this replay set it */
+/* fetch_program's uniforms: those the flush sets, swapped with `program`'s
+ * for a fetch flush (fetch_swap), and those set once a replay there. */
+#define FETCH_SWAPPED(X) X(window) X(pass) X(pack_entry) X(pack_size) X(bank_sprite) X(bank_source) X(bank_level)
+#define DECLARE(name) static GLint uf_##name;
+FETCH_SWAPPED(DECLARE)
+#undef DECLARE
+static GLint uf_op, uf_scale, uf_picture_size, uf_tex_xbr, uf_capture, uf_units[8];
+
+static void make_fetch_program(int xbr)
+{
+    static const char *const units[8] = {"vram", "scratch", "banks", "entry_map", "place_map", "pack", "glyphs", "captured"};
+    GLuint made;
+    int i;
+    if (fetch_program) gl_DeleteProgram(fetch_program);
+    fetch_program = 0;
+    if (!fetch_allowed) return;
+    made = link_program(xbr ? "#define TEXTURE_XBR 1\n#define FRAMEBUFFER_FETCH gl_LastFragColorARM\n"
+                            : "#define FRAMEBUFFER_FETCH gl_LastFragColorARM\n",
+                        "#extension GL_ARM_shader_framebuffer_fetch : require\n");
+    if (!made) {
+        fetch_allowed = 0; /* tried once: subtractive primitives in two passes, as without the extension */
+        fprintf(stderr, "memories-pc: OpenGL picture: no framebuffer fetch (its program did not build)\n");
+        return;
+    }
+    fetch_program = made;
+#define LOCATE(name) uf_##name = gl_GetUniformLocation(made, #name);
+    FETCH_SWAPPED(LOCATE)
+#undef LOCATE
+    uf_op = gl_GetUniformLocation(made, "op");
+    uf_scale = gl_GetUniformLocation(made, "scale");
+    uf_picture_size = gl_GetUniformLocation(made, "picture_size");
+    uf_tex_xbr = gl_GetUniformLocation(made, "tex_xbr");
+    uf_capture = gl_GetUniformLocation(made, "capture");
+    for (i = 0; i < 8; i++) uf_units[i] = gl_GetUniformLocation(made, units[i]);
+}
+
+static void fetch_swap(void)
+{
+#define SWAP(name) { GLint t = u_##name; u_##name = uf_##name; uf_##name = t; }
+    FETCH_SWAPPED(SWAP)
+#undef SWAP
 }
 
 static GLuint make_texture(GLenum internal, int w, int h, GLenum format, GLenum type)
@@ -903,7 +1025,81 @@ static GLuint picture_draw(void)
     return picture_ms_fbo ? picture_ms_fbo : picture_fbo;
 }
 
-/* The picture and its scratch copy at the scale, made or remade. */
+/* The scale a start of the picture was refused at (0: none) and why
+ * (MEMORIES_REFUSED_*, display.h), for the platform to take
+ * (GlPicture_TakeRefusedScale) and fall back from. */
+static int refused_scale, refused_why;
+
+static void refuse_scale(int wanted, int why)
+{
+    refused_scale = wanted;
+    refused_why = why;
+}
+
+/* MEMORIES_GL_FAIL_8X=1: the 8x targets fail as an out-of-memory driver would
+ * (1); =msaa: only the 8x multisampled buffer does (2), so the picture is made
+ * without anti-aliasing and a lower scale gets it back. To see the fallback
+ * without a weak card (notes/pc-build.md). */
+static int fail_8x_asked(void)
+{
+    static int asked = -1;
+    if (asked < 0) {
+        const char *env = getenv("MEMORIES_GL_FAIL_8X");
+        asked = !env || !*env || !strcmp(env, "0") ? 0 : !strcmp(env, "msaa") ? 2 : 1;
+    }
+    return asked;
+}
+
+/* The lowest scale made to fail (0: none): MEMORIES_GL_FAIL_SCALE=N fails the
+ * picture at N and above (4: 4x and 8x, so a refused 8x is followed by a
+ * refused 4x), MEMORIES_GL_FAIL_8X=1 is N of 8. */
+static int fail_from(void)
+{
+    static int from = -1;
+    if (from < 0) {
+        const char *env = getenv("MEMORIES_GL_FAIL_SCALE");
+        from = env && *env ? atoi(env) : 0;
+        if (from != 2 && from != 4 && from != 8) from = fail_8x_asked() == 1 ? 8 : 0;
+    }
+    return from;
+}
+
+/* The multisampled buffer at the picture's size, or 0 (also past the largest
+ * renderbuffer, which make_multisampled would only learn from a GL error). A
+ * buffer that does not fit costs the picture its samples, not its scale. */
+static GLuint make_multisampled_fitting(int w, int h, GLuint *buffer_out)
+{
+    GLint largest = 0;
+    glGetIntegerv(GL_MAX_RENDERBUFFER_SIZE, &largest);
+    if (w > largest || h > largest) {
+        fprintf(stderr, "memories-pc: OpenGL picture: %dx%d is beyond the largest renderbuffer (%d); no anti-aliasing\n",
+                w, h, largest);
+        return 0;
+    }
+    if (fail_8x_asked() == 2 && w == SOFT_GPU_WIDTH * 8) {
+        fprintf(stderr, "memories-pc: OpenGL picture: no room for %dx anti-aliasing at this resolution (MEMORIES_GL_FAIL_8X)\n",
+                samples);
+        return 0;
+    }
+    return make_multisampled(w, h, buffer_out);
+}
+
+/* The picture's colour targets, freed (what a failed start must not keep:
+ * at 8x they are 128 MiB each). */
+static void free_picture_targets(void)
+{
+    if (picture_fbo) gl_DeleteFramebuffers(1, &picture_fbo);
+    if (picture_scratch_fbo) gl_DeleteFramebuffers(1, &picture_scratch_fbo);
+    if (picture_texture) glDeleteTextures(1, &picture_texture);
+    if (picture_scratch) glDeleteTextures(1, &picture_scratch);
+    picture_fbo = picture_scratch_fbo = 0;
+    picture_texture = picture_scratch = 0;
+}
+
+/* The picture and its scratch copy at the scale, made or remade. A refusal
+ * leaves no picture (scale 0) and is noted for the platform, which asks for
+ * the next scale down (refused_scale); the multisampled buffer alone failing
+ * costs samples, never the scale. */
 static int make_picture(int wanted)
 {
     int w = SOFT_GPU_WIDTH * wanted, h = SOFT_GPU_HEIGHT * wanted;
@@ -913,38 +1109,68 @@ static int make_picture(int wanted)
         /* A phone's memory: at 8x the picture and its scratch copy are
          * 128 MiB each, before anti-aliasing and widescreen's targets. */
         fprintf(stderr, "memories-pc: OpenGL picture: %dx is beyond OpenGL ES's 4x\n", wanted);
+        refuse_scale(wanted, MEMORIES_REFUSED_ES);
         return 0;
     }
     glGetIntegerv(GL_MAX_TEXTURE_SIZE, &largest);
     if (w > largest || h > largest) {
         fprintf(stderr, "memories-pc: OpenGL picture: %dx is beyond the largest texture (%d)\n", wanted, largest);
+        refuse_scale(wanted, MEMORIES_REFUSED_SIZE);
         return 0;
     }
     wide_free(); /* their textures are at the old scale */
     capture_rect[2] = capture_rect[3] = 0; /* so is the capture's */
     free_multisampled(&picture_ms_fbo, &picture_ms_buffer);
     picture_unresolved = 0; /* drawn again from VRAM (resync) */
-    if (picture_fbo) gl_DeleteFramebuffers(1, &picture_fbo);
-    if (picture_scratch_fbo) gl_DeleteFramebuffers(1, &picture_scratch_fbo);
-    if (picture_texture) glDeleteTextures(1, &picture_texture);
-    if (picture_scratch) glDeleteTextures(1, &picture_scratch);
+    free_picture_targets();
+    while (glGetError() != GL_NO_ERROR) continue;
     picture_texture = make_texture(GL_RGBA8, w, h, GL_RGBA, GL_UNSIGNED_BYTE);
     picture_scratch = make_texture(GL_RGBA8, w, h, GL_RGBA, GL_UNSIGNED_BYTE);
+    if (glGetError() != GL_NO_ERROR || (fail_from() && wanted >= fail_from())) { /* out of video memory */
+        fprintf(stderr, "memories-pc: OpenGL picture: no room for the %dx picture%s\n", wanted,
+                fail_from() && wanted >= fail_from() ? " (MEMORIES_GL_FAIL_*)" : "");
+        free_picture_targets();
+        scale = 0;
+        refuse_scale(wanted, MEMORIES_REFUSED_ROOM);
+        return 0;
+    }
     picture_fbo = make_framebuffer(picture_texture);
     picture_scratch_fbo = make_framebuffer(picture_scratch);
     if (!picture_fbo || !picture_scratch_fbo) {
+        free_picture_targets();
         scale = 0;
+        refuse_scale(wanted, MEMORIES_REFUSED_ROOM);
         return 0;
     }
-    if (samples && !(picture_ms_fbo = make_multisampled(w, h, &picture_ms_buffer)))
+    samples = samples_given; /* what the last scale could not make, this one may */
+    if (samples && !(picture_ms_fbo = make_multisampled_fitting(w, h, &picture_ms_buffer)))
         samples = 0; /* no room: drawn without, until the setting or the scale changes */
     scale = wanted;
     samples_scale = wanted; /* made at this scale: set_samples has nothing to redo */
     return 1;
 }
 
+int GlPicture_TakeRefusedScale(int *why)
+{
+    int refused = refused_scale;
+    if (why) *why = refused_why;
+    refused_scale = refused_why = 0;
+    return refused;
+}
+
 static void delete_names(void); /* every name the pass holds (below) */
 static void forget_names(void);
+
+/* Whether the context's GL_EXTENSIONS names `name`. */
+static int has_extension(const char *name)
+{
+    const char *all = (const char *)glGetString(GL_EXTENSIONS), *at;
+    size_t length = strlen(name);
+    for (at = all; at && (at = strstr(at, name)); at += length) {
+        if ((at == all || at[-1] == ' ') && (at[length] == ' ' || !at[length])) return 1;
+    }
+    return 0;
+}
 
 /* A start that failed half way: what it made deleted, nothing held. */
 static int refuse(void)
@@ -980,7 +1206,14 @@ int GlPicture_Init(void)
         fprintf(stderr, "memories-pc: OpenGL picture: no glGenVertexArrays, which OpenGL ES 3 has\n");
         return 0;
     }
+    fetch_allowed = 0;
+    if (es && has_extension("GL_ARM_shader_framebuffer_fetch")) {
+        const char *fetch = getenv("MEMORIES_GL_FETCH");
+        fetch_allowed = !fetch || strcmp(fetch, "0");
+        if (!fetch_allowed) fprintf(stderr, "memories-pc: OpenGL picture: framebuffer fetch off (MEMORIES_GL_FETCH=0)\n");
+    }
     if (!make_program(Settings_Get(SET_XBR) != 0)) return refuse();
+    if (fetch_program) fprintf(stderr, "memories-pc: OpenGL picture: framebuffer fetch on (GL_ARM_shader_framebuffer_fetch)\n");
     vram_texture = make_texture(GL_R16UI, SOFT_GPU_WIDTH, SOFT_GPU_HEIGHT, GL_RED_INTEGER, GL_UNSIGNED_SHORT);
     vram_scratch = make_texture(GL_R16UI, SOFT_GPU_WIDTH, SOFT_GPU_HEIGHT, GL_RED_INTEGER, GL_UNSIGNED_SHORT);
     vram_fbo = make_framebuffer(vram_texture);
@@ -1017,6 +1250,7 @@ typedef struct Run {
     size_t first, count;
     int clip[4], window[4], subtractive, pack; /* pack: the entry (index + 1) sampled, 0 none */
     int wide; /* the widescreen target it is drawn into, -1 the picture */
+    int fetch; /* drawn with fetch_program (set by fetch_join, read only in a flush it joined) */
 } Run;
 /* The widescreen target the primitive being read is drawn into, -1 the
  * picture (see "widescreen" below). */
@@ -1087,7 +1321,8 @@ static int bounds_now[4];
 
 /* A subtractive primitive is a run of its own: its two passes (opaque
  * texels, then the semi-transparent ones) must not straddle a later
- * primitive that overlaps it. */
+ * primitive that overlaps it. (With framebuffer fetch it has one pass, and
+ * fetch_join joins the runs again.) */
 static int run_matches(const Run *run, int subtractive)
 {
     return !subtractive && run->clip[0] == state.clip_x1 && run->clip[1] == state.clip_y1 && run->clip[2] == state.clip_x2 &&
@@ -1138,6 +1373,17 @@ static GlVertex *push_vertices(size_t n, int subtractive)
     vertex_count += n;
     memset(out, 0, n * sizeof(*out));
     return out;
+}
+
+/* HD text (flag 16) reads its palette at whatever index its atlas holds
+ * under the pixel, 0 to 255 (an 8-bit texture), a neighbouring glyph's or
+ * label's too where the pixel's centre lies past its own (the atlas is not
+ * clamped to it); word_at wraps it at x 1023. The software GPU settled only
+ * the entries the console's own texels index (texture_rects): the row
+ * whole, before its draw (flush_runs hands the patch over first). */
+static void ink_palette(void)
+{
+    SoftGpu_Settle(state.clut_x, state.clut_y, 256, 1);
 }
 
 static void set_vertex(GlVertex *out, float x, float y, float u, float v, const Vertex *from, int flags)
@@ -1199,6 +1445,7 @@ static void triangle(const Vertex *a, const Vertex *b, const Vertex *c, int flag
         shift = 0.0f;
         flags |= 64;
     }
+    if (flags & 16) ink_palette();
     for (i = 0; i < 3; i++) {
         float x = v[i]->precise ? v[i]->fx * (float)scale + shift : (float)(v[i]->x * scale) + shift;
         float y = v[i]->precise ? v[i]->fy * (float)scale + shift : (float)(v[i]->y * scale) + shift;
@@ -1235,6 +1482,7 @@ static void block(int x, int y, int w, int h, int u0, int v0, int u1, int v1, co
     float half = 0.5f / (float)scale;
     float s0 = (float)u0 - half, t0 = (float)v0 - half, s1 = (float)u1 - half, t1 = (float)v1 - half;
     if (!out) return;
+    if (flags & 16) ink_palette();
     bounds_now[0] = u0;
     bounds_now[1] = v0;
     bounds_now[2] = u1 - 1;
@@ -2346,8 +2594,8 @@ static GLuint lean(void)
     GLint ok = 0;
     if (lean_tried) return lean_program;
     lean_tried = 1;
-    vs = compile(GL_VERTEX_SHADER, lean_vertex_source, NULL);
-    fs = vs ? compile(GL_FRAGMENT_SHADER, lean_fragment_source, NULL) : 0;
+    vs = compile(GL_VERTEX_SHADER, lean_vertex_source, NULL, NULL);
+    fs = vs ? compile(GL_FRAGMENT_SHADER, lean_fragment_source, NULL, NULL) : 0;
     if (!fs) {
         if (vs) gl_DeleteShader(vs);
         return 0;
@@ -2543,7 +2791,7 @@ static void lean_draw(size_t r)
             gl_Uniform2i(ul_pack_origin, h->ox, h->oy);
             gl_Uniform1i(ul_pack, 5);
             glDrawArrays(GL_TRIANGLES, (GLint)from, (GLsizei)(t - from));
-            gl_UseProgram(program);
+            gl_UseProgram(fetch_in_use ? fetch_program : program);
         } else {
             glDrawArrays(GL_TRIANGLES, (GLint)from, (GLsizei)(t - from));
         }
@@ -2599,17 +2847,106 @@ static int fast_wanted(void)
     return mode == 1 || (mode == 2 && fast_auto);
 }
 
+/* Runs a and b, b right after a: one state, b's vertices following a's. */
+static int fetch_joinable(const Run *a, const Run *b)
+{
+    return a->wide == b->wide && a->pack == b->pack && a->first + a->count == b->first &&
+           !memcmp(a->clip, b->clip, sizeof(b->clip)) && !memcmp(a->window, b->window, sizeof(b->window));
+}
+
+/* Subtractive runs a flush needs for fetch_join: below that the two passes
+ * cost the CPU less than fetch_program costs the GPU. Measured on the A22 at
+ * 4x: the campaign map has 64 to 94 subtractive runs in every flush and fell
+ * from 46.7 to 43.8 frames a second with fetch_program for them (35.3 with it
+ * for the whole flush); the attack effect has about 460 in its flush.
+ * Counted per target (the picture, each widescreen target): in widescreen a
+ * primitive is drawn into the picture and again into its target, which would
+ * double a flush's count (a 3D battle's flushes went from at most about 540
+ * to about 1,070) and take the map past the line. */
+#define FETCH_MIN_RUNS 128
+
+/* A flush with at least FETCH_MIN_RUNS subtractive runs for one target,
+ * drawn with fetch_program's help when there is one and nothing it draws
+ * into is anti-aliased. In each stretch
+ * of joinable runs, the runs from its first subtractive one to its last are
+ * joined into one, drawn with fetch_program (`fetch`); the runs before and
+ * after them stay as they are, drawn with `program`, so the picture's other
+ * pixels are shaded as before. None is left subtractive. 0: the flush is
+ * drawn as without the extension. */
+static int fetch_join(void)
+{
+    size_t i, j, k, count = 0, subtractive[WIDE_TARGETS + 1] = {0}, most = 0;
+    if (!fetch_program) return 0;
+    for (i = 0; i < run_count; i++) {
+        if (runs[i].subtractive && ++subtractive[runs[i].wide + 1] > most) most = subtractive[runs[i].wide + 1];
+    }
+    if (most < FETCH_MIN_RUNS) return 0;
+    for (i = 0; i < run_count; i++) {
+        if (runs[i].wide < 0 ? picture_ms_fbo != 0 : wide[runs[i].wide].ms_fbo != 0) return 0;
+    }
+    for (i = 0; i < run_count; i = j) {
+        size_t first_sub = run_count, last_sub = 0;
+        for (j = i + 1; j < run_count && fetch_joinable(&runs[j - 1], &runs[j]); j++) {}
+        for (k = i; k < j; k++) {
+            if (!runs[k].subtractive) continue;
+            if (first_sub == run_count) first_sub = k;
+            last_sub = k;
+        }
+        for (k = i; k < j; k++) {
+            if (first_sub < k && k <= last_sub) {
+                runs[count - 1].count += runs[k].count;
+                continue;
+            }
+            runs[count] = runs[k];
+            runs[count].fetch = k == first_sub;
+            runs[count++].subtractive = 0;
+        }
+    }
+    run_count = count;
+    return 1;
+}
+
+/* fetch_program in use (on) or `program` (off): fetch_program with what the
+ * replay set in `program` set in it too, and the flush's uniforms swapped
+ * in, or back. */
+static void fetch_use(int on)
+{
+    int i;
+    if (on == fetch_in_use) return;
+    fetch_in_use = on;
+    if (!on) {
+        fetch_swap();
+        gl_UseProgram(program);
+        return;
+    }
+    gl_UseProgram(fetch_program);
+    gl_Uniform1i(uf_op, 0);
+    gl_Uniform1i(uf_scale, scale);
+    gl_Uniform2f(uf_picture_size, (float)(SOFT_GPU_WIDTH * scale), (float)(SOFT_GPU_HEIGHT * scale));
+    gl_Uniform1i(uf_tex_xbr, tex_xbr_now);
+    gl_Uniform4i(uf_capture, capture_rect[0], capture_rect[1], capture_rect[2], capture_rect[3]);
+    for (i = 0; i < 8; i++) gl_Uniform1i(uf_units[i], i);
+    fetch_swap();
+}
+
 /* The primitives gathered so far, in order, into the picture. */
 static void flush_runs(void)
 {
     size_t i;
     int origin_x = 0, origin_y = 0, leaning, bound;
+    /* A host lookup made since the last flush (HdText_Hud, ...) may have
+     * settled held work the last upload missed: its patch, before these
+     * primitives draw, and before the transfer or the end of the replay
+     * that flushes them reads the copy, even when they drew nothing (a
+     * degenerate or oversized polygon looked up and dropped). upload_vram. */
+    if (scale >= 2) SoftGpu_CopyPatches();
     if (!vertex_count || scale < 2) {
         vertex_count = 0;
         run_count = 0;
         return;
     }
     group_runs();
+    flush_fetching = fetch_join(); /* before lean_mark, which takes the runs by index */
     for (i = 0; i < run_count && !pack_drawn; i++) pack_drawn = runs[i].pack > 0;
     sync_banks();
     sync_pack();
@@ -2618,6 +2955,7 @@ static void flush_runs(void)
     glBindTexture(GL_TEXTURE_2D, vram_texture);
     gl_UseProgram(program);
     gl_Uniform1i(u_op, 0);
+    fetch_flushes += flush_fetching;
     glEnable(GL_SCISSOR_TEST);
     glEnable(GL_BLEND);
     glBlendFunc(GL_ONE, GL_SRC_ALPHA);
@@ -2641,6 +2979,7 @@ static void flush_runs(void)
                 glViewport(-origin_x * scale, -origin_y * scale, SOFT_GPU_WIDTH * scale, SOFT_GPU_HEIGHT * scale);
             }
         }
+        if (flush_fetching) fetch_use(run->fetch); /* before the run's uniforms: they are its program's */
         scissor_words(run->clip[0], run->clip[1], run->clip[2], run->clip[3], origin_x, origin_y);
         gl_Uniform4i(u_window, run->window[0] * 8, run->window[1] * 8, (run->window[2] & run->window[0]) * 8,
                     (run->window[3] & run->window[1]) * 8);
@@ -2668,6 +3007,8 @@ static void flush_runs(void)
             glBlendFunc(GL_ONE, GL_SRC_ALPHA);
         }
     }
+    fetch_use(0); /* `program` and its uniforms back */
+    flush_fetching = 0;
     unbind_attributes();
     glDisable(GL_BLEND);
     glDisable(GL_SCISSOR_TEST);
@@ -2724,15 +3065,19 @@ static void clip_rect(int *x, int *y, int *w, int *h)
     if (*y + *h > SOFT_GPU_HEIGHT) *h = SOFT_GPU_HEIGHT - *y;
 }
 
-static void apply_load(int x, int y, int w, int h, const uint16_t *pixels)
+/* The part of a load the picture has room for (an upload past the edge wraps
+ * on the console; here it is cut). 0 when none of it is left. */
+static int load_clip(int *x, int *y, int *w, int *h)
 {
-    int cw = w, ch = h;
-    flush_runs();
-    if (scale < 2) return;
-    x &= SOFT_GPU_WIDTH - 1;
-    y &= SOFT_GPU_HEIGHT - 1;
-    clip_rect(&x, &y, &cw, &ch); /* an upload past the edge wraps on the console; here it is cut */
-    if (cw <= 0 || ch <= 0) return;
+    *x &= SOFT_GPU_WIDTH - 1;
+    *y &= SOFT_GPU_HEIGHT - 1;
+    clip_rect(x, y, w, h);
+    return *w > 0 && *h > 0;
+}
+
+/* Its words into VRAM's texture; w is the row length of pixels. */
+static void load_upload(int x, int y, int w, int cw, int ch, const uint16_t *pixels)
+{
     capture_touch(x, y, cw, ch);
     glBindTexture(GL_TEXTURE_2D, vram_texture);
     glPixelStorei(GL_UNPACK_ROW_LENGTH, w);
@@ -2740,8 +3085,66 @@ static void apply_load(int x, int y, int w, int h, const uint16_t *pixels)
     glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, cw, ch, GL_RED_INTEGER, GL_UNSIGNED_SHORT, pixels);
     glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+}
+
+/* Its words from VRAM's texture into the picture and the widescreen targets. */
+static void load_copy(int x, int y, int cw, int ch)
+{
     picture_from_words(x, y, cw, ch);
     wide_mirror(x, y, cw, ch, 0, 0, 0, 0);
+}
+
+static void apply_load(int x, int y, int w, int h, const uint16_t *pixels)
+{
+    int cw = w, ch = h;
+    flush_runs();
+    if (scale < 2) return;
+    if (!load_clip(&x, &y, &cw, &ch)) return;
+    load_upload(x, y, w, cw, ch, pixels);
+    load_copy(x, y, cw, ch);
+}
+
+/* The words one OP_LOAD takes in a record. */
+static size_t load_words(const uint32_t *op)
+{
+    return 5 + ((size_t)op[3] * op[4] + 1) / 2;
+}
+
+/* A run of loads in a record, from the one at taken[at] (a 3D battle sends
+ * some 235 of them, its models and palettes, as it starts, up to 68 in one
+ * replay): every upload into VRAM's texture first, then each one's copy into
+ * the picture, in the record's order. One at a time, each upload changed the
+ * texture the copy queued just before it still reads. Measured on a Samsung
+ * A22 (Mali, OpenGL ES): the worst frame at the start of a battle was 106 to
+ * 153 ms at 2x and 102 to 172 ms at 4x (three runs of two battles each), and
+ * in two passes 38 to 43 ms at 2x and 58 to 69 ms at 4x. With timers around
+ * the uploads (one run at 2x) an upload took 1.5 to 2 ms there, and 0.3 ms in
+ * two passes; a desktop GPU takes 8 us. The likely cause is the driver
+ * waiting for the queued copy, or copying the texture; it was not looked at.
+ * The picture is the same: a copy reads only its own word of VRAM's texture
+ * (nothing around it), so where two loads overlap the later one's words are in
+ * the picture either way, and each copy and its widescreen mirror still follow
+ * the one before it. Returns the words the run takes: it ends at a record that
+ * is not a load, or a load cut short by the end of the record, which the caller
+ * stops on as it always did. */
+static size_t apply_loads(const uint32_t *taken, size_t at, size_t count)
+{
+    size_t end = at, k;
+    flush_runs();
+    while (end + 5 <= count && taken[end] == OP_LOAD && end + load_words(taken + end) <= count)
+        end += load_words(taken + end);
+    if (scale < 2) return end - at;
+    for (k = at; k < end; k += load_words(taken + k)) {
+        const uint32_t *op = taken + k;
+        int x = (int)op[1], y = (int)op[2], cw = (int)op[3], ch = (int)op[4];
+        if (load_clip(&x, &y, &cw, &ch)) load_upload(x, y, (int)op[3], cw, ch, (const uint16_t *)(op + 5));
+    }
+    for (k = at; k < end; k += load_words(taken + k)) {
+        const uint32_t *op = taken + k;
+        int x = (int)op[1], y = (int)op[2], cw = (int)op[3], ch = (int)op[4];
+        if (load_clip(&x, &y, &cw, &ch)) load_copy(x, y, cw, ch);
+    }
+    return end - at;
 }
 
 static void apply_fill(int x, int y, int w, int h, uint32_t rgb24)
@@ -2873,21 +3276,55 @@ static void apply_capture(int sx, int sy, int dx, int dy, int w, int h)
     capture_uniform();
 }
 
-/* VRAM as the software GPU has it, whole, into its texture. */
+/* VRAM as the software GPU has it, whole, into its texture. Not settled
+ * (soft_gpu.h, SoftGpu_VramRaw): the replay draws the drawing areas'
+ * picture itself, and settling here would raster both areas at every
+ * replay. So the copy misses what the deferred raster holds now, and
+ * SoftGpu_CopyTaken notes which: when such an area is settled, its words as
+ * they would have been now come back as a patch, which the next replay
+ * applies before anything in its record reads the copy (apply_patch). The
+ * tick is held off from the read to the note: a settle in between would
+ * leave the area half old here and no patch for it. A resync settles
+ * first. */
 static void upload_vram(void)
 {
+    sigset_t held, previous;
+    sigemptyset(&held);
+    sigaddset(&held, SIGALRM);
+    sigprocmask(SIG_BLOCK, &held, &previous);
     glBindTexture(GL_TEXTURE_2D, vram_texture);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 2);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, SOFT_GPU_WIDTH, SOFT_GPU_HEIGHT, GL_RED_INTEGER, GL_UNSIGNED_SHORT,
-                    SoftGpu_Vram());
+                    SoftGpu_VramRaw());
+    SoftGpu_CopyTaken(&recorder);
+    sigprocmask(SIG_SETMASK, &previous, NULL);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
     stats.vram_uploads++;
+}
+
+/* A patch (soft_gpu.h, SoftGpu_CopyPatches): words x,y,w,h of VRAM's
+ * texture as the last upload_vram should have taken them, had the deferred
+ * raster not held them back. Only VRAM's texture: the picture was drawn from
+ * the primitives as they came. Without a picture (a lost context, before the
+ * first resync) there is no copy: the resync to come makes it whole. */
+static void apply_patch(int x, int y, int w, int h, const uint16_t *words)
+{
+    if (scale < 2 || !vram_texture) return;
+    gl_ActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, vram_texture);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, w);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 2);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h, GL_RED_INTEGER, GL_UNSIGNED_SHORT, words);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    stats.patches++;
 }
 
 /* The state words, then VRAM whole into its texture and the picture. At a
  * scale of 1 there is no picture: the state words still count. */
 static void resync(int wanted, const uint32_t words[6])
 {
+    SoftGpu_Settle(0, 0, SOFT_GPU_WIDTH, SOFT_GPU_HEIGHT); /* read whole, as it is now */
     vertex_count = 0;
     run_count = 0;
     capture_rect[2] = capture_rect[3] = 0; /* VRAM may be anything now */
@@ -2934,9 +3371,9 @@ static void set_samples(int wanted)
     wide_free();
     picture_resolve_all(); /* the picture carries on from its texture */
     free_multisampled(&picture_ms_fbo, &picture_ms_buffer);
-    samples = given;
+    samples = samples_given = given;
     if (!samples || scale < 2) return;
-    picture_ms_fbo = make_multisampled(SOFT_GPU_WIDTH * scale, SOFT_GPU_HEIGHT * scale, &picture_ms_buffer);
+    picture_ms_fbo = make_multisampled_fitting(SOFT_GPU_WIDTH * scale, SOFT_GPU_HEIGHT * scale, &picture_ms_buffer);
     if (!picture_ms_fbo) {
         samples = 0; /* no room: drawn without, until the setting or the scale changes */
         return;
@@ -3015,12 +3452,31 @@ int GlPicture_Replay(void)
     glBindTexture(GL_TEXTURE_2D, capture_texture);
     gl_ActiveTexture(GL_TEXTURE0);
     capture_uniform();
-    gl_Uniform1i(u_tex_xbr, Settings_Get(SET_XBR));
+    gl_Uniform1i(u_tex_xbr, tex_xbr_now = Settings_Get(SET_XBR));
     hd_text = HdText_Enabled();
     hd_fast = fast_wanted();
     set_samples(Settings_Get(SET_MSAA));
     hd_hud = HdText_HudEnabled();
     opponent_name = HdText_NameEnabled();
+    /* How far past a primitive's texels texture xBR reads VRAM's texture
+     * (texture_xbr): its centre texel `e` is not clamped to `bounds`, and the
+     * neighbours only to the span of bounds and e, so the reach is how far e
+     * leaves bounds. Without anti-aliasing a fragment's centre lies in the
+     * primitive, so its coordinates lie within the vertices' (bounds, give
+     * or take the console's left-out last texel); `back` moves them on by
+     * less than 2 (1 - 1 / scale, twice at most) and the 1/256 does not take
+     * floor() further: e is at most one texel past the last u and v, never
+     * before the first. With anti-aliasing the centre of a pixel a sample of
+     * it covers can lie outside the primitive and the corner step goes half
+     * a pixel more, both as many texels as a pixel spans, without bound:
+     * anywhere in the page, which texel_word wraps. The software GPU settles
+     * that much past what it settles of each primitive (soft_gpu.h). Before
+     * the patches: a change settles what was held under the old reach. */
+    SoftGpu_SetCopyReach(!Settings_Get(SET_XBR) ? 0 : samples ? SOFT_GPU_REACH_PAGE : 1);
+    /* What the last upload missed of the deferred raster's held work and has
+     * been settled since, into VRAM's texture before anything here reads it
+     * (upload_vram). */
+    SoftGpu_CopyPatches();
     if (overflow || wanted_resync) {
         /* Too much for the arena: from VRAM as it is now, with the state
          * as it is now; the record is superseded. */
@@ -3051,9 +3507,9 @@ int GlPicture_Replay(void)
             if (scale < 2) vertex_count = run_count = 0; /* the state words still count */
             break;
         case OP_LOAD:
-            used = 5 + ((size_t)op[3] * op[4] + 1) / 2;
+            used = load_words(op);
             if (at + used > count) { at = count; break; }
-            apply_load((int)op[1], (int)op[2], (int)op[3], (int)op[4], (const uint16_t *)(op + 5));
+            used = apply_loads(taken, at, count); /* this one and the loads right after it */
             break;
         case OP_MOVE:
             used = 7;
@@ -3096,6 +3552,8 @@ int GlPicture_Replay(void)
         clock_gettime(CLOCK_MONOTONIC, &t1);
         total_us += (unsigned)((t1.tv_sec - t0.tv_sec) * 1000000 + (t1.tv_nsec - t0.tv_nsec) / 1000);
         if (++replays == 120) {
+            if (fetch_program) LOG(LOG_FRAMES, "OpenGL picture: %u flushes drawn with framebuffer fetch", fetch_flushes);
+            fetch_flushes = 0;
             LOG(LOG_FRAMES, "OpenGL picture: %u us per replay at %dx", total_us / 120, scale);
             LOG(LOG_FRAMES,
                 "OpenGL picture per replay at %dx, %dx MSAA: %.1f resolves (%.1f Msamples), %.1f blits (%.1f Mpx), "
@@ -3104,9 +3562,12 @@ int GlPicture_Replay(void)
                 stats.blit_px / 120e6, stats.copies / 120.0, stats.copy_px / 120e6, stats.quads / 120.0,
                 stats.quad_px / 120e6, stats.draws / 120.0);
             /* VRAM is 1024 x 512 16-bit words; the maps 16 and 32 bits a word. */
-            LOG(LOG_FRAMES, "OpenGL picture uploads per replay: VRAM %.2f MB, texture pack maps %.2f MB (%u in 120)",
+            LOG(LOG_FRAMES,
+                "OpenGL picture uploads per replay: VRAM %.2f MB, texture pack maps %.2f MB (%u in 120), "
+                "%u deferred raster patches in 120",
                 stats.vram_uploads * (SOFT_GPU_WIDTH * SOFT_GPU_HEIGHT * 2.0) / 120e6,
-                stats.map_uploads * (SOFT_GPU_WIDTH * SOFT_GPU_HEIGHT * 6.0) / 120e6, stats.map_uploads);
+                stats.map_uploads * (SOFT_GPU_WIDTH * SOFT_GPU_HEIGHT * 6.0) / 120e6, stats.map_uploads,
+                stats.patches);
             memset(&stats, 0, sizeof(stats));
             replays = total_us = 0;
         }
@@ -3365,6 +3826,7 @@ static void delete_names(void)
         gl_DeleteProgram(program);
     }
     if (lean_program) gl_DeleteProgram(lean_program);
+    if (fetch_program) gl_DeleteProgram(fetch_program);
     if (buffer) gl_DeleteBuffers(1, &buffer);
     if (vertex_array && glDeleteVertexArrays_) glDeleteVertexArrays_(1, &vertex_array);
     if (vram_fbo) gl_DeleteFramebuffers(1, &vram_fbo);
@@ -3400,6 +3862,8 @@ static void forget_names(void)
     on = 0;
     program = buffer = vertex_array = 0;
     lean_program = 0;
+    fetch_program = 0; /* made again with `program` (make_program) */
+    flush_fetching = fetch_in_use = 0;
     lean_tried = 0; /* made again in the new context, when wanted */
     lean_maps = ~0u;
     vram_texture = vram_scratch = vram_fbo = vram_scratch_fbo = 0;

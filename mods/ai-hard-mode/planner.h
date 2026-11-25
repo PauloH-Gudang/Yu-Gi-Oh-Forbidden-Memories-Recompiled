@@ -29,6 +29,7 @@ typedef struct {
 typedef struct {
     int hand, fusion, guardian, attacks, defense, spells, effective;
     int materials, budget, blind_risk, material_cost, trades;
+    int blind_defense; /* weigh a face-down defender by what a failed attack costs */
 } HmOptions;
 typedef struct {
     HmCard (*card)(int id);
@@ -48,7 +49,7 @@ typedef struct {
 extern int (*Hm_StarMatchup)(int attacker, int defender);
 int Hm_StarBonus(int a, int b);
 int Hm_KeepValue(HmCard card);
-int Hm_ChooseStar(const HmBoard *, HmCard, int pinned);
+int Hm_ChooseStar(const HmBoard *, const HmOptions *, HmCard, int pinned);
 HmDecision Hm_PlanHand(const HmBoard *, const HmOptions *, const HmRules *);
 HmDecision Hm_PlanField(const HmBoard *, const HmOptions *, const HmRules *,
                         const HmDecision *retail);

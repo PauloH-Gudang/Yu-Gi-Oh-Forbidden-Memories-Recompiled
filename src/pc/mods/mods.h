@@ -61,6 +61,11 @@ void Mods_SetMouse(void (*motion)(int *dx, int *dy, unsigned *buttons, int escap
  * notch is also a D-pad press (0 when a mod has taken the wheel). Without
  * these the host answers no pointer and no notches. */
 void Mods_SetPointer(int (*pointer)(int *x, int *y, unsigned *buttons), int (*wheel)(void), void (*take)(int on));
+/* The keyboard for host->text_capture and host->text_key (API 28): whether the
+ * window keeps the keys typed for a mod, and the next of them (0 none; 8, 13
+ * and 27 for Backspace, Enter and Escape, else printable ASCII). Without
+ * these the host keeps nothing. */
+void Mods_SetText(void (*capture)(int on), int (*next)(void));
 /* The MEMORIES_HUD_* parts the applied mods hide (host->hide_hud), or 0. */
 unsigned Mods_HiddenHud(void);
 /* Where the window shows the game's picture, for host->overlay_picture:
@@ -176,6 +181,14 @@ void Mods_DrawFrame(void);
 /* Whether a mod's frame callback, in the last Mods_DrawFrame, asked that
  * its frame be drawn only in the scaled picture (host->picture_only_frame). */
 int Mods_PictureOnlyFrame(void);
+/* How many times loaded mod code bound SoftGpu_Vram or SoftGpu_StateData
+ * (or code loaded by the system's loader, whose bindings are not seen): the
+ * software GPU keeps no drawing back while it is not 0 (libgpu.c). */
+int Mods_VramUsers(void);
+/* Called with the new count as each such binding is made (NULL: nobody is
+ * told): libgpu.c sets it to SoftGpu_SetModVramUsers, which rasters what is
+ * held before the mod can see VRAM. */
+extern void (*Mods_VramUsersChanged)(int users);
 /* The applied mods' overlays (MemoriesMod.overlay), drawn with the port's
  * menu text; the rectangle they covered, or zeros. Their signature changes
  * whenever one of them would draw something else (`frame` for a mod that

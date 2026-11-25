@@ -81,8 +81,12 @@
  *      event change
  *  26  a card's "variant_permille" and "variant_label" (notes/more-cards.md)
  *      only; no host layout or event change
- *  27  (held for the manifest-only feature of PR #486)
- *  28  (held for text_capture and text_key, PR #487)
+ *  27  a frame style's richer parts (stars.image, game_frame, parts_over_art, color on the
+ *      labels and digit strips) and a card's art_transparent (notes/modding.md, card_layout);
+ *      a card_layout of frame_styles alone no longer replaces another mod's layout;
+ *      CardLayout_HandPlace, a hand card's placement for a code mod. No host layout or
+ *      event change, and CardLayoutFrameStyle keeps its size
+ *  28  text_capture, text_key: the keys typed, for a mod that has the player type
  *  29  model_module, model_module_remove, model_module_base: native C a code
  *      mod gives for a battle model's control modules (MemoriesModelModule),
  *      run instead of those modules' MIPS where the module's bytes hash to
@@ -457,6 +461,26 @@ struct MemoriesModHost {
     int (*wheel)(const MemoriesModHost *);
     void (*take_wheel)(const MemoriesModHost *, int on);
 
+    /* --- API 28 ---
+     * Typed text, for a mod with a text field of its own (a password, a
+     * name). text_capture(1) makes the keyboard the mod's, until
+     * text_capture(0), the mod being turned off, or another mod taking it:
+     * the text the player types (the number pad's and the number row's
+     * digits, letters, a space, whatever the keyboard layout and an input
+     * method make of the keys; Ctrl+V, Command+V or Shift+Insert gives the
+     * clipboard's printable ASCII as if typed) and Backspace, Enter and Escape are kept for
+     * text_key, and no key does anything in the game meanwhile (Enter is
+     * not Start, Escape asks nothing). The game's controls given by the
+     * pad are not touched. Keys held when it starts end as they were
+     * pressed. While a menu, a notice or one of the port's windows has the
+     * keyboard, nothing is kept.
+     * text_key: the next key kept, in the order it was typed: 32 to 126 a
+     * printable ASCII character, MEMORIES_KEY_BACKSPACE, MEMORIES_KEY_ENTER
+     * or MEMORIES_KEY_ESCAPE; 0 when none is waiting. Characters past ASCII
+     * (an accent, a kana) are left out. */
+    void (*text_capture)(const MemoriesModHost *, int on);
+    int (*text_key)(const MemoriesModHost *);
+
     /* --- API 29 ---
      * Native C for a model's control module (MemoriesModelModule): a token,
      * or 0 when the row is refused (the mod's status says why: a sha256 that
@@ -473,6 +497,10 @@ struct MemoriesModHost {
      * finds its data: (T *)(uintptr_t)(base + offset). 0 outside an entry. */
     uint32_t (*model_module_base)(const MemoriesModHost *);
 };
+
+#define MEMORIES_KEY_BACKSPACE 8
+#define MEMORIES_KEY_ENTER 13
+#define MEMORIES_KEY_ESCAPE 27
 
 /* The symbol a mod's object defines, and its type. */
 typedef int (*MemoriesModEntry)(const MemoriesModHost *host, MemoriesMod *mod);

@@ -565,13 +565,27 @@ entries), and
 `MEMORIES_TRACE_MENU=1` (menu-bar clicks) and
 `MEMORIES_TRACE_MODEL_MODULES=1` (MODEL bridge commands) and
 `MEMORIES_TRACE_DUEL_EFFECTS=1` (WA effect requests and payloads). Without an audio device
-(or headless) a silent sink still runs the SPU: the game polls envelopes and
-the disc service waits for CD-input room, so a stopped SPU hangs the game
-after the movie.
+(or headless) a silent sink still runs the SPU: the sound driver reads
+voice status and envelopes, and only the mixer drains the CD/XA input (a
+full ring drops the decoded sectors' samples; the disc service does not
+wait for room). The sink is a thread that mixes 256 frames every 5.8 ms of
+real time, except under `MEMORIES_DETERMINISTIC=1` (not on Android): there
+the game thread mixes 44.1 frames at each 1 ms step of the virtual clock,
+before the step's tick runs the sound driver (a step the interrupt clock's
+handler takes only owes its frames, mixed at the next step on the game
+thread), and writes
+`MEMORIES_DUMP_AUDIO` from there, so the dump is as long as the game's
+virtual time. The thread mixed as much as real time allowed while the game
+ran flat out, so a voice finished its release at another game instant in
+each run and the driver reused its note records in another order: two
+lockstep runs differed in up to a few hundred bytes of the driver's memory.
+The fraction of a frame still owed is saved in the state
+(`platform-mixer`).
 
 Key-on and key-off requests are applied by the mixer at its next 256-frame
-period (5.8 ms), but the hardware answered `SpuGetKeyStatus` and
-`SpuGetVoiceEnvelope` at once, and the sound driver relies on that: it picks
+period (5.8 ms; 1 ms when the game thread mixes), but the hardware answered
+`SpuGetKeyStatus` and `SpuGetVoiceEnvelope` at once, and the sound driver
+relies on that: it picks
 a free SFX voice by envelope 0 and spins on status after a key-off. So both
 reads answer from the request (`keyed_mask`; a pending key-on reads as full
 attack), not from the mixer. Before that, two sounds keyed within one mix
@@ -2701,7 +2715,7 @@ ones loaded after it.
 
 ### Internal resolution
 
-View > Console resolution / Internal 2x, 4x (the `internal_scale`
+Video > Resolution > Console resolution / Internal 2x, 4x, 8x (the `internal_scale`
 setting, `MEMORIES_INTERNAL_SCALE=N`, 1, 2, 4 or 8) shows a picture of the
 whole of VRAM at N x N pixels per VRAM word in 24-bit color instead of
 VRAM. VRAM itself stays exactly what the console's would be: the game reads
@@ -2718,7 +2732,23 @@ HD text. The function now also calls `Memories_PictureCapture` (under
 when the record reaches it, and 16-bit texels in the rect take their color
 from the copy while their word still decides transparency and
 semi-transparency. A load, copy or fill over the rect, a resync or a new
-scale drops the copy. The software picture and 1x keep VRAM's texels there. A line is the console's one-pixel line made N
+scale drops the copy. The software picture and 1x keep VRAM's texels there.
+A story scene's image change is the same case: `Script_OpShowImage`
+copies the displayed 320x160 frame (MoveImage) to 448,256 and a sprite draws
+that snapshot while the screen fades to the next image. It now calls
+`Memories_PictureCapture` for the copy, so the snapshot takes its pixels from
+the scaled picture (with xBR or HD text on, the detail the picture had)
+instead of from VRAM's 1x copy. In the first-duel replay at 4x that is the
+fade of frames 1322-1342 only; the steady frames of the scene are drawn
+straight and were never affected. Only one capture holds at a time: the
+card's area (320,256, 0x8C by 0xC4) and this one share x 448-460, and a load
+or move over either drops the other, as the later one is what VRAM holds. A
+card burn and a script scene are not on screen together. It is the only
+display-to-texture MoveImage that needs one: the others in the game copy
+texture to texture (the model animations, texture tints) or shuffle the
+movie's frame to 0,256, and a capture for each of them would evict this one.
+
+A line is the console's one-pixel line made N
 times thicker, one quad covering each picture pixel once (`line_quad` in
 both renderers), so a semi-transparent line blends once per pixel as on the
 console. Drawing it as an N x N block per picture step blended the Library's
@@ -2741,6 +2771,31 @@ What a primitive draws is not sampled by a later one of the same frame
 (the game never renders to a texture); across frames VRAM is uploaded
 whole after each replay. A duel with 3D Monsters replays in 1.5-2.5 ms a
 frame at 2x and 2.5-4 ms at 4x on the development machine.
+
+A run of consecutive uploads in a record (`apply_loads`; a 3D battle sends
+some 235 of them, models and palettes, as it starts, up to 68 in one replay)
+is applied in two passes, every upload into VRAM's texture first and then
+each one's copy into the picture and the widescreen targets, in the record's
+order; one upload and one copy at a time, each upload changed the texture a
+copy queued just before it still reads. On a Samsung A22 (Mali, OpenGL ES)
+that cost 1.5-2 ms an upload (timers around them, one run at 2x; 0.3 ms in
+two passes; a desktop GPU takes 8 us an upload, no stall): the worst frame at
+the start of a battle took 106-153 ms at 2x and 102-172 ms at 4x (three runs
+of two battles each, median 135 and 159 ms; the game's own frame log, mods
+off, no pack), and 38-43 ms at 2x and 58-69 ms at 4x with two passes (median
+40 and 68 ms). The likely cause is the driver waiting for the queued copy, or
+copying the texture; it was not looked at. At 4x the entry still has a frame
+of about 60-70 ms. The picture is the same: the copy shader reads only its
+own word of VRAM's texture, so where two loads overlap the later one's words
+are in the picture either way. Checked on the desktop with the whole scaled
+picture hashed after every replay: three battles at 2x and at 4x, a synthetic
+record of overlapping, edge-clipped, odd-sized and empty loads, widescreen,
+the HD pack with HD text and a state load inside a battle came out the same
+before and after (with anti-aliasing, 2x to 8x, the hash of the picture
+differs in a few frames from run to run, as much between two runs of the
+same build as between the two builds; where that comes from was not found).
+The attack effect's frame inside the battle (200 ms and more on the phone,
+growing with the scale) is another cost and is not changed by this.
 
 Without that (the X11 backend, `MEMORIES_GL_PICTURE=0`, an older GL) the
 software GPU draws every primitive a second time into the picture
@@ -2839,6 +2894,1138 @@ is identical to the 4:3 picture, with it on or off.
 
 It changes nothing at 1x, and nothing in the software picture.
 
+#### Internal 8x
+
+Video > Resolution offers Internal 8x on the desktop builds (Windows, Linux,
+macOS) with "needs a strong graphics card" beside it; the Android menu does
+not list it, as OpenGL ES refuses it (below). The picture covers all of
+VRAM, 8192x4096 RGBA: 128 MiB, and its scratch copy another 128 MiB, so the
+colour targets alone are 256 MiB and 8 samples of anti-aliasing add 1 GB.
+The texture is 8192 pixels on a side, so `GL_MAX_TEXTURE_SIZE` must be at
+least that (most cards give 16384; one that gives exactly 8192 fits).
+`internal_scale` 8 (the setting or `MEMORIES_INTERNAL_SCALE=8`) was always
+accepted; the menu now offers it.
+
+The row is for the OpenGL picture pass. With no pass (the X11 backend,
+`MEMORIES_GL_PICTURE=0`, a GL older than 3.0) the software GPU would draw
+every primitive 64 times, far too slow to play, so the row is dimmed with
+"needs OpenGL 3" (as HD text is) instead of offering it with a hint that
+does not fit. It is dimmed, not hidden, so the menu keeps its shape and says
+what is missing; a saved or scripted 8 still works there, slowly, as before.
+
+When the picture cannot be made, the game does not stop and does not show a
+black frame: a texture the driver cannot allocate (a GL error, an
+incomplete framebuffer), a size past `GL_MAX_TEXTURE_SIZE`, or OpenGL ES's
+4x limit makes the pass say so on standard error ("OpenGL picture: no room
+for the 8x picture"), free what it made and report the scale and why
+(`GlPicture_TakeRefusedScale`: `MEMORIES_REFUSED_ROOM`, `_SIZE` or `_ES`).
+The presenter then calls `Memories_ScaleRefused(8, why)`, which caps the
+internal resolution at the next scale down, 4x, for the rest of the session
+(`Memories_SetInternalScale` applies the cap to the setting, the Video menu
+and `MEMORIES_SCALE_AT` alike; the cap is the highest scale that works), and
+the frame in flight is shown from VRAM, as when the scales differ. A
+software picture that cannot allocate 8x falls back the same way (`_ROOM`).
+If 4x is refused too (a GL failure there, or no room for the software
+picture) the cap goes to 2x, and so on down to the console's resolution.
+
+The menu follows the cap (`Menu_ScaleRefused`). Every refused scale, and
+every one above it, is dimmed in Video > Resolution with the reason beside
+it: "no room on this graphics card" (`_ROOM`), "too large for this graphics
+card" (`_SIZE`, past `GL_MAX_TEXTURE_SIZE`) or "not with OpenGL ES" (`_ES`,
+on a desktop with `MEMORIES_GLES=1`). The row that is checked is the scale
+that runs, 4x after a refused 8x, while the saved setting stays as it was.
+One notice, "Internal resolution lowered", says what was refused and what
+runs instead ("This graphics card has no room for Internal 8x, so the game
+runs at Internal 4x for now. Your setting stays, and the next start tries
+again."), shown when no other notice is up; if 4x is refused before the
+notice is shown, it says "could not make Internal 8x or 4x".
+
+The saved `internal_scale` stays 8: nothing depends on it being the scale in
+force (the duel code clamps it, the menu shows the scale that runs), the
+next start tries again, which is right after a driver update or with another
+program closed, and a failure that may have been temporary does not cost the
+player their choice. A start with the card still too small shows the notice
+again; picking 4x in the menu ends it.
+
+Anti-aliasing is the extra, not the scale: a multisampled buffer that does
+not fit (a GL error, or a size beyond `GL_MAX_RENDERBUFFER_SIZE`) is dropped,
+as it always was ("no room for 8x anti-aliasing at this resolution" on
+standard error, drawn without until the setting or the scale changes), at
+the same scale; only the colour targets failing drops the scale. So 8x with
+8 samples on a card with room for 8x alone gives 8x without anti-aliasing,
+not 4x. The samples the driver allows for the setting are kept
+(`samples_given`), so a lower scale, made again by a refused 8x or by the
+menu, tries them again: after an 8x that had to go without, 4x has its
+anti-aliasing back. A widescreen target that cannot be made shows the 4:3
+picture between black sides, as before.
+
+`MEMORIES_GL_FAIL_8X=1` makes the 8x targets fail as an out-of-memory
+driver's would (after they are allocated, so the clean-up runs), and
+`MEMORIES_GL_FAIL_8X=msaa` only the 8x multisampled buffer, and
+`MEMORIES_GL_FAIL_SCALE=4` (2, 4 or 8) the picture at that scale and above, so
+that a refused 8x is followed by a refused 4x, to see the fallback, the
+anti-aliasing coming back and the cascade without a weak card. They need the
+OpenGL picture pass, so a window: the headless runs (`MEMORIES_HEADLESS`) use
+the software picture.
+
+### Settling VRAM before it is read
+
+At 2x and above with the OpenGL picture, the GPU draws the picture the
+window shows, yet the software GPU still rasters every primitive into VRAM
+at 1x, which nothing shows: on the Windows PC that raster is 75-88% of the
+game thread's time in a duel (phones not measured yet). The way out is a
+raster that keeps a frame's primitives back in the two 320x240 drawing
+areas and draws them only when something reads what they would have
+drawn, or drops them when the game's clear covers the area two frames
+later. That needs every reader of rastered words to say what it reads
+first. `soft_gpu.h` has it:
+
+- `SoftGpu_Settle(x, y, w, h)`: what has been drawn in the rectangle
+  (wrapping as transfers do) is in VRAM when it returns.
+  `SoftGpu_SettleTexture(depth, page_x, page_y, clut_x, clut_y)` settles a
+  primitive's page (64, 128 or 256 words wide by depth, 256 rows) and, below
+  16 bits, its palette row.
+- `SoftGpu_Vram()` settles all of VRAM, so a reader that says nothing (a
+  code mod: it is lent to mods) is safe. `SoftGpu_VramRaw()` settles nothing,
+  for a reader that settled its own rectangle.
+- `SoftGpu_VramRaw` and `SoftGpu_SettleObserver` are the port's own: not
+  lent to code mods (`NOT_LENT_TO_MODS` in `tools/pc/build_config.py`, used
+  by both export tables, so enforced at build time only: see the mod's VRAM
+  binding below) and declared only outside `MEMORIES_MOD`, so the SDK's
+  `soft_gpu.h` does not offer them and no release pins them.
+- Settling calls `SoftGpu_SettleObserver` (tests) and rasters what the
+  deferred raster holds there (below, "The deferred raster"). With that off,
+  the default, the raster is immediate and nothing a frame draws or a run
+  hashes changes. A new scale or recorder settles all of VRAM before
+  anything changes.
+
+Readers that settle, by what they read:
+
+- All of VRAM: `SoftGpu_Vram()` (dumps and shots, `displayed_picture` after
+  its flush; `Memories_VramHash`, the replays' and `hash`'s; the pack's
+  rediscovery after a state load, `texture_pack.c` `rediscover`), save
+  states (`SoftGpu_StateData(0)`), `SoftGpu_PictureFromVram` (scale changes,
+  state loads), a new scale or recorder (`resync_recorder` relies on its
+  two callers having settled), `resync` in `gl_picture.c` (also on an
+  overflow of the record), and the software picture (`SoftGpu_Picture`,
+  when it is drawn here).
+- The display area: the 1x present, `Memories_ShowStill` and widescreen's
+  4:3 fallback, through `display_words` in `libgpu.c` (a 24-bit row is half
+  as many words again); the x11 backend's screenshot and window redraw,
+  which read the last presented frame again later (`last_words` in
+  `x11.c`). The SDL backend copies the frame as it is presented. Headless
+  (`MEMORIES_HEADLESS`) `display_words` settles nothing: neither backend's
+  `Platform_Present` reads a word without a window.
+- A rectangle: `SoftGpu_Store` (StoreImage), a move's source (not the 2x1
+  move onto itself without the mask that the game makes every frame), the
+  destination of a load or move while the mask bit is checked, a capture's
+  source, a widened target and its picture while the software GPU rasters
+  them (`SoftGpu_WideFrame`, `SoftGpu_WideFrameView`, `SoftGpu_WidePicture`;
+  with a recorder at 2x and above the target's words are not shown and
+  nothing is settled), with the texture dump on, a primitive's texture
+  before `TextureDump_Primitive` reads it through its `source` pointer, and
+  the life-point panel's palette, which `name_over_panel` reads at 1x (the
+  panel is always rastered at once, which settles it already, and the
+  game's palettes there lie outside the drawing areas; settled all the
+  same, so no reader goes without).
+- Host lookups a primitive makes, each its own rectangle: `hd_text.c`
+  (`HdText_Cell` the font's page; the card title's words in
+  `HdText_TitleUploaded` and `HdText_TitleCard`; the life-point panel's page
+  in `HdText_NameBox`; the primitive's texture in `HdText_Hud` and
+  `HdText_FieldWord`, only once the sprite is found to be the panel, a label
+  or a digit sheet (`gl_picture.c` asks them for every textured sprite and
+  quad, and a settle of a page that reaches into a buffer would raster held
+  work for nothing), another label's page in `read_label`, each palette
+  entry in `color`), `glyphs.c` (`read_cell`'s cell, `copy_palettes`' rows),
+  `star_icons.c` (the stars' palette and page), `card_layout_art.c`
+  (`CardLayoutArt_TitleCell`'s source page), `battle_models.c` (`textures`,
+  the three rectangles it copies into the slot's bank) and `menu_letters.c`
+  (each sprite's texture).
+
+`upload_vram` in `gl_picture.c` reads VRAM raw on purpose: settling at
+every replay would raster both drawing areas every frame. So the OpenGL
+copy of VRAM misses what the deferred raster holds when it is taken, and
+gets it back as patches ("The deferred raster", "At 2x and above with the
+OpenGL picture"): a move out of a drawing area (`apply_move` copies
+inside the copy) and a primitive sampling one read it, and their CPU
+counterparts settle what they read, which makes the patch. The raster
+checks each textured primitive's texels against the held areas as it
+comes (`texture_rects`), so a primitive sampling held work is seen.
+
+The checks, and how far they go:
+
+- `pc_soft_gpu_settle` (`tests/pc/soft_gpu_settle_test.c`) covers the
+  readers inside `soft_gpu.c`: its observer stands in for a raster that
+  holds words back and writes them at the first settle that crosses them,
+  so a reader that reads before it settles, or never settles, reads the
+  old words. Each settle in `soft_gpu.c` taken out alone fails it (checked
+  one by one when it was written), with the texture dump off and on; a new
+  scale and a new recorder must settle before the scale or recorder
+  changes. It checks that drawing, fills, unmasked loads, banks and a
+  recorder's widened targets settle nothing.
+- `pc_vram_readers` (`tools/pc/check_vram_readers.py`, which tests itself
+  on each bypass first) reads `src/`, `mods/` and `examples/` (`.c`, `.h`,
+  `.inc`): a function that calls `SoftGpu_VramRaw()` must be listed and,
+  unless it says why not, settle in its own body; `SoftGpu_VramRaw` named in
+  a macro or taken as a function pointer fails, as does writing through
+  either pointer; `resync` must settle before it uploads; a function that
+  calls `SoftGpu_StateData` (whose index 0 is VRAM, settled as it is handed
+  out but writable) must be listed with why its use is safe (the save
+  state's, which reads or writes it whole in the same call), and
+  `SoftGpu_StateData` named in a macro, taken as a function pointer or
+  called in an initializer outside a function fails as `SoftGpu_VramRaw`
+  does (its self-test has each of these, and a listed user that passes;
+  each rule taken out alone fails its own case). It cannot tell
+  whether a rectangle is the right one, or whether a listed reader settles
+  before it reads (only that it settles); it does not see a settled
+  pointer kept and read after later drawing (the x11 backend's last frame
+  was one, fixed by hand), a pointer handed to another function
+  (`Platform_Present`), or `soft_gpu.c` itself.
+- Frame hashes (`Memories_VramHash`, the replays) settle all of VRAM, so
+  hashes that match prove nothing once work is kept back: they would match
+  however late the settle. The deferred raster's poison mode
+  (`MEMORIES_DEFERRED_POISON=1`) fills held work with magenta until a
+  settle, so a reader that does not settle shows the poison in a frame dump
+  or, if what it read goes back into VRAM or the game, in a hash.
+
+What the change that keeps work back had to get right (see "The deferred
+raster" for how it does):
+
+- The game clock's tick (`MEMORIES_CLOCK=interrupt`, SIGALRM) can call a
+  LoadImage or StoreImage while a batch is being rastered (see
+  `vram_pixel` in `soft_gpu.c`): a real settle must not re-enter a raster
+  in progress, or must run with the tick held.
+- The widened targets follow VRAM (`wide_mirror`) and need nothing of their
+  own only if work is kept back while a recorder draws the picture at 2x and
+  above, where the software GPU does not raster them (`wide_rastered`).
+  Keeping work back without a recorder at 2x and above (at 1x, with or
+  without one) has
+  to hold the targets' second pass too; the first version keeps nothing back
+  in an area that has a target.
+
+What changes what a primitive draws without going through `load_words`,
+`move_words` or `fill_words` (which a kept-back raster sees), with the
+lines of the commit that added settling:
+
+| Writer | Where | What a kept-back raster must do |
+|---|---|---|
+| The raster itself, `plot` (and `name_over_panel` through it) | `soft_gpu.c:706` | it is the raster; `plot` also clears the pack's tags and shadow cells it draws over (`:720`), which must happen as the primitive comes |
+| A state load through `SoftGpu_StateData(0)`'s pointer | `state_subsystems.c:221`, then `SoftGpu_PictureFromVram` at `:227` | drop what is kept back (StateData settles first) |
+| Texture banks through `SoftGpu_Bank()`'s pointer (sampled, never drawn into) | `field_models.c:452`, `:2242`, `field_art.c:167`, `:349` (3D Monsters); `glyphs.c:996`, `:1020`, `:1077` (and `copy_palettes`, every call); `card_layout_art.c:185`, `:312`, `:487`, `:550`, `:696`; `battle_models.c:180` (copies VRAM in every call); `attribute_icons.c:123`; `duel_ui.c:322`; `type_icons.c:110`; `star_icons.c:165` (palettes copied every call) | a held primitive reads the bank's frozen copy, compared with the bank as each primitive that reads it is held (the writers rewrite the same bytes every frame, unseen: "Banks and the pack's shadow" below) |
+| The pack's shadow cells and tags | `texture_pack.c:1343` `paint` (every cell, the between-frames repaints at `:2821` and `:2828` included), `:1627` `tag_block`, `:2847` (unload); `texture_dump.c:356`, `:398`, `:450` (with each transfer), `:505` (a state load's tags) | the same, with the shadow's frozen copy (no hook in any writer) |
+| State taken when the list is flushed | `SoftGpu_PanelName`/`SoftGpu_PanelCut` (`libgpu.c` `flush_drawing`), `SoftGpu_PictureOnlyFrame` (`soft_gpu.c:1200`), `SoftGpu_PictureOnlyClut` (`:1176`), `SoftGpu_SetPrecise` (`:1444`) | keep the value each primitive came with |
+| Code mods | `SoftGpu_StateData` and `SoftGpu_Vram` are lent to mods, and a mod may keep VRAM's pointer and write through it whenever; `SoftGpu_Bank` is lent too (the bank row above covers it) | raster at once while a loaded mod imports `SoftGpu_StateData` or `SoftGpu_Vram` (mods must just work); a mod's bank writes are met by the bank's frozen copy |
+
+Measured with the target load (an HD pack, HD text, a translation and every
+code mod in `mods/`), headless at 1x on an instrumented build (not in the
+tree) that simulates the kept-back raster beside the real one: a raster
+that rasters bank and shadow primitives at once skips almost no duel field
+or menu frame (the pack's shadow is sampled in every duel frame, a texture
+bank in 78%), while one that also keeps them back skips 99.6-99.9% (an
+upper bound: banks were taken as changed only when their bytes changed,
+compared at the end of each frame). Copying the texels a move overwrites
+matters only in a 3D battle whose background animates its texture with a
+move every frame (`func_8004E9A0.c`, the background record's kinds 1 and
+4): 12% of its frames skipped without the copies, all with them; the 3D
+battle samples neither banks nor the shadow.
+
+### The deferred raster
+
+The deferred raster keeps back what is drawn into a full-screen drawing
+area until something reads it, and drops it when the game clears the area
+first. `MEMORIES_DEFERRED_RASTER` (read once, at the first `ResetGraph`):
+unset, it is on while the OpenGL picture draws at internal 2x and above
+(`SOFT_GPU_DEFERRED_AUTO`), where nothing shows VRAM's words and the CPU's
+raster at 1x is drawn only for what reads it back; `0` turns it off;
+any other value turns it on at every scale (1x included, where a window
+shows the words every frame: for tests and measurement). Android takes the
+same default: its OpenGL ES picture at 2x and 4x holds, and
+`MEMORIES_DEFERRED_RASTER=0` in `environment.txt` (the player's folder,
+read at start) turns it off. `SoftGpu_SetDeferred(mode, poison)` in
+`soft_gpu.h` is the switch, which settles everything when it changes.
+
+What is held, and how:
+
+- A polygon, sprite or line whose drawing area is at least 256x192 words
+  (the game's two 320x240 buffers) is copied, words and all, into that
+  area's queue, with the drawing state (`GpuState`, the save state's
+  struct) it is rastered with; equal states are stored once. Two areas can
+  hold at once; a third rasters the older one.
+- What the primitive does as it comes is still done then: the state it
+  leaves (its palette, page, blend, depth: later primitives and
+  `SoftGpu_StateData(1)` see it), `TextureDump_Prepare` and
+  `TextureDump_Primitive`, the recorder's copy of the batch and its PGXP
+  vertices, the picture-only checks. A queued primitive is rastered later
+  by the same `polygon`, `rectangle` or `lines` with `replaying` set, which
+  skips all of that, samples what it sampled as it came (VRAM, even if a
+  bank of its number has been made since, or its bank's frozen copy; the
+  shadow's frozen cells if it took from the shadow: "Banks and the pack's
+  shadow" below), and clears no provenance tags (it was held only if they
+  were clear, below).
+- It is rastered at the first settle that crosses its area (any
+  `SoftGpu_Settle`, and so every reader in "Settling VRAM before it is
+  read"), in the order it came, area by area; or dropped when a fill covers
+  the whole area, which overwrites every word whatever the mask (the game's
+  clear, two frames after it drew there).
+- A write rasters it first: a load, a move's destination (not the game's
+  2x1 move onto itself, which writes nothing), a fill that does not cover
+  the area, a primitive rastered at once, into its area or into the texels
+  or palette row it samples, unless every word the write would write is
+  already there (the game uploads the same texels and palettes frame after
+  frame; checked under the mask state, only for what is sampled, never for
+  a held area itself). A load, move or fill into the texels or palette row
+  it samples (not into its area) keeps the words it overwrites in the
+  area's undo log instead, while the log has room ("Writes into what held
+  work samples" below). Each area keeps 48 such rectangles; past that a new
+  one is merged into the one it grows least, as long as that does not
+  reach into an area held now or before (the buffers); failing that the
+  two that grow least are merged to make room (a menu's strips below the
+  buffers fill the 48, then a glyph from the right half comes); else any
+  write rasters the area.
+- What a primitive samples is the part of its page its texture
+  coordinates span, not the whole page (`texture_rects`): the game keeps
+  textures in pages that reach into the drawing areas' rows (a 256-row page
+  at y 0 covers both buffers), and whole pages made a duel field's
+  textured primitives look as if they read the buffers. A polygon samples
+  within its vertices' least and greatest u and v (`polygon_uv`: each
+  pixel's are a mix of them, and the raster's 2^-8 bias outweighs its
+  steps' rounding); a sprite from u, v to u + w - 1, v + h - 1; all of the
+  page's width or height if that runs past 255 (it wraps) or the texture
+  window folds it. No margin: a texel past them would reach row 239 from
+  the game's strips at 240 and tie the two buffers together. A sliver whose
+  texture spreads so fast across it that the raster's 32-bit steps could
+  overflow (range x 4 x width x height >= 768 x twice its area) takes the
+  whole page; the check found no sliver that reads outside its range, so
+  this is caution, not a case seen. An 8-bit palette from x 768 on runs
+  past VRAM's edge into the first buffer's columns (the game's at 896 hold
+  128 colours): it counts up to the greatest index the texels it reads
+  hold, found by reading them as the primitive comes (they are then not
+  held, or it would be rastered at once, which reads the whole palette).
+- So that areas can be rastered one by one, held areas never overlap and
+  none samples another: before an area starts a queue, the areas that meet
+  it or sample it are rastered.
+
+Rastered at once instead (after what it draws over and what it reads has
+been rastered), with the cause counted (`SoftGpuDeferredStats.now`):
+
+- it samples a texture bank (`SoftGpu_Bank`) or the texture pack's shadow
+  (`TextureDump_Prepare` said 1) and that source's frozen copy could not be
+  made: no memory for it, or the clock's tick is running ("Banks and the
+  pack's shadow" below: otherwise it is held);
+- the texels it samples or its palette lie in a held area or in its own;
+- its area's provenance tags or shadow cells are not all clear
+  (`TextureDump_Clean`, checked again whenever `TextureDump_TouchCount`
+  moves), so drawing would clear some;
+- it is the life-point panel's page while the opponent's name is drawn over
+  it at 1x (`SoftGpu_PanelName`, which the host answers as the panel comes);
+- a loaded code mod bound `SoftGpu_Vram` or `SoftGpu_StateData`
+  (`Mods_VramUsers` counts it in `Mods_Lookup`, which `resolve` and
+  `host->symbol` both use, and any object the system's loader loaded,
+  whose bindings are not seen; never down again, as code stays linked).
+  The software GPU is told as each binding is made (`Mods_VramUsersChanged`,
+  which the first `ResetGraph` points at `SoftGpu_SetModVramUsers`, telling
+  it of the bindings made before; `flush_drawing` tells it again), so what
+  is held is rastered before the mod can keep VRAM's pointer or call
+  `SoftGpu_Gp0` itself; told only at the next non-empty flush, it could see
+  held or poisoned words until then (`pc_mods` checks the call). The hook
+  is not lent to mods, but only at build time: `NOT_LENT_TO_MODS`
+  (`tools/pc/build_config.py`) keeps it out of the export table (the 32-bit
+  table has no `Mods_` names at all; the arm64 one would have lent this one),
+  and the official mod build (`build_mod_arm64.py`) rejects an import that
+  `exports.txt` lacks. Nothing checks at run time: a macOS dylib built by
+  hand could still bind it, as it could `SoftGpu_HoldClock` and
+  `SoftGpu_SetDeferred` already, and a mod that set it would keep the
+  software GPU from hearing of its VRAM binding;
+- a scaled picture is drawn here (the software picture at 2x and above),
+  or a recorder draws it at 2x and above that keeps no copy of VRAM the
+  patches can reach (`patch` NULL, or its copy not taken yet since it was
+  set: below), or the switch is AUTO below 2x;
+- (these two are not counted: while either holds, `holding()` is false and
+  a batch neither holds the clock nor calls `hold`, so then drawing costs
+  and times what it does with the switch off;)
+- the area has a widescreen target the software GPU rasters (its second
+  pass is not held; with a recorder at 2x and above the recorder draws the
+  targets, and the area holds as any other);
+- an area's queue passed 4M words, or memory ran out;
+- a primitive was rastered at once into its area, for one of the reasons
+  above but the last two, since the area's last whole clear: until the
+  next, the area holds nothing (`given_up`). When banks and the shadow went
+  at once, a duel frame with a texture pack or a mod's bank could not be
+  held whole, and holding the rest only to raster it at the next such
+  primitive cost 20% more raster time than not holding at all (the copies,
+  and the palette scan of `texture_rects`).
+- the area met the panel, or a bank or the shadow with no frozen copy made
+  for it, in its last cycle (clear to clear; the game's second clear
+  right after the first ends none): it is still given up after that clear
+  (`again`), until a cycle that meets none, after which it holds again.
+  When banks and the shadow went at once, a duel frame with the pack and
+  the mods met one nearly every time (about 14 primitives in), so with
+  `given_up` alone each held those 14 only to raster them at the first such
+  primitive: 4% more raster time on the duel field than not holding
+  (measured below). A cycle given up for the other reasons (a texture in
+  held work, tags) is not carried over.
+
+The rules that need no rectangles (the area's size, `holding()`, the
+panel, given up) come first; a polygon's span
+(`polygon_uv`), `texture_rects` and its palette scan are taken only for a
+primitive that passes them (or, rastered at once while work is held, for
+the texels it reads), so none of them costs anything with the switch off
+or in an area given up. That the switch off costs nothing is measured, not
+only read from the code (below). A bank's or the shadow's frozen copy is
+made last, for a primitive every other rule has let hold, so one rastered
+at once never allocates a copy it would not read.
+
+The game clock's tick (`MEMORIES_CLOCK=interrupt`) is held off, not let in:
+`SoftGpu_HoldClock`, which `platform_common.c` sets when it starts the
+interrupt clock (NULL with the cooperative clock, the default), blocks
+SIGALRM (on Windows, `Memories_SigProcMask`, which the clock thread obeys)
+through each `SoftGpu_Gp0` while work can be held (`holding()`: the switch
+on, no mod's VRAM, no software scaled picture, no recorder at 2x and above
+without its copy, not AUTO below 2x) or is
+held, through every load, store, move, fill and settle while anything is held, and through every
+change of `given_up` (a clear changes it with nothing held, and a fill from
+the tick in the middle of a removal would leave the count at -1 and the
+next addition writing outside it), and puts the mask back
+as it found it; `soft_gpu.c` counts the nesting, so only the outermost call
+blocks. A tick then never finds a queue half made or half rastered, or
+`gpu` swapped for a held primitive's state. Re-entering instead was turned
+down: a tick that settled in the middle of an append would leave the queue
+with entries of a frame already drawn. With deferral off nothing is held
+and the clock is never held; nor with it on while `holding()` is false
+(the cases above). At 2x and above the OpenGL picture also takes its copy
+with the tick held off (below).
+
+#### Banks and the pack's shadow (frozen copies)
+
+A primitive that samples a texture bank or the HD pack's shadow is held
+too. Their writers (the table above: the 3D Monsters mod and the port's own
+bank users through `SoftGpu_Bank`'s pointer, the pack's `paint`, transfers'
+`TextureDump_Loaded`/`Moved`/`Cleared`, the pack's unload) write unseen, at
+any time, and most write the same bytes again every frame, so neither a
+hook in each writer nor a write count can say when what a held primitive
+reads has changed. Instead each source (`frozen[0]` the shadow's cells,
+`frozen[b]` bank b) has a VRAM-shaped frozen copy, and held work reads
+only that:
+
+- a held entry records the bank it sampled as it came (0 for VRAM; a
+  sprite's comes from E1, which is not in `GpuState`) and whether it took
+  from the shadow; `settle_area` sets `texture_source` (and `set_page`
+  inside a replayed polygon) to the bank's copy, and the sampler's cells
+  (`Sampler.cells`) to the shadow's copy;
+- as a primitive that reads a source is held (`frozen_sync`, with the clock
+  held), the words it reads are compared with the copy: its texel
+  rectangle (`texel_rect`, wrapping past x 1023, the whole page on an axis
+  the window folds or that wraps), for a bank below 16 bits also its
+  palette row in the bank (16 or 256 words, wrapping), for the shadow the
+  four cells of each of those words. If no held area reads that source
+  they are just copied; if they are the same, nothing happens (a rewrite
+  of the same bytes is no change); if they changed, every held area that
+  reads the source (`HeldArea.sources`) is rastered first, from the copy
+  as it still is, counted as `why[WRITE]`, and then the copy takes them;
+- so the copy changes only while no held work reads it, and whatever
+  settles a held area, whenever (a reader, the tick, a state, a scale, the
+  OpenGL replay's lookups), it reads what its primitives read as they
+  came. Nothing in the writers changes, and nothing a mod does through its
+  bank pointer can break it;
+- a bank's rectangles found or made the same are remembered for the rest
+  of the `SoftGpu_Gp0` batch (`verified`, 16 of them), and one within them
+  is not compared again. A duel frame is one batch, and the 3D Monsters
+  model reads the same 8-bit page (128x256 words) and palette rows from its
+  bank in hundreds of polygons: compared each time, that was 3.5 MB a frame
+  and made the duel field with every mod 28% slower than not holding. It is
+  exact because nothing writes a bank inside a batch: the writers are the
+  game's and mods' code, which runs between batches; the clock's tick is
+  held off through any batch that can hold; and what a batch calls back
+  (the recorder, the pack's and the dump's hooks) writes no bank. The
+  panel's name (at 1x) forgets what was remembered, as the host may answer
+  it through code that writes a bank (a fixed case: its callback changes
+  the texels a held sprite read, and a second sprite in the same batch
+  must draw the new ones). It is forgotten too whenever a copy is made,
+  freed or poisoned. The shadow is not remembered: the pack's prepare
+  paints it inside the batch;
+- a bank's primitive reads no VRAM word (its palette is the bank's), so
+  VRAM's rules (`texture_rects`, the held-area meet, `add_sampled`, the
+  immediate path's `before_read`) are not applied to it: a bank's texture
+  coordinates often lie inside a drawing area. A shadow primitive keeps
+  all of them (it reads the word's semi-transparency bit, and the word
+  itself where no cell replaces it) besides its cells;
+- the copies (a bank 1 MB, the shadow 4 MB) are made in `hold` the first
+  time a primitive that reads the source is held, never in the clock's
+  tick: with `MEMORIES_CLOCK=interrupt` a `LoadImage` from the game's
+  interrupt code flushes the pending batch there (`flush_drawing`), inside
+  the SIGALRM handler (on Windows, the redirected main thread), where
+  nothing may be allocated. `platform_common.c` counts `on_tick`'s run of
+  the interrupt code and lends it as `SoftGpu_InTick`, set with
+  `SoftGpu_HoldClock` and, like it, not lent to mods. In the tick, or with
+  no memory, the primitive goes at once (`NOW_BANK`, `NOW_SHADOW`) and
+  `again` applies; a primitive whose copy exists holds from the tick too.
+  A settle, the tick's too, only reads the copies. They are freed when the
+  switch goes off. What `hold` still allocates in such a tick is the
+  queues' own growth, as before banks were held: `grow`'s reallocs of an
+  area's words, entries and states when they need more room, and with
+  poison the area's `before` copy in `held_area`. Where the tick is a
+  signal handler (Linux, macOS) that is a realloc inside it, which
+  deadlocks if the tick came while the main thread was inside malloc; on
+  Windows the tick never interrupts the C runtime, so it cannot come there. Only the interrupt clock (not
+  the default, and not in the 64-bit Windows build) and a tick-level
+  `LoadImage` flushing a batch that holds reach it. With poison, a copy is magenta when
+  it is made (or the poison switched on) wherever it has not taken words
+  yet, so a replay that read what was never frozen would show. Once only:
+  refilled each time no held work read it, every rectangle not compared
+  since would differ at the next hold and settle the readers, and a poison
+  run held far less long than AUTO (the first duel at 2x with the pack:
+  183688 rastered against 27160);
+- nothing new is lent to mods and no shared struct grows
+  (`SoftGpuDeferredStats` counts a change as `why[WRITE]`).
+
+Measured (Windows, headless, internal 2x with the OpenGL picture, the HD
+pack, HD text, a translation and every code mod in `mods/`; CPU raster
+time a frame = draws plus settles outside them, each frame's best of 3
+interleaved runs; a scratch build, not in the tree; the PC was in use, the
+off runs' A/A spread is given):
+
+| Scenario | Off | AUTO | A/A |
+|---|---|---|---|
+| Duel field | 1.68 ms | 0.40 ms (-76%) | -11% |
+| 3D battle | 2.81 ms | 0.86 ms (-69%) | +1% |
+| Menus | 1.42 ms | 0.12 ms (-91%) | +9% |
+| All | 2.05 ms | 0.52 ms (-75%) | -5% |
+
+Measured again after the copies were made only for what holds and never
+in the tick (the same load and method), at 2x and at internal 4x:
+
+| Scenario | 2x off | 2x AUTO | 2x A/A | 4x off | 4x AUTO | 4x A/A |
+|---|---|---|---|---|---|---|
+| Duel field | 1.35 ms | 0.32 ms (-77%) | -15% | 1.27 ms | 0.31 ms (-76%) | -5% |
+| 3D battle | 2.28 ms | 0.67 ms (-70%) | -21% | 2.09 ms | 0.67 ms (-68%) | +1% |
+| Menus | 0.87 ms | 0.09 ms (-90%) | +31% | 0.83 ms | 0.10 ms (-88%) | -22% |
+| All | 1.62 ms | 0.40 ms (-75%) | -14% | 1.50 ms | 0.40 ms (-74%) | -3% |
+
+The software GPU rasters VRAM at the console's size whatever the internal
+scale (the OpenGL picture draws the scaled one), so 4x saves what 2x does.
+
+Before this, AUTO held nothing on the duel field with that load (0 held
+a frame, the same raster time as off); now 423 primitives a frame are held
+and 98% of field frames hold all their full-screen work. Without the
+batch's remembered bank rectangles the field was 28% slower than off. The
+copies cost about 15-30 MB (the game's private memory in a full duel,
+AUTO against off).
+
+#### Writes into what held work samples (undo logs)
+
+Some 3D battles animate their background with a `MoveImage` outside any
+draw batch every frame (`func_8004E9A0`, switching on byte 0xA0 of the
+battle record `D_80091008[D_800F5678[0] * 0xB2]`): kind 1, the Normal
+terrain's (where a duel starts: all 39 opponents of Debug > Jump to's
+duels do; a field card changes it), moves one
+of three 16x64 strips to 704,448; kind 4, the Sea's (the Umi card), 32x24
+words to 544,360. Three frames in four the words are the same (the
+`write_same` check above); every fourth they change, and the texels belong
+to what both held buffers sample, so that one move rastered both: whole
+frames of primitives that their clears would have dropped two frames
+later, about 80% of the CPU raster left in those battles.
+
+Such a write now keeps the old words instead (`undo_save`): a load, a move
+or a fill that would change texels a held area samples saves the words it
+overwrites there, cut to the area's sampled rectangles (pieces that do not
+wrap), at the end of that area's log, oldest first, and the area stays
+held. Both areas sample the strip, so each saves its own copy.
+
+- At the area's settle (`settle_area`) each entry's words are swapped
+  with VRAM's, last entry first, so every texel holds the words it had
+  before the first saved write to it; the queue is rastered; then every
+  entry is swapped back, first entry first. A swap is its own inverse, so
+  VRAM and the saved words come back exactly, however the entries overlap
+  (a texel written twice, three loads of the same words). The entries are
+  sampled texels, which lie outside every held area, so the swaps touch
+  neither the area being rastered nor the other one, and nothing else
+  reads VRAM in between: the clock is held, a replay calls nobody back,
+  and a patch for the OpenGL copy is made from the area's own words, which
+  the replay drew from the words swapped in.
+- What makes that the words the held work sampled as it came: every
+  other writer of those texels still rasters the area first (a primitive
+  rastered at once, a write with no room in the log, a write while the
+  area keeps no rectangles, `sampled_all`), and a primitive held into the
+  area after a write that samples any texel the log saved
+  (`undo_meets`) rasters the area first too (counted as `why[WRITE]`): it
+  needs the new words, the held work the old. A primitive held after the
+  write that reads only other texels needs nothing: whatever is written
+  there after it is saved in turn.
+- Outside a settle VRAM holds the new words, as it would rastered at once:
+  readers of all of it (a state, `SoftGpu_Vram`, the frame hash, a dump)
+  settle first, which swaps and swaps back, and `SoftGpu_VramRaw`'s readers
+  see the words as written. A settle, a drop by a clear (the common path:
+  the log goes with the area), a reset and the switch forget the log.
+- Bounded: 32 entries and 64K words (128 KB) an area. Past either the
+  write rasters the area, as before. The buffers are made as the switch
+  goes on (`SoftGpu_SetDeferred`, the main thread) and freed when it goes
+  off with the clock held from the settle to the last free (a tick landing
+  between them could hold a primitive or save a write into a buffer about
+  to be freed), never where a write is saved: a `LoadImage` from the clock's tick
+  saves into the buffer already there, and without one (no memory) the
+  write rasters as before. Banks and the shadow's cells are not VRAM and
+  keep their frozen copies; a shadow primitive's words are saved like any
+  other, its cells come from the frozen copy at the settle.
+- `SoftGpu_UndoSaves` counts the writes saved (one an area a write),
+  apart from `SoftGpuDeferredStats`, which does not grow; it is not lent to
+  mods (`NOT_LENT_TO_MODS`). The frame trace's deferred line prints it.
+  With `MEMORIES_DEFERRED_RASTER=0` nothing is held, nothing saved and no
+  buffer made.
+
+Measured (Windows, headless, the OpenGL picture, the HD pack, HD text, a
+translation and every code mod in `mods/`; CPU raster time a 3D battle
+frame, the game's mode 1 = draws plus settles outside them, each frame's
+best of 3 interleaved runs; four Square battles against Simon Muran, on
+the Normal terrain and with Umi played first; a scratch build, not in the
+tree; the PC was in use):
+
+| Battles | Scale | Off | Before (the frozen copies) | Undo logs |
+|---|---|---|---|---|
+| Normal (kind 1) | 2x | 1.94 ms | 1.08 ms | 0.16 ms (-86%) |
+| Sea (kind 4) | 2x | 2.00 ms | 0.94 ms | 0.17 ms (-82%) |
+| Normal (kind 1) | 4x | 1.91 ms | 1.05 ms | 0.15 ms (-85%) |
+| Sea (kind 4) | 4x | 1.98 ms | 0.92 ms | 0.17 ms (-82%) |
+
+Per battle frame, before and after: settles by a write 0.49 and 0.40 ->
+0, patches to the OpenGL copy 0.24 and 0.20 -> 0, and held work dropped
+by its clear half of it (325 of 650 primitives, 372 of 626) -> all of it;
+0.49 and 0.39 undo saves. What is left is the primitives' front end and
+`hold`'s bookkeeping, at or below the 0.26 ms the investigation measured
+by skipping the settle outright. The other terrains' records (Forest,
+which the full duel plays, kind 6; Wasteland 3; Mountain 5; Sogen 0;
+Yami 2) move nothing, and their battles gain nothing.
+
+Checks and tools:
+
+- `pc_soft_gpu_deferred` (`tests/pc/soft_gpu_deferred_test.c`): 600
+  random frames (one in five busy, a few hundred primitives; three in four
+  calm, sampling and writing only right of the buffers, a page or 8-bit
+  palette that would wrap past x 1023 into the first buffer's columns
+  taken from rows below them), three seeds, played immediate, deferred and deferred with
+  poison; two 320x240 areas cleared in turn (now and then one at 0,256),
+  polygons, sprites and lines sampling VRAM pages, the other area, a bank
+  and the "pack's" pages, between loads, moves (the 2x1 self-move too),
+  fills, stores, the same texels uploaded again (one word changed now and
+  then, under any mask state), settles, tags and shadow cells painted,
+  save states, a mod
+  binding VRAM and a scale change; a `TextureDump_Prepare` that loads and
+  stores in the middle of a batch, as the tick can. Every store, settled
+  rectangle, state, a present of the area just drawn (one frame in four)
+  and the final VRAM, tags, shadow and drawing state must match, the clock
+  hook must be called balanced and never nested, nothing may be held while
+  the mod binds VRAM, and each immediate cause but the panel's,
+  `OTHER`'s, `BANK`'s and `SHADOW`'s must have occurred (the last two must
+  not: their copies are always made here; a fixed case where the
+  allocator is wrapped makes them fail). Calm frames sample bank 3 and the
+  shadow's page too, polygons fade, E1 words name bank 3, and bank 3's
+  texels and palette rows and the shadow's cells are written between
+  batches, and the shadow's also by the prepare stand-in inside a batch (as
+  the pack paints), the same words mostly and changed now and then; bank
+  primitives' pages (calm frames' too) and the bank's writes lie anywhere
+  in it, as they read no VRAM word. Fixed cases for the frozen copies: a sprite from
+  bank 3 (named by E1) and one from the shadow, held, then the same words
+  written again (nothing rastered, by the counters), changed (the held
+  ones rastered first), changed again; a polygon naming bank 17 with a
+  fade whose palette entry changes after it is held; 8-bit sprites whose
+  bank palette at x 960 wraps to x 36, changed between two; a bank's
+  texels at coordinates inside the drawing area (held, its pixels the
+  bank's, changed between two sprites, as rastered at once); the panel's
+  name rewriting a bank's texels inside a batch between two held sprites
+  of another area (pixels as rastered at once); a bank's change read by
+  held work in both areas, both rastered first (the second area's pixels
+  the old words); at 2x, a bank
+  sprite held across a take, the bank changed, the patch made from the
+  copy and the other area reading it; the tick stand-in (`SoftGpu_InTick`)
+  flushing a bank and a shadow sprite, held from it while the copy exists
+  and rastered at once with nothing allocated when it would be made there;
+  and, with the allocator wrapped, no memory for a copy: rastered at once,
+  the area given up past the game's two clears, still with no copy made
+  for what goes at once, and held again after the next. `OTHER` has two fixed cases of its own:
+  widescreen on at 1x (a sprite and a quad into a full-screen area are
+  rastered at once, VRAM and the widened picture equal the immediate run's,
+  and with widescreen off the same two are held) and 2.2 million two-word
+  dots, which pass the 4M-word queue limit once (the first dot is in VRAM
+  before any settle, the end equals the immediate run's); they fail with
+  the `SoftGpu_WideMargin` arm of `hold` or the re-settle at the limit
+  taken out. A fixed case checks that with a mod's VRAM
+  or at 2x a batch holds nothing, counts nothing and never holds the clock,
+  and the `again` case that a clear of an area given up, with nothing held,
+  holds the clock. Each of these taken out alone fails it:
+  the load's, the move destination's and the immediate primitive's settles,
+  the sampled-rectangle check, the snapshot of the state, the settle before
+  a new area, the drop only on a whole cover, the poison's restore, holding
+  bank primitives, clearing tags in a replay and the clean check (a fixed
+  case each: tags painted over held work, and tags painted in the area
+  before a primitive; the random frames alone catch neither), and a
+  sampled rectangle one word wide, without its palette or without a
+  sprite's wrap (a fixed case: a sprite past u 255 reading the other,
+  held, area), an upload taken as unchanged when it is not, or when it
+  sets the mask bit (a fixed case: zeros uploaded again under E6's mask
+  bit while a held sprite reads them; the random frames as they are now
+  do not meet it), a merged rectangle not grown (a fixed case: 60 sprites
+  reading 60 texels, the last one uploaded anew), two merged to make room
+  and not grown (a fixed case: 48 strip texels and one from the right half,
+  each strip texel uploaded anew in a run of its own), a rectangle taken as
+  within another when it is not, an 8-bit palette counted short or not
+  past VRAM's edge (a fixed case: index 140 of a palette at 896, read at
+  12,100 and uploaded anew), or a polygon's range short by a texel (a
+  fixed case: 900 mirrored quads, turned ones and slivers, every texel of their page
+  outside their range, and their greatest u's column and v's row, uploaded
+  anew while they are held), or the settle before a new area (a fixed
+  case: an area holds a sprite reading words of the other area, which then
+  starts holding over them with no clear first and is settled first; the
+  random frames clear first, which settles the reader, so only this case
+  catches it). A fixed case checks `again`: an area that met the panel
+  holds nothing after its next clear (made twice), nor after the one after
+  a cycle with the panel, and holds again after a cycle without, or after
+  one given up for its own texture (a bank before banks were held). Calm frames come four or five at a time
+  (two cycles of each area or so), or with `again` too few held areas
+  would be dropped for the test's own check; four or five so that a busy
+  stretch starts on either area, and the test requires that each area's
+  held work was still held when a busy frame's load, move, fill, store,
+  settle, tags or state came (`SoftGpuDeferredStats.queued` says what each
+  queue holds). Before, the stretches came four at a time and so always
+  began on the first area, and calm frames' textures past x 1023 and 8-bit
+  palettes wrapped into it and gave it up every cycle: the first area held
+  no calm queue while a busy frame ran, which is where the x wrap, the
+  8-bit palettes at x 768 on and the 2x1 self-move land; held primitives
+  rose from 15-18 thousand a seed to 24-29 thousand. (Not
+  checking a primitive's texture against its own area is not caught, and
+  needs not be: the queue rasters in order, so a held primitive that reads
+  its own area reads what the ones before it drew.) Of the 27 removals a
+  scratch mutation script (not in the repo) makes, on this test: 15 fail
+  the random frames' equality (two of them, holding bank primitives and
+  the clean check, fail their cause counts first, and the equality
+  without those); 10 only a fixed case (the settle before a new area,
+  `again` three ways, the batch's clock gate, the clock around a clear of
+  `given_up`, forgetting `given_up` at a state load, clearing tags in a
+  replay, the mask bit's upload, an 8-bit palette counted only to VRAM's
+  edge); one, `queued` left empty, only the count of held work busy frames
+  met; and one, the own-area check above, nothing.
+- The undo logs (same test): the random frames move a battle background's
+  strip over the same 16x64 texels after each frame (now and then twice,
+  at another place), and must have saved more writes than frames and still
+  settled some by a write. Thirty-seven fixed cases (`soft_gpu_deferred_test
+  fixed` runs only them), each played at once, kept back and with poison,
+  all of VRAM and every store compared, and each checking its undo saves and
+  settles by a write (the later ones also the settles by a slot given up, a
+  primitive at once and all of VRAM): one load; three loads of
+  the same texels with three different words; a load, a move and a fill
+  over parts of each other, then loads under the mask; a load then the
+  clear (a sprite after the clear reads the new words); sprites held after
+  a load, one reading other texels (held with the log) and one reading
+  saved ones (the area rastered first); a load and a move from the tick
+  stand-in, nothing allocated; a full log by entries (the 33rd write) and by
+  words; `SoftGpu_VramRaw` (the new words), a state and `SoftGpu_Vram` with
+  a log outstanding; the shadow's sprite with its cells repainted and with
+  them the same; both areas saving the same write; a bank's sprite (nothing
+  saved); a 4-bit palette entry; 49 wrapping texel rectangles
+  (`sampled_all`: the write rasters); a write wider than what is sampled
+  (only that saved); writes wrapping past x 1023 and y 511 (a load, a fill
+  and a move, each in two pieces); a textured polygon reading saved texels;
+  partly overlapping sampled rectangles and writes whose pieces overlap; a
+  write in two pieces whose second does not fit; an 8-bit palette reaching
+  past x 1023; a texture window; one write that settles the other area while
+  this one saves, and one with the other's log full; a primitive rastered
+  at once over saved texels; a slot given up with a log; moves whose source
+  and destination overlap, and one from saved texels; each switch with a log
+  outstanding (copy reach, a mod's VRAM, `SetDeferred` on to on and on to off,
+  the scale, a reset); the queue at `HELD_WORDS_MAX` with a log outstanding
+  (two poly-lines of 3.5M and 0.7M words); and a tick landing as
+  `SetDeferred` settles. Two copy cases at 2x make the patch after a held
+  sprite's replay with the words swapped in, read back through the model
+  copy, at copy reach 0 and 1. A scratch script (not in the repo) makes 25
+  mutations: 20 of the undo code (the swap orders, no swap in or back, the
+  oldest entry skipped, no settle first, the settle first on one entry,
+  without the palette or on the other area, the log kept across a clear or
+  reset for both areas, one sampled rectangle, `sampled_all` unchecked, the
+  duplicate check taken as meeting, a full log taking the write, the caps
+  off by one or ignored, the buffer made in the tick, a wrapped piece one
+  word short, the rows not cut), the review's three (a wrapped piece
+  unsaved, the settle-first check skipped for polygons, the duplicate check
+  dropping any piece that meets one, which is the partial-meeting mutation
+  again) and the two clock holds (`SetDeferred`, the counter's read): all 25
+  fail the fixed cases alone, none needs the random frames.
+- The same test's copy runs (2x): two seeds of the random frames at 2x
+  with a model of the OpenGL picture's recorder and copy of VRAM (loads,
+  moves and fills cut at VRAM's edges as `gl_picture.c` cuts them,
+  primitives that only sample), replayed at the end of three frames in
+  four, with settles of its own in the middle of a replay (the host
+  lookups), widescreen on two frames in three, picture-only frames and
+  palettes, the scale to 4x and back; played off, AUTO and AUTO with
+  poison. Every word of the copy a textured primitive or a move reads in
+  the drawing areas, and everything the 1x runs compare, must match, and
+  held work must have outlived takes of the copy and made patches (about
+  150 areas and 100 patches a seed). Fixed cases: a take between two
+  sprites at one place (the patch is the first: rastered only up to the
+  take), a fill that covers an area only by wrapping past x 1023, a
+  replay's own settle after its last draw (its patch must not come back),
+  a picture-only sprite reading held work the copy missed, a frame and a
+  palette made picture-only while work is held, and what lets work be held
+  (AUTO at 1x, a recorder without `patch`, one before its first take,
+  widescreen). Each of these taken out alone fails it (a scratch mutation
+  script, not in the repo, PR 3's list): the patch, rastering only up to
+  the take, the take's marks, forgetting the patches at a take, the
+  wrapped fill, `picture_only_reads` (both callers, and each), the
+  picture-only checks while replaying (both, and each), `copy_on()` in
+  `holding()` (refused, or unconditional), AUTO at 1x, the widescreen
+  refusal, forgetting the copy at a new recorder, and `patch` in
+  `copy_on()`.
+- `MEMORIES_DEFERRED_POISON=1`: an area's words become magenta (0x7c1f) as
+  its queue begins, and come back (then the queue is rastered) at the
+  settle. A reader that does not settle sees magenta; frame hashes and
+  dumps settle all of VRAM and cannot catch one. Debug only.
+- `MEMORIES_TRACE=frames` logs, beside `draws:`, a `deferred:` line per 120
+  DrawOTags: primitives held, dropped, rastered and rastered at once, areas
+  cleared and settled, and the settles' time, in the draws (a batch's) and
+  outside them (a reader's).
+
+- `MEMORIES_FRAME_HASHES_EVERY=<n>` hashes every n-th frame only. Every
+  hash (and every checkpoint a recording writes, one a frame) settles all
+  of VRAM, so a run hashed every frame never drops anything; a sparse one
+  does, and still sees in its hashes what a wrong drop or a late raster
+  left.
+
+The gate (a scratch script, not in the repo): every replay, headless at
+1x on this Windows PC, played by one build five ways: with the switch off
+and on while recording (a checkpoint a frame) with per-frame hashes, and
+off, on and on with poison without recording, hashed every 7th frame. Each
+run's checkpoints and hashes against those of the run with it off, never
+against the stored ones. On the Windows build of this change, all 16 replays
+(the three scripted state loads included) matched in all four comparisons;
+hashed every 7th frame, the 13 recorded ones kept back 0.06-5.6 million
+primitives each and dropped 68-71% of them (full duel: 3.4 of 4.8
+million; at most 6 frames in 7 can drop), so the drops and the late
+rasters were in what was hashed. (The scripted ones' logs are not
+collected; their hashes matched.) Without `again` the replays with a
+mod's bank held more only to raster it (3D Monsters 0.83 million instead
+of 0.57, the x64 data mods 0.12 instead of 0.06, dropping as many).
+
+The same with the target load (the HD pack, HD text and a scratch folder of
+mods, a translation and every code mod among them), on a full duel's
+session hashed every 7th frame: with it off twice, on, and on with poison,
+the 2114 hashes were the same in all four (held 3.4 million primitives,
+dropped 2.4 million; with `again`). A run on the interrupt clock
+(`MEMORIES_CLOCK=interrupt`, with poison) finished the menus session with
+work held and dropped (0.86 million held); its hashes cannot be compared.
+
+Measured headless at 1x, on this Windows PC only (scratch scripts, not in
+the repo, and a scratch build with a per-frame log keyed by the game's
+main mode, as step A's;
+sessions: Blue-Eyes 3D battles, full duel, menus, first duel; no
+recording, hashes or shots, which would settle), the same frames with the
+switch off and on, each session three times off and three times on,
+interleaved, on this Windows PC while it was in use. "Dropped" is the
+share of areas whose held work ended dropped, never rastered, out of all
+that held any (one run); raster time is the draws (SoftGpu_Gp0) with it
+off against the draws plus settles outside them with it on, per frame,
+each frame's least of its three runs (the PC's own spikes, up to 80 ms a
+frame, otherwise decide a few per cent either way: by their means two
+runs with the switch off differed by up to 10% on the duel field, and by
+far more on the campaign's few frames):
+
+| Scenario | Bare: dropped | Bare: raster off -> on | With pack and mods: dropped | Pack and mods: raster off -> on |
+|---|---|---|---|---|
+| Duel field | 99.5% | 0.89 -> 0.05 ms (-95%) | 53 of 73 areas | 1.10 -> 1.10 ms (-0.5%) |
+| 3D battle | 73.8% | 1.75 -> 0.59 ms (-66%) | 73.7% | 1.83 -> 0.60 ms (-67%) |
+| Menus | 99.1% | 0.71 -> 0.05 ms (-94%) | 99.5% | 0.77 -> 0.58 ms (-25%) |
+| Campaign | 99.8% | 1.17 -> 0.03 ms (-97%) | 98.3% | 1.25 -> 0.27 ms (-78%) |
+| All | 91.4% | 1.16 -> 0.21 ms (-82%) | 80.4% | 1.29 -> 0.77 ms (-41%) |
+
+The build before (no `again`, every primitive's rectangles taken first),
+measured the same way: pack and mods, duel field 1.14 -> 1.18 ms (+4.2%), 3D battle -67%,
+menus -27%, campaign -80%, all -39%; bare as above. The duel field then
+held about 14 primitives a frame and rastered them at its first bank or
+shadow primitive, nearly every frame (0.3% of its areas dropped); now it
+holds in 73 cycles of 17463 frames, and its time with the switch on is
+its time with it off. Menus and the campaign drop as much work as before
+(18.3 thousand and 432 thousand primitives) and hold far less in vain.
+
+With the switch off (`MEMORIES_DEFERRED_RASTER` unset), measured on
+`59ad1683e1` against the change it builds on (`07623c60e4`, settling), headless at 1x on this
+Windows PC only: three interleaved runs of each build, the duel field and
+the 3D battle, bare and with the pack and the mods. The draws'
+(`SoftGpu_Gp0`) time per frame differs by -4.2% to +1.5% between the two
+builds, within the noise (two runs of the same build differ by up to
+5% either way), and the frame hashes of five runs (about 40 thousand
+frames) are identical between them. The off path has changed since only
+where it tests `holding()` instead of the switch, in a clear that
+looks at `given_up` only when something is in it (never, off), in the
+`forget_given_up()` calls (a reset, a state load, a new scale, a new
+recorder, the switch, a mod's first VRAM binding), and in the per-binding
+hook call (`Mods_VramUsersChanged`): the last two return at once with the
+switch off, and none of the changes was measured on its own.
+
+- Bare, what still rasters is the 3D battle's palette move
+  (`func_8004E9A0.c`), which writes texels its held model samples every
+  frame (26% of its areas; step A's "+4", copying the old texels, would
+  keep them), and a few reads.
+- With the pack and the mods a duel frame always has primitives that
+  sample the pack's shadow or a mod's bank (4.3 million bank and 0.8
+  million shadow primitives over 17463 frames), so nearly nothing can be
+  dropped; `given_up` and `again` make it cost what not holding costs
+  (without `given_up` it cost 20% more, with it alone 4%). No loaded mod
+  bound `SoftGpu_Vram` or `SoftGpu_StateData` (the build measured counted
+  such primitives as `OTHER`: there were none). Menus
+  sample the shadow too; the 3D battle samples neither, and saves as much
+  as bare.
+- This is the headless share, which stands in for the OpenGL picture at 2x
+  and above, where nothing shows VRAM. A window at 1x presents (and so
+  settles) the buffer just drawn every frame and saves nothing.
+
+#### At 2x and above with the OpenGL picture
+
+There the CPU's raster at 1x is drawn only for what reads VRAM back (the
+picture is the GPU's), which is why AUTO holds there and only there. What
+it takes:
+
+- The OpenGL copy of VRAM. `gl_picture.c` draws its primitives into the
+  scaled picture only; its copy of VRAM (`vram_texture`, which they sample
+  and `apply_move` copies inside) is VRAM taken whole and raw after each
+  replay (`upload_vram`), then changed by the record's loads, moves and
+  fills. So it misses what is held when it is taken. `upload_vram` calls
+  `SoftGpu_CopyTaken` right after it reads VRAM, which notes for each held
+  area how many primitives it held then (`HeldArea.copied`). When such an
+  area is settled, those are rastered first and the area's words kept as a
+  patch (the area as the copy should have had it), then the rest. The
+  recorder takes the patches (`SoftGpu_CopyPatches`, its `patch` callback,
+  which writes the copy only, never the picture) at the start of its next
+  replay, before anything in the record, and at every `flush_runs`, before
+  it draws and before the transfer that flushes it, whether it drew
+  anything or not (the replay's own host lookups, `HdText_Hud` and the
+  others, settle too, also for a primitive that then draws nothing). Why
+  this is exact, and why not an `OP_LOAD` in the record: a
+  patch is the area as it was at the last take, which is what the copy
+  holds with the switch off from the replay's start until the first write
+  into the area in the record; and every write or read of the area in the
+  record has a CPU counterpart (a load, move, fill or primitive) that
+  settles it first (or drops it, for a whole clear), so the patch exists
+  before the replay reaches it, and an area is patched at most once a take
+  (its next queue starts after it). In the record, a patch would land
+  after its reader: `SoftGpu_Gp0` records a batch whole before rastering
+  it, and loads, moves and fills are recorded before they settle. A
+  patch the recorder has not taken when it takes the copy again is
+  forgotten (the copy then has those words, rastered further). The tick is
+  held off from the copy's read to `SoftGpu_CopyTaken`. A settle can come
+  from the tick (its LoadImage, StoreImage, MoveImage or ClearImage), so a
+  patch is made without allocating: the patches share one buffer of VRAM's
+  size, made on the main thread at the recorder's first take, when nothing
+  can be held yet; it is always enough (the areas held at a take never
+  overlap and lie in VRAM, one patch an area), and without it no copy is
+  kept, so nothing is held. `tools/pc/check_vram_readers.py` checks the
+  calls' places in `upload_vram`, `GlPicture_Replay` and `flush_runs`
+  (`COPY_KEEPING`).
+- The clock and the record: while work can be held or is, a transfer from
+  outside a batch (`SoftGpu_Load`, `Move`, `Fill`) and a batch
+  (`SoftGpu_Gp0`) hold the tick off from their record to the end of the
+  transfer, so record and transfer are one. Otherwise a tick in between
+  records its own transfer after this one but makes it first; with held
+  work that could drop an area the copy missed (a tick's clear) before a
+  move out of it that the record still replays first, from the copy's
+  stale words. With nothing held and nothing holdable the path is as
+  before (a tick there reorders both alike).
+- Only a recorder with `patch` that has taken its copy since it was set,
+  naming itself (`SoftGpu_CopyTaken(&recorder)`), lets work be held
+  (`copy_on()`); so a test's recorder, a mod's or the OpenGL picture
+  before its first replay hold nothing. `SoftGpu_SetRecorder` is lent to
+  mods, and a mod's recorder, made with an older header, ends before
+  `patch`: it is never read that far (`copy_on()` checks `copy_kept`
+  first, and only the recorder that names itself is marked;
+  `SoftGpu_CopyTaken`, `SoftGpu_CopyPatches` and `SoftGpu_SetCopyReach`
+  are not lent), and a translated build resolves a recorder only as far
+  as `capture`. A new recorder or a new scale forgets the copy and its
+  patches (`forget_copy`): nothing is held until the copy is taken again.
+- A fill that covers a held area only by wrapping past VRAM's edge settles
+  it instead of dropping it while the copy misses it (`fill_reaches`):
+  `apply_fill` cuts a fill at the edge, so the copy keeps the old words
+  there.
+- Picture-only primitives (`SoftGpu_PictureOnlyClut`,
+  `SoftGpu_PictureOnlyFrame`) are drawn by the recorder alone and never
+  held; what they sample is settled as they come (`picture_only_reads`),
+  so the copy gets it. A held primitive was not picture-only as it came,
+  so it is rastered whatever the two say when it is settled (the checks
+  are false while replaying).
+- Widescreen: with a recorder at 2x and above the recorder draws the
+  targets and the software GPU's are neither rastered nor shown
+  (`SoftGpu_WideFrame` settles nothing then), so an area with a target
+  holds as any other; `wt->drawn` is counted as a primitive comes.
+- PGXP is the recorder's alone (the raster never reads `precise`); a
+  capture settles its source as it comes; the life-point panel's name is a
+  1x matter (`panel_page`); a new scale or recorder, a state load and a
+  resync settle everything first. A lost OpenGL ES context
+  (`GlPicture_Lost`) keeps the recorder and asks for a resync, which
+  settles everything and takes the copy whole again.
+- The replay's host lookups (`HdText_*` in `gl_picture.c`) read VRAM at
+  replay time and settle what they read, which rasters a held area they
+  cross for nothing but correctness.
+- Reads the OpenGL pass makes beyond the texels the coordinates span, so
+  beyond what the raster settles of a primitive (`texture_rects`):
+  - Texture xBR (`texture_xbr`) does not clamp its centre texel `e` to the
+    primitive's `bounds` (clamping it changed xBR pictures), and clamps the
+    neighbours only to the span of `bounds` and `e`, so it reads as far as
+    `e` leaves `bounds`. Without anti-aliasing a fragment's centre lies in
+    the primitive, so its coordinates lie within the vertices'; `back`
+    moves them on by less than 2 texels and the 1/256 does not carry
+    `floor()` further: `e` is at most one texel past the last u and v,
+    never before the first. With anti-aliasing a pixel's centre can lie
+    outside the primitive and the corner step adds half a pixel, both as
+    many texels as a pixel spans: no bound short of the page, which
+    `texel_word` wraps. `gl_picture.c` tells the software GPU that reach at
+    each replay, before the patches (`SoftGpu_SetCopyReach`: 0 with xBR
+    off, 1 with it, `SOFT_GPU_REACH_PAGE` with xBR and anti-aliasing), and
+    `texel_rect` takes it in while the copy is kept: one more u and v, or
+    all of the page on an axis that would wrap. A change settles
+    everything (what is held was let hold under the old reach). With xBR
+    off (the default) nothing changes.
+  - HD text (flag 16) reads its palette at whatever index its atlas holds
+    under the pixel, 0 to 255, a neighbouring glyph's or label's too where
+    the pixel's centre lies past its own; the raster settled only the
+    entries the console's texels index (16 for a 4-bit glyph). Each HD
+    text primitive settles its palette row whole (`ink_palette`, 256
+    entries, wrapping as `word_at` does) as the replay gathers it, so
+    `flush_runs` hands the patch over before it draws (`HdText_Hud` and
+    `HdText_FieldWord` already settled theirs).
+
+The gate at 2x and 4x (scratch scripts, not in the repo; a scratch build
+with a window that is never shown and a per-frame hash of the scaled
+picture read back from the GPU, which settles nothing): one build, each
+scenario played three ways, `MEMORIES_DEFERRED_RASTER=0`, unset (AUTO) and
+unset with poison, with every frame presented (`fps` -1), no recording
+(its checkpoint a frame settles all of VRAM), and a picture and a VRAM hash
+every 30 VBlanks. Every frame's picture hash, every picture and every VRAM
+hash matched in all of them: menus, the story's first duel, a full duel
+(field and 3D battles) and a duel field with a state saved and loaded
+twice, each at 2x and 4x, bare and with the HD pack and HD text; the menus
+and the full duel at 2x with every mod of the target load (picture-only
+frames and palettes, banks); the menus and the first duel at 2x with
+texture xBR; widescreen (`aspect` 2, its widened picture hashed) on the
+full duel bare and the menus with the pack at 2x; the first duel with
+the scale changed from 2x to 4x in the middle (`MEMORIES_SCALE_AT`); the
+menus at 2x with the texture dump on (`MEMORIES_DUMP_TEXTURES`, its 2082
+files the same too).
+Each AUTO run held and dropped work and made patches (the
+full duel at 2x, bare: 4.8 million primitives held, 4.2 million dropped,
+1302 patches over 14677 frames; with the pack 3.5 million held, 3.0
+dropped, 757 patches). With poison on the interrupt clock
+(`MEMORIES_CLOCK=interrupt`) the menus and the full duel at 2x finished
+holding as much, and their pictures matched the default clock's. Found on
+the way, not the deferred raster's: the HD pack's automatic fast drawing
+(`fast_wanted`) turns on from frame times, so a slower run (one with the
+switch off at 4x) drew differently from frame 11642; the gate pins it
+off (`hd_fast` 0). With xBR and 4x anti-aliasing together two runs with
+the switch off differ from each other. At 1x the gate of "The deferred
+raster" (every replay, headless) also ran with the variable unset, which
+is AUTO and must hold nothing there: its checkpoints and every frame's
+hash matched the run with it off in all 16 replays, as did the runs with
+it on and with poison.
+
+After the review's fixes (the reach, the HD palette rows, the clock, the
+patches at every flush) the gate ran again on one scratch build of them:
+the menus, the first duel and the full duel at 2x and 4x, bare and with
+the pack; the full duel at 2x with the target load; texture xBR alone
+(no anti-aliasing) on the menus, the first duel and the full duel at 2x;
+and the interrupt clock with AUTO and with poison on the menus and the
+full duel at 2x and 4x, against the default clock's run with the switch
+off. Every frame's picture hash, every picture and every VRAM hash
+matched, and with xBR off the deferred raster's counts (held, dropped,
+rastered, settles by cause, patches) were the same as before the fixes
+to the primitive, so the measurements below still hold. The full duel's
+patches (1302 at 2x bare, 734 of them in its 3D battles) are the gate's
+own doing: its VRAM hash every 30 VBlanks settles everything. Played
+without those (the sessions' own pictures only), its battles make none,
+as nothing the game does there reaches held work. So a duel with 3D
+battles that do (Blue-Eyes White Dragon against Simon Muran, four
+attacks; the model's palette move every frame settles held work, 3053
+times) was played three ways at 2x bare without the periodic hashes:
+1527 patches inside its battles, and every frame's picture the same in
+all three (14100 frames). With xBR the full duel
+holds as much (4.71 against 4.77 million primitives) and drops less (3.87
+against 4.22 million): what xBR reads one texel further settles more.
+With xBR and 4x anti-aliasing (the whole page, AUTO only: that picture
+differs from run to run with the switch off too) it still holds 4.67
+million and drops 3.73. On
+the duel field with the pack or the target load nothing is held: the
+area is given up at 99.9% of the frames (152 and 330 primitives a frame
+rastered at once, no settles), not held and settled each frame.
+
+Measured on this Windows PC as at 1x (above: three interleaved runs a
+session with the switch off and AUTO, the per-frame least of the three,
+raster time the draws plus settles outside them), with the window never
+shown and every frame presented, on the gate's scratch build:
+
+| Scenario | 2x bare | 2x pack and mods | 4x bare | 4x pack and mods |
+|---|---|---|---|---|
+| Duel field | 0.94 -> 0.05 ms (-94%) | 1.16 -> 1.18 ms (+1%) | 0.93 -> 0.05 ms (-95%) | 1.15 -> 1.16 ms (+0.4%) |
+| 3D battle | 1.82 -> 0.61 ms (-67%) | 1.91 -> 0.63 ms (-67%) | 1.79 -> 0.60 ms (-67%) | 1.89 -> 0.61 ms (-68%) |
+| Menus | 0.74 -> 0.05 ms (-93%) | 0.80 -> 0.61 ms (-24%) | 0.73 -> 0.05 ms (-93%) | 0.80 -> 0.61 ms (-24%) |
+| All | 1.23 -> 0.25 ms (-80%) | 1.38 -> 0.86 ms (-38%) | 1.21 -> 0.24 ms (-80%) | 1.36 -> 0.85 ms (-38%) |
+
+Two runs with the switch off differed by 2-6% on the duel field (the 2x
+runs overlapped a long build here; the 4x pack runs were made again on a
+quieter PC). The duel field with the pack is the shadow's and the banks'
+(left, below): it holds as at 1x, given up nearly every frame.
+
+On the Samsung A22 (a debug APK of this branch, mods off, the game's own
+frame trace; at 4x three runs each way, interleaved, a 10 s duel-field
+window and two 8 s windows of 3D battles; at 2x two runs each way): on
+the duel field the raster (draws and settles outside them) went from 5.3
+to 0.44 ms a frame at 2x and 4x, and the game's work a frame from 6.7 to
+2.4 ms; the present grew from 5.6 to 7.1 ms (the replay from 2.5 to 3.6
+ms, with no patches there, so the same GPU work), so the two together
+went from 12.3 to 9.5 ms at a steady 60 frames a second. Why the present
+grew (simpleperf on a profileable build of the same APK, and per-thread
+scheduler counters): the replay, the present and the game's own code run
+the same instruction counts both ways but take 35-40% longer with AUTO,
+because with the raster gone the lighter game thread is kept on the
+phone's small Cortex-A55 cores (its run time on the big A75 cores falls
+from 50-57% to 8-10%, the small cluster at about 1.3 GHz). About 0.7 ms of
+the replay's 1.0 ms rise is that, measured; the other 0.35 ms is inferred
+from the thread's run-queue wait rising as much, not measured. AUTO's own
+new code (`SoftGpu_CopyTaken`, `SoftGpu_CopyPatches`, the upload's
+`sigprocmask` pair) costs about 0.02 ms a frame. The CPU time the threads used (`/proc`, 4x, three interleaved
+runs each way) says the same: the game's thread (which also replays)
+14.2 -> 11.7 ms a frame on the duel field, the whole app 22.9 -> 17.6. In
+3D battles little is saved: the raster went from 6.5 and 8.0 ms to 4.5
+and 5.5 (the background's palette move rasters what is held, settles
+caused by a write), the game's thread's CPU time 28.1 -> 27.0 and 44.9 ->
+41.5 ms a frame, the whole app's 42.6 -> 43.4 and 71.9 -> 66.8, at 29 and
+23 frames a second either way (the first battle runs at its own 30 a
+second, the second below it with the switch off too). The battles'
+frame rates differ by no more than runs with the switch off differ from
+each other: in new interleaved windows of the first battle, 26.98 off
+against 26.92 AUTO at 4x and 28.83 against 28.98 at 2x; the second
+battle's window was not run again. With the
+virtual clock (`MEMORIES_DETERMINISTIC=1`), three pictures of a duel taken
+over the control channel were the same with the switch off (twice), AUTO
+and AUTO with poison, at 2x and 4x, and at 2x with the OpenGL ES context
+lost and made again before them (`MEMORIES_TEST_GL_RESET`), off, AUTO
+and poison.
+
+What is left:
+
+- The pack's shadow and the banks: primitives sampling either are still
+  rastered at once, which in a duel with an HD pack is every frame (step A:
+  0.3% of duel frames skip), at 2x as at 1x. Both need a generation that
+  moves only when their bytes do.
+- Move hazards: the 3D battle's palette move (`func_8004E9A0.c`) writes
+  texels held work samples every frame, which rasters it; copying the old
+  texels instead is step A's "+4".
+- The queues are safe from the clock's tick (held off), not from another
+  thread: nothing but the game thread may call the software GPU.
+- The cost of holding where little is dropped (the copies, the palette
+  scan of an 8-bit palette at x 768 on) has been measured on this PC only;
+  on a phone `given_up` and `again` matter more, and the scan may want a
+  cache. `again` costs a cycle's drops where a bank or the shadow comes
+  in one frame and not the next (the first cycle without one is not held).
+- `given_up` is forgotten whenever the switch changes, at a reset
+  (`SoftGpu_Reset`), a state load or a new scale (`SoftGpu_PictureFromVram`),
+  a new recorder and a mod's first VRAM binding: what was given up belongs
+  to frames before them. It only decides what holding costs, never what is
+  drawn (a fixed case checks that the next primitive holds after a state
+  load and after a reset).
+- Mods: a mod that binds `SoftGpu_Vram` or `SoftGpu_StateData` turns
+  holding off for the rest of the run (`Mods_VramUsers` never goes down).
+
 ### OpenGL ES 3 (Android)
 
 On Android the picture pass runs on OpenGL ES 3.0 or later, so internal
@@ -2876,11 +4063,72 @@ ES 3 (or a failed context) gets the renderer SDL picks and the software
 picture, as before, and Video > HD text says "needs OpenGL ES 3".
 
 Limits on ES: internal resolution up to 4x (8x is refused: 128 MiB per
-picture texture), anti-aliasing up to 4 samples (8x is given as 4x). The
+picture texture; the menu does not list it, and a saved or scripted 8 falls
+back to 4x with the notice, "Internal 8x" above), anti-aliasing up to 4
+samples (8x is given as 4x). The
 GL version, renderer, GLSL version and any shader compile log go to
 standard error, which the app forwards to logcat (`adb logcat -s
 memories`: "OpenGL picture: OpenGL ES 3.2 ... on Adreno ..., OpenGL ES
 GLSL ES 3.20", then "OpenGL picture pass on").
+
+**Subtractive blending with framebuffer fetch (Mali).** A subtractive
+(mode 2) primitive is a run of its own, drawn twice (its opaque texels,
+then its semi-transparent ones with `GL_FUNC_REVERSE_SUBTRACT`), and the
+normal stretch after it is another run. A 3D battle's attack effect
+(about 31 frames) draws about 400 subtractive triangles a frame, one at a
+time between normal ones: one flush of about 890 runs and 1,360
+`glDrawArrays`, against 35 runs before the effect. On a Samsung Galaxy A22
+(Mali-G52, OpenGL ES 3.2) at 2x that flush took 42 ms of CPU a frame and
+about 180 ms on the effect's first frame, 27 to 44 VBlanks missed around
+it over the runs measured; the same state and uniform calls without the
+draws took 1.6 ms, so the time is in the draw calls (likely the driver's
+cost per draw; a desktop NVIDIA driver makes the same calls in 0.2 ms).
+Where the driver lists `GL_ARM_shader_framebuffer_fetch`, the pass also
+builds `fetch_program`: the fragment shader with `FRAMEBUFFER_FETCH`, in
+which a semi-transparent texel of mode 2 reads the pixel under it
+(`gl_LastFragColorARM`) and writes `max(dst - src, 0)` with alpha 0, which
+the blend (one, source alpha) passes through as it is: the subtracting
+pass's equation, in the same draw. Reading the picture costs the GPU, so it
+is used where the draws cost more: in a flush with at least 128
+subtractive runs for one target (`FETCH_MIN_RUNS`; counted per target, the
+picture or a widescreen target, since in widescreen a primitive is drawn
+into both: the map's flushes have 128 to 188 subtractive runs in all
+there, 64 to 94 for one target), `fetch_join` joins each stretch of
+runs of one state from its first subtractive run to its last into one run
+drawn with `fetch_program` (`fetch_use` switches programs per run); the
+runs around them, and every other flush, are drawn as before. On the A22
+(OpenGL ES, mods off, no pack), a subtractive primitive is in most of the
+game (the PC's count, 2x: the boot, the menus' fades with 30 subtractive
+runs a flush, the campaign map with 64 to 94 in every flush, Free Duel,
+the duel, 3D battles, the credits), and at 4x the map fell from 46.7 to
+35.3 frames a second when every flush with one used `fetch_program`, 43.8
+when only the span between its subtractive runs did; the steady 3D battle
+(a median of 8 a flush over two whole battles) kept 30 frames a second
+with the GPU busier. The attack effect has about 460 in its flush.
+Not used with anti-aliasing (the color
+read is then not the pixel's), where the extension is missing (desktop
+GL, GPUs without it), where its program does not build (once: "no
+framebuffer fetch" in the log), or with `MEMORIES_GL_FETCH=0` (the
+subtractive primitives then draw in two passes as before). "framebuffer
+fetch on" in the log says it is available; with `MEMORIES_TRACE=frames`,
+"N flushes drawn with framebuffer fetch" counts them every 120 replays.
+The first start after an install compiles one more program: 337 ms on the
+A22 against 6 without; later starts take 5 to 13 ms (the driver keeps
+it). `GL_EXT_shader_framebuffer_fetch` (Adreno, PowerVR) is not used: it
+has not been tried on a device.
+Measured on the A22 (22 November 2026, mods off, no pack, three runs a
+side, `MEMORIES_GL_FETCH=0` against the default on the same APK, the
+game's 120-frame trace windows): in the attack effect at 2x, 38.5 VBlanks
+missed (27 to 40.5) and a worst frame of 101 to 255 ms became 0 missed and
+at most 13 ms; at 4x 45.5 (24 to 47.5) became 37.5 (37 to 38) and the worst
+frame 134 to 252 ms became 47 to 53 ms, the effect still GPU-bound (about
+26 frames a second, the GPU at 80% against 69%). The duel field, the map and
+the steady 3D battle drew no flush with it and kept their frame rates (the
+map at 4x 46.5 against 46.6 frames a second). The picture is the same:
+lockstep frame dumps (`MEMORIES_DETERMINISTIC=1`, `MEMORIES_DUMP_PICTURE=1`)
+of the effect against the two passes, and the scaled picture of every
+replay on the desktop (which never takes this path) against the build
+before it.
 
 **A lost context.** Android may lose the GL context while the app is in
 the background; SDL then makes a new one and sends
@@ -3992,7 +5240,7 @@ Native pieces (all under `src/pc/`):
 | LIBGPU | `sdk/libgpu.c` | Environments, `DrawOTag` through `Memories_GpuCollect`, image transfers. `DrawOTag` snapshots the list and it is rasterized at `DrawSync` or before the next VRAM access, where the hardware would have finished it. Drawing inside `DrawOTag` put ~8 ms between `VSync` and `Input_UpdatePads`; whenever a second VBlank got in there the pad code published each press twice (two cursor steps, two sounds). `DrawSync` also runs what the cooperative clock owes, so a frame's overrun is counted before `Graphics_SyncFrame` reads the game's VBlank counter (see "VSync(0)" under the clock) |
 | LIBGS | `sdk/libgs.c` | Ported from the resident assembly against the library's guest globals (`GsDRAWENV` `0x800FE048`, `GsDISPENV` `0x800FE0A8`, ...): graph init, display-buffer swap, OT clear/sort, `GsSortSprite`/`FastSprite`/`FlipSprite`/`Poly`/`BoxFill` |
 | LIBDS/LIBCD | `sdk/libds.c` | ISO9660 lookup and sector delivery from the disc image on the VBlank tick (8 sectors per tick; faster than hardware). Resolved LBAs equal `disc_layout.json`. XA "play" only advances the head |
-| SPU | `audio/spu.c`, `sdk/libspu.c`, `platform/audio_alsa.c` | 24 ADPCM voices, hardware ADSR, pitch, volumes, Gaussian interpolation, CD/XA input, mixed on an ALSA thread at 44.1 kHz. The menu's output volume is a separate gain the mixer walks to its target over about 36 ms, because stepping it mid-waveform is an audible click and dragging the slider made a burst of them. No reverb, noise, sweeps or pitch modulation. Key on/off cross threads as atomic bit sets (a key-off after a still-pending key-on is applied after it); no locks where a signal handler runs. `SpuSetVoiceAttr` follows the decompiled library (`tmp/port-research/psyz/decomp/src/libspu/sr_sv.c`): pitch, then sample note, then note, so a note overrides a pitch in the same call, with the library's integer note-to-pitch; ADSR modes are written only with their rates. The sound-effect voice sends mask `0xFFFF` with pitch `0x1000` and note `0x2400` against sample note `0x3C00`; applying the pitch last played every effect two octaves high |
+| SPU | `audio/spu.c`, `sdk/libspu.c`, `platform/audio_alsa.c` | 24 ADPCM voices, hardware ADSR, pitch, volumes, Gaussian interpolation, CD/XA input, mixed on an ALSA thread at 44.1 kHz. The menu's output volume is a separate gain the mixer walks to its target over about 36 ms, because stepping it mid-waveform is an audible click and dragging the slider made a burst of them. No reverb, noise, sweeps or pitch modulation. Key on/off cross threads as atomic bit sets (a key-off after a still-pending key-on is applied after it); no locks where a signal handler runs. `SpuSetVoiceAttr` follows the decompiled library (`tmp/port-research/psyz/decomp/src/libspu/sr_sv.c`): pitch, then sample note, then note, so a note overrides a pitch in the same call, with the library's integer note-to-pitch; ADSR modes are written only with their rates. The sound-effect voice sends mask `0xFFFF` with pitch `0x1000` and note `0x2400` against sample note `0x3C00`; applying the pitch last played every effect two octaves high. `pc_spu_mix` (`tests/pc/spu_mix_test.c`; `test_native.py` on macOS) holds the mixer to two SHA-256 digests over ten minutes of a seeded register schedule: each call's output, envelopes and key status, and every 16th call's `spu` chunk; the second pass restarts from a state, then saves, scrambles, loads and saves again mid-stream and requires the same bytes. The digests are the same on GCC and Clang, x86-64, i386 and arm64; spu.c is built with `-fwrapv` there as in the game, whose master-volume product wraps when two dozen loud voices overflow it |
 | Modules | `guest/modules.c`, `MODULES` in `tools/pc/build_game32.py` | Modules built for the shared `0x80168000` bank are all linked in. Clashing symbols become `<module>__<name>`, their variables move to `ovl_<module>_data/bss` and are restored from a startup copy when the module's first sector lands on the bank (`CdGetSector` reports loader writes), and guest-address calls are resolved against the identifier word at the start of the loaded image. Data the module's C leaves undefined is pinned to the guest addresses the loader fills. Linked so far: `password` (`0x15`, also name entry) |
 | Interrupts | `sdk/libetc.c`, `platform/x11.c` | A 1 kHz `SIGALRM` drives VBlank (59.94 Hz), root counter 2 (the sequencer: `SetRCnt` without the system-clock flag selects sysclk/8, so `0xE000` is 73.8 Hz), disc delivery and MDEC completion. Critical sections defer them |
 | XA/STR/MDEC | `sdk/libds.c`, `sdk/libpress.c` | XA ADPCM sectors decode into the SPU's CD input; streaming reads run at the drive's real rate (75/150 sectors per second). `St*` assembles STR frames in host slots; `DecDCTvlc2` emits genuine MDEC run-level words (bitstream v2), and the software MDEC fills each `DecDCTout` strip and then runs the game's callback. Floating-point IDCT; 15- and 24-bit output; 24-bit display mode is presented |
@@ -4289,6 +5537,28 @@ What differs from Linux, and why:
   other duplicate definition is still an error. PE cannot place sections at
   chosen addresses, so the fixed game sections are not there: save states
   work within one build but are not carried across rebuilds.
+- **No empty gated-module sections (header space).** lld reserves a section
+  header for every output section it has before it drops the empty ones,
+  and `llvm-strip` (package.py `strip`) shrinks SizeOfHeaders to the
+  sections left without moving any. clang writes an empty `.data` and `.bss`
+  into every COFF object, and renamed to `ovl_<module>_*` with their `$a`/`$z`
+  markers each became an output section. About 17 model shapes (two modules
+  each) are enough to push the headers past a page; #475 brought 20, and
+  master's 238 modules (2026-11-15) made 0x5200 bytes of headers, .text went
+  to 0x6000, and the stripped exe had a hole after its 0x400 bytes of
+  headers, which Windows will not load ("not a valid Win32 application",
+  error 193; the PE format wants sections adjacent). So a gated module's
+  empty sections are not made `ovl_*` ones
+  (`rename_coff_sections(..., empty=False)`): one without variables, as
+  every model module is, has no `ovl_*` sections or markers (and
+  `Memories_Modules` lists no gated module). Its sources are game units too,
+  so their empty `.data`/`.bss` then become `game_data$m`/`game_bss$m` with
+  the rest, empty parts of game_data and game_bss that add no section.
+  Every Windows link, 32- and 64-bit, fails unless its sections are adjacent
+  from the headers on and its headers fit in one page (`tools/pc/pe_layout.py`
+  `link_layout_problems`), so no strip can open a hole; `package.py` checks
+  the stripped exe again (`pe_layout_gaps`), and `test_package.py` checks the
+  archives' exes the same way.
 - **Bitfield layout.** MinGW compilers lay bitfields out as MSVC does by
   default, where fields of different declared types do not share a unit:
   `GsOT_TAG` (`unsigned p:24; unsigned char num:8`) became 8 bytes and every
@@ -5615,6 +6885,48 @@ or 0xC0000000 starts the game all the same.
   (0x9FF00000) go that way, as on macOS; before, on Android they were raw
   fixed mappings that the runtime did not know, so a held range broke the
   translations and the interpreter stack. Linux's own flag value is kept.
+- **Unlowered units** (`build_arm64.py` `UNLOWERED`: `audio/spu.c`), in
+  both arm64 translated builds, Android and macOS. The guest pass lowers
+  every access of a port unit through `GuestRuntime_ResolveData`, which a
+  hot loop pays for: `Spu_Mix`, the audio thread's mixer, took 7.6% of the
+  app's cycles on a Galaxy A22's duel field and 20% in a 3D battle. An
+  `ORDINARY` unit skips the pass, but its globals then get no guest token,
+  which moves every token handed out after them: the region table a state
+  records (`translated_state_memory.c`) no longer matches, so every state
+  saved before would be refused, and its functions leave the signatures
+  mods are built against. An unlowered unit goes through the pass with
+  `"lower": false` (`guest_ir.cpp` `keepUnlowered`): the code is left as
+  compiled (Clang's -O0 `optnone`/`noinline` dropped, so it is optimized
+  at O2 like an ordinary unit; a `noinline` of the source's own cannot be
+  told from -O0's and goes too) and its globals are registered exactly as
+  a lowered unit's (same globals, order, sizes, identities and flags).
+  The pass refuses what it would have lowered, since the code would use it
+  raw: a guest-width pointer, a guest address (a pinned symbol, in the code
+  or a global's initializer), a pointer narrowed to 32 bits or less
+  (`ptrtoint`, or `trunc` of one), a pointer made from a runtime integer
+  (`inttoptr`), an indirect call, and hooks. `build_arm64.py` stops when
+  an entry does not exist, is not one of the target's native units or is
+  also ordinary. The rest of the contract is that every pointer such a
+  unit is handed is a host one. For `spu.c`: `Spu_Mix`'s output (SDL's
+  `feed` buffer, the silent thread's), `Spu_CdWrite`'s frames (LIBDS's
+  static XA buffer), `Spu_GetAdsr`'s two halves (LIBSPU's locals) and
+  `Spu_State`'s state are all host memory; LIBSPU's `SpuWrite` copies into
+  `Spu_Ram` by its host address; `Spu_Mix` reaches SDL's thread as a
+  function pointer (`Platform_StartAudio`), a host address that
+  `GuestRuntime_ResolveFunction` passes through as before. **For mods**:
+  the exported `Spu_*` functions now take host pointers only, as an
+  ordinary unit's functions already do, so on Android and macOS a code mod
+  that hands `Spu_GetAdsr` or `Spu_CdWrite` a pointer into guest RAM
+  crashes (a mod's own variables and buffers are host memory and are fine).
+  A golden test of the mixer's output, which this change keeps bit for bit,
+  is proposed separately. Galaxy A22 (simpleperf, cpu-cycles, three runs
+  before and two after, 2026-11-17): `Spu_Mix` 78-79 to 28 Mcycles/s on
+  the duel field (about 2.8x less; 7.6% to 2.9% of the app) and 155-160 to
+  50 Mcycles/s in a 3D battle (about 3.1x; 19.5-20.3% to 7.4%); the whole
+  app 1.03 to 0.98 Gcycles/s on the field and 0.78-0.80 to 0.68 in the
+  battle. A state saved by the build before loads in the build after
+  ("carried over by its symbol table"), and the two builds' states record
+  the same 11,485 non-heap regions.
 - **Save states** name the game by its GNU build ID (`translated_state_backend.c`,
   `dl_iterate_phdr`) and are relocated to where it is loaded, so they carry
   from one launch to the next; `check_load_bias` (`android.c`, which kept a
