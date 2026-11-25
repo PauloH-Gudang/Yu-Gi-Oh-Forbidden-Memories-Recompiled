@@ -248,14 +248,21 @@ static int frame_box_dimension(const JsonValue *frame, const char *key, int fall
     return (int)value;
 }
 
+/* One colour channel from a manifest, kept to 0..255: CardLayout_Tint packs three into one word, where a
+ * negative or larger value would spill into the others. */
+static int channel(long value)
+{
+    return value < 0 ? 0 : value > 255 ? 255 : (int)value;
+}
+
 /* `part` ("color": {"r": ..., "g": ..., "b": ...}), each 0x80 (no change)
  * absent -- CardLayoutPart's own tint convention. */
 static void tint(const JsonValue *part, int *r, int *g, int *b)
 {
     const JsonValue *color = Json_Member(part, "color");
-    *r = (int)Json_Number(Json_Member(color, "r"), 0x80);
-    *g = (int)Json_Number(Json_Member(color, "g"), 0x80);
-    *b = (int)Json_Number(Json_Member(color, "b"), 0x80);
+    *r = channel(Json_Number(Json_Member(color, "r"), 0x80));
+    *g = channel(Json_Number(Json_Member(color, "g"), 0x80));
+    *b = channel(Json_Number(Json_Member(color, "b"), 0x80));
 }
 
 /* Any movable card-view part can opt out without changing its coordinates:

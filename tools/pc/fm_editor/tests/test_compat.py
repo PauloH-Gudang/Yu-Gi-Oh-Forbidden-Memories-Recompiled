@@ -300,10 +300,14 @@ class FeatureTest(unittest.TestCase):
 
     def test_api_27_frame_looks(self):
         """The richer parts of a frame style, and a see-through picture (notes/modding.md, "Frame styles"): a game
-        of API 24 would ignore them and draw the plain card."""
-        for style in ({"game_frame": True}, {"parts_over_art": True}, {"stars": {"image": "s.png"}}):
+        of API 26 would ignore them and draw the plain card."""
+        for style in ({"game_frame": True}, {"parts_over_art": True}, {"stars": {"image": "s.png"}},
+                      {"atk_label": {"color": {"r": 255}}}, {"digits": {"color": {"g": 96}}}):
             with self.subTest(style=style):
                 self.assertEqual(self.needs({"card_layout": {"frame_styles": {"a": style}}}), 27)
+        for layout in ({"stars": {"image": "s.png"}}, {"dfd_label": {"color": {"b": 32}}}):
+            with self.subTest(layout=layout):
+                self.assertEqual(self.needs({"card_layout": layout}), 27)
         self.assertEqual(self.needs({"cards": [{"copy": 1, "id": "a", "art_transparent": True}]}), 27)
         self.assertEqual(self.needs({"card_layout": {"frame_styles": {"a": {"stars": {"width": 9}}}}}), 18)
 

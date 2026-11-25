@@ -262,6 +262,12 @@ def features(manifest: dict, project=None) -> list:
             add(27, "a card's see-through picture (\"art_transparent\")")
     layout = manifest.get("card_layout")
     styles = layout.get("frame_styles") if isinstance(layout, dict) else None
+    if isinstance(layout, dict):
+        if isinstance(layout.get("stars"), dict) and "image" in layout["stars"]:
+            add(27, "the level stars from a picture (\"stars\" \"image\")")
+        for key in ("atk_label", "dfd_label", "digits"):
+            if isinstance(layout.get(key), dict) and "color" in layout[key]:
+                add(27, "a \"color\" on \"%s\"" % key)
     for style in (styles.values() if isinstance(styles, dict) else ()):
         if not isinstance(style, dict):
             continue
@@ -270,6 +276,9 @@ def features(manifest: dict, project=None) -> list:
                 add(27, "a frame style's \"%s\"" % key)
         if isinstance(style.get("stars"), dict) and "image" in style["stars"]:
             add(27, "a frame style's level stars from a picture (\"stars\" \"image\")")
+        for key in ("atk_label", "dfd_label", "digits"):
+            if isinstance(style.get(key), dict) and "color" in style[key]:
+                add(27, "a \"color\" on a frame style's \"%s\"" % key)
     return out
 
 
