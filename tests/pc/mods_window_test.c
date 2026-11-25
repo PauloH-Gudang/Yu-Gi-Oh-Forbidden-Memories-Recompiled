@@ -1651,6 +1651,75 @@ static void test_modpack_code(void)
     assert(drawn_y(" Plain\n") >= 0 && drawn_y(" Plain\n") != drawn_y("Code mod\n"));
     ModsWindow_Init();
 }
+/* A modpack import cut off by closing the window: its thread is stopped and
+ * joined before the close returns, and nothing it made is left (no pack, no
+ * hidden folder). The unpacking naps after each chunk, so the close lands
+ * in the middle of the big file. */
+static int pack_pick_called, pack_chunks;
+static char pack_zip[1024];
+static int pack_pick(int kind, char *why, size_t size)
+{
+    (void)why;
+    (void)size;
+    assert(kind == 0);
+    pack_pick_called = 1;
+    return 0;
+}
+static int pack_picked(char *path, size_t size, char *why, size_t why_size)
+{
+    (void)why;
+    (void)why_size;
+    snprintf(path, size, "%s", pack_zip);
+    return 1;
+}
+static void pack_nap(void)
+{
+    __atomic_add_fetch(&pack_chunks, 1, __ATOMIC_ACQ_REL);
+    nap();
+    nap();
+}
+static int modpacks_left(void)
+{
+    char path[1024];
+    DIR *directory;
+    struct dirent *entry;
+    int n = 0;
+    snprintf(path, sizeof(path), "%s/modpacks", root);
+    if (!(directory = opendir(path))) return 0;
+    while ((entry = readdir(directory)))
+        n += !strncmp(entry->d_name, ".importing-", 11) || !strcmp(entry->d_name, "Cut");
+    closedir(directory);
+    return n;
+}
+static void test_modpack_close(void)
+{
+    static char big[4u << 20];
+    ZipItem items[3] = {{"cut/mod.json", "{\"id\":\"cut\",\"name\":\"Cut\"}", 0, 0, 0, 0, 0, 0},
+                        {"cut/big.bin", big, 0, 0, 0, 0, 0, 0},
+                        {"modpack.json", "{\"name\":\"Cut\",\"mods\":[],\"files\":{}}", 0, 0, 0, 0, 0, 0}};
+    int x, y;
+    memset(big, 'B', sizeof(big) - 1);
+    snprintf(pack_zip, sizeof(pack_zip), "%s/cut.zip", root);
+    write_zip(pack_zip, items, 3);
+    ModsWindow_SetModpackPicker(pack_pick, pack_picked);
+    ModsWindow_SetModpackStepped(pack_nap);
+    ModsWindow_Init();
+    click(50, 118); /* the Modpack tab */
+    assert(ModsWindow_Locate(MODS_UI_CLOSE, &x, &y));
+    /* Import... is the first of the three buttons left of Close (130 wide, 8 apart). */
+    click(x - 3 * (130 + 8), y);
+    assert(pack_pick_called);
+    while (!__atomic_load_n(&pack_chunks, __ATOMIC_ACQUIRE)) {
+        ModsWindow_Tick();
+        nap();
+    }
+    assert(ModsWindow_RequestClose());
+    assert(modpacks_left() == 0 && pack_chunks < (int)(sizeof(big) >> 16));
+    ModsWindow_SetModpackStepped(NULL);
+    ModsWindow_SetModpackPicker(NULL, NULL);
+    remove(pack_zip);
+    ModsWindow_Init();
+}
 int main(int argc, char **argv)
 {
     char path[1024];
@@ -1854,6 +1923,7 @@ int main(int argc, char **argv)
         assert(strstr(drawn, "Content mod") && !strstr(drawn, "Native code mod"));
     }
     test_modpack_code();
+    test_modpack_close();
     ModsWindow_Init();
     ModsWindow_Resize(720, 480);
     ModsWindow_Size(&w, &h);

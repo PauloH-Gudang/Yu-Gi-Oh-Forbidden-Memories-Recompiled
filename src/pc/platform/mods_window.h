@@ -107,6 +107,11 @@ int ModsWindow_Tick(void);
  * the file's path, -1 when none was chosen, -2 on a failure (why). */
 void ModsWindow_SetModpackPicker(int (*pick)(int kind, char *why, size_t why_size),
                                  int (*picked)(char *path, size_t size, char *why, size_t why_size));
+/* A modpack import's job stops and its thread is joined when the window
+ * closes (ModsWindow_RequestClose or ModsWindow_Event saying so) and when
+ * the game exits; so do an export's and Activate's. For the tests: `stepped`
+ * is called after each chunk an import unpacks (Mods_ImportStepped). */
+void ModsWindow_SetModpackStepped(void (*stepped)(void));
 /* Suggested export path, held in a static buffer until the next call. */
 const char *ModsWindow_ExportSuggestion(void);
 /* UTF-8 clipboard callbacks: 1 on success, 0 on failure/insufficient room.

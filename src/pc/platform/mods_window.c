@@ -81,6 +81,8 @@ static char pack_query[96];
 static int pack_filter; /* 0 all, 1 selected, 2 unselected; focus 5 is search */
 static int packs, pack_sel, pack_scroll, pack_count, pack_mods[PACKS_MAX], pack_ask; /* pack_ask: 2 Restart */
 static int pack_restart(void);
+static void pack_jobs_stop(void);
+static void (*pack_stepped)(void); /* ModsWindow_SetModpackStepped */
 static int wanted[MODS_MAX], ranks[MODS_MAX], *values[MODS_MAX], counts[MODS_MAX];
 static int slider_drag = -1, bar_drag, bar_grab; /* bar_drag: 1 the list's scrollbar, 2 the details' */
 /* Import mod... (ModsWindow_SetImport): the platform's picker, the step an
@@ -410,6 +412,10 @@ static void adopt(int i)
 }
 void ModsWindow_Init(void)
 {
+    static int stops_at_exit;
+    /* The game quits by exit() (libetc.c, VSync): a modpack job still running
+     * then is stopped and its thread joined, so its part-made file goes. */
+    if (!stops_at_exit) stops_at_exit = !atexit(pack_jobs_stop);
     unit = Menu_Scale();
     touch = Menu_TouchTarget();
     folder_launch();
@@ -1240,6 +1246,7 @@ static void *pack_import_step(void *unused)
     }
     for (int i = 0; i < import_job.count; i++) Mods_ImportMod(import, i)->replace[0] = 0;
     Mods_ImportWatch(import, &import_job.done, &import_job.cancel);
+    if (pack_stepped) Mods_ImportStepped(import, pack_stepped);
     if (!Mods_ImportInstall(import, temp, why, sizeof(why))) goto done;
     snprintf(path, sizeof(path), "%s/poster.png", temp);
     if (Mods_ImportExtract(import, "poster.png", path, why, sizeof(why)) < 0) goto done;
@@ -2617,9 +2624,39 @@ static void draw_activate(MenuCanvas *c, const PackLayout *k, int x)
     if (kind == 1) button(c, k->activate, pack_sel ? "Activate modpack" : "Use normal mods", 1);
     if (kind == 2) button(c, k->activate, pack_ask == 2 ? "Restart now" : "Restart to activate", 1);
 }
+/* The Modpack tab's jobs, stopped and their threads joined: the window
+ * closes, or the game quits. Each removes what it had made (the import its
+ * hidden folder, the export its .zip, as Stop does). */
+static void pack_jobs_stop(void)
+{
+    if (import_job.running) {
+        __atomic_store_n(&import_job.cancel, 1, __ATOMIC_RELAXED);
+        pthread_join(import_job.thread, NULL);
+        import_job.running = 0;
+    }
+    if (export_job.running) {
+        __atomic_store_n(&export_job.cancel, 1, __ATOMIC_RELAXED);
+        pthread_join(export_job.thread, NULL);
+        export_job.running = 0;
+        free(export_job.json.text);
+        memset(&export_job.json, 0, sizeof(export_job.json));
+    }
+    if (prep.running) {
+        __atomic_store_n(&prep.cancel, 1, __ATOMIC_RELAXED);
+        pthread_join(prep.thread, NULL);
+        prep.running = 0;
+    }
+}
+void ModsWindow_SetModpackStepped(void (*stepped)(void)) { pack_stepped = stepped; }
 /* Restart (the footer's, or Restart to activate): asked once, then done. */
 static void pack_restart_press(void)
 {
+    if (import_job.running || export_job.running || prep.running) {
+        pack_ask = 0;
+        put(status, sizeof(status), "Wait for the %s to finish, or stop it, before restarting.",
+            import_job.running ? "import" : export_job.running ? "export" : "modpack's check");
+        return;
+    }
     if (!pack_restart()) {
         put(status, sizeof(status), "Nothing to restart for: the chosen modpack is running.");
         return;
@@ -4252,13 +4289,22 @@ int ModsWindow_RequestClose(void)
     focus = 0;
     slider_drag = -1;
     bar_drag = 0;
-    if (pending == 2 || !changed())
+    if (pending == 2 || !changed()) {
+        pack_jobs_stop();
         return 1;
+    }
     pending = 2;
     snprintf(status, sizeof(status), "Discard your unsaved mod changes?");
     return 0;
 }
+static int window_event(const MenuEvent *e);
 int ModsWindow_Event(const MenuEvent *e)
+{
+    int close = window_event(e);
+    if (close) pack_jobs_stop(); /* the window closes: its jobs end with it */
+    return close;
+}
+static int window_event(const MenuEvent *e)
 {
     Layout l;
     layout(&l);
